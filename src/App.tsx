@@ -36,7 +36,7 @@ import { ImageViewer } from './components/editors/ImageViewer';
 import { VideoEditor } from './components/editors/VideoEditor';
 import { TerminalPanel } from './components/terminal/TerminalPanel';
 import { copyToClipboard, getImgurClientId, uploadFilePath, uploadAlbum, uploadMany, gdriveUpload } from './services/shareService';
-import { generateExcelBase64, generateCsvContent, sanitizeFileName } from './services/aiActions';
+import { generateExcelBase64, generateCsvContent, generateDocxBase64, sanitizeFileName } from './services/aiActions';
 
 const App: React.FC = () => {
   const ws = useWorkspace();
@@ -348,6 +348,29 @@ const App: React.FC = () => {
         ws.flash('Нет активного документа для вставки');
         return;
       }
+
+      if (tab.type === 'word') {
+        window.dispatchEvent(
+          new CustomEvent('workspace:insert-text', {
+            detail: { tabId: tab.id, text },
+          })
+        );
+        ws.flash('Текст вставлен в документ Word');
+        return;
+      }
+
+      if (tab.type === 'markdown' || tab.type === 'richtext') {
+        window.dispatchEvent(
+          new CustomEvent('workspace:insert-text', {
+            detail: { tabId: tab.id, text },
+          })
+        );
+        const next = tab.content ? `${tab.content}\n\n${text}` : text;
+        ws.updateTabContent(tab.id, next);
+        ws.flash('Текст вставлен в документ');
+        return;
+      }
+
       const applier = editorApplier.current;
       if (applier) {
         applier({ from: -1, to: -1, text });
@@ -360,9 +383,38 @@ const App: React.FC = () => {
   );
 
   const replaceDocument = useCallback(
-    (text: string) => {
+    async (text: string) => {
       const tab = ws.activeTab;
       if (!tab) return;
+
+      if (tab.type === 'word') {
+        try {
+          const docTitle = tab.name.replace(/\.docx?$/i, '');
+          const base64 = await generateDocxBase64(text, docTitle);
+          ws.updateTabContent(tab.id, base64);
+          window.dispatchEvent(
+            new CustomEvent('workspace:replace-document', {
+              detail: { tabId: tab.id, text, base64 },
+            })
+          );
+          ws.flash('Документ Word заменён ответом AI');
+        } catch (err) {
+          ws.flash(`Ошибка замены документа: ${(err as Error).message}`);
+        }
+        return;
+      }
+
+      if (tab.type === 'markdown' || tab.type === 'richtext') {
+        ws.updateTabContent(tab.id, text);
+        window.dispatchEvent(
+          new CustomEvent('workspace:replace-document', {
+            detail: { tabId: tab.id, text },
+          })
+        );
+        ws.flash('Документ заменён ответом AI');
+        return;
+      }
+
       ws.updateTabContent(tab.id, text);
       editorApplier.current?.({ from: 0, to: tab.content.length, text });
       ws.flash('Документ заменён ответом AI');
@@ -403,11 +455,21 @@ const App: React.FC = () => {
   const handleAICreateFile = useCallback(
     async (name: string, content = ''): Promise<string | null> => {
       try {
-        const finalName = sanitizeFileName(name, '.txt');
+        const isWord = /\.docx?$/i.test(name);
+        const finalName = sanitizeFileName(name, isWord ? '.docx' : '.txt');
+        let finalContent = content;
+        let encoding = 'utf-8';
+
+        if (isWord || /\.docx?$/i.test(finalName)) {
+          const docTitle = finalName.replace(/\.docx?$/i, '');
+          finalContent = await generateDocxBase64(content, docTitle);
+          encoding = 'base64';
+        }
+
         const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
-        const createdPath = await ws.createFile(parentDir, finalName, content, 'utf-8');
+        const createdPath = await ws.createFile(parentDir, finalName, finalContent, encoding);
         if (createdPath) {
-          ws.flash(`Создан файл: ${finalName}`);
+          ws.flash(isWord ? `Создан документ Word: ${finalName}` : `Создан файл: ${finalName}`);
         }
         return createdPath;
       } catch (err) {

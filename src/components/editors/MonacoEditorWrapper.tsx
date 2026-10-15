@@ -93,13 +93,18 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
 
       // from === -1 означает «вставить в позицию курсора»
       if (edit.from === -1) {
-        const position = editor.getPosition();
+        let position = editor.getPosition();
+        if (!position) {
+          const lineCount = model.getLineCount();
+          position = { lineNumber: lineCount, column: model.getLineMaxColumn(lineCount) } as any;
+        }
         editor.executeEdits('ai-insert', [
           { range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column), text: edit.text },
         ]);
       } else {
-        const start = model.getPositionAt(edit.from);
-        const end = model.getPositionAt(edit.to);
+        const fullRange = model.getFullModelRange();
+        const start = edit.from === 0 ? fullRange.getStartPosition() : model.getPositionAt(edit.from);
+        const end = edit.to >= model.getValueLength() ? fullRange.getEndPosition() : model.getPositionAt(edit.to);
         editor.executeEdits('ai-replace', [
           { range: new monaco.Range(start.lineNumber, start.column, end.lineNumber, end.column), text: edit.text },
         ]);

@@ -273,6 +273,11 @@ export const AIChatPanel: React.FC<Props> = ({
               action.format
             );
           }
+        } else if (action.action === 'create_document' || action.action === 'create_word') {
+          if (onCreateFile) {
+            const fileName = action.name || (action.title ? `${action.title}.docx` : 'Документ.docx');
+            resultPath = await onCreateFile(fileName, action.content || '');
+          }
         } else if (action.action === 'create_file') {
           if (onCreateFile) {
             resultPath = await onCreateFile(
@@ -736,6 +741,85 @@ const AIActionCard: React.FC<{
     );
   }
 
+  if (
+    action.action === 'create_document' ||
+    action.action === 'create_word' ||
+    (action.action === 'create_file' && /\.docx?$/i.test(action.name || action.path || ''))
+  ) {
+    const rawName =
+      action.name ||
+      ('title' in action && action.title ? `${action.title}.docx` : '') ||
+      ('path' in action && action.path ? action.path : '') ||
+      'Документ.docx';
+    const fileName = rawName.toLowerCase().endsWith('.docx') ? rawName : `${rawName}.docx`;
+    const contentLen = action.content?.length || 0;
+
+    return (
+      <div className="mt-2 rounded-lg border border-blue-500/30 bg-blue-500/10 p-2.5 text-xs">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start gap-2 min-w-0">
+            <div className="mt-0.5 rounded bg-blue-500/20 p-1 text-blue-400 shrink-0">
+              <FileText size={15} />
+            </div>
+            <div className="min-w-0">
+              <div className="font-semibold text-ws truncate">
+                Документ Word: <span className="text-blue-400 font-mono">{fileName}</span>
+              </div>
+              <div className="text-[11px] text-ws-muted mt-0.5">
+                {contentLen > 0 ? `${contentLen} символов` : 'Новый документ'} · Word (.docx)
+              </div>
+            </div>
+          </div>
+
+          <div className="shrink-0">
+            {status === 'running' ? (
+              <span className="flex items-center gap-1.5 text-[11px] text-ws-accent">
+                <Spinner size={12} />
+                Создание...
+              </span>
+            ) : status === 'done' ? (
+              <div className="flex items-center gap-1.5">
+                <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                  <Check size={12} />
+                  Создан
+                </span>
+                {onOpen && (
+                  <button
+                    onClick={onOpen}
+                    className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws hover:bg-ws-hover transition-colors"
+                  >
+                    <ExternalLink size={10} />
+                    Открыть
+                  </button>
+                )}
+              </div>
+            ) : status === 'error' ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-ws-danger" title={error}>
+                  Ошибка
+                </span>
+                <button
+                  onClick={onExecute}
+                  className="rounded bg-ws-surface px-2 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+                >
+                  Повторить
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={onExecute}
+                className="flex items-center gap-1 rounded bg-blue-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-blue-500 shadow-sm transition-all"
+              >
+                <Play size={10} />
+                Создать и открыть
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (action.action === 'create_file') {
     const fileName = action.name || action.path || 'Новый файл';
     const contentLen = action.content?.length || 0;
@@ -909,11 +993,13 @@ const MessageBubble: React.FC<{
               state.result ||
               (act.action === 'create_table'
                 ? act.name
-                : act.action === 'create_file'
-                  ? act.name || act.path
-                  : act.action === 'open_file'
-                    ? act.path
-                    : undefined);
+                : act.action === 'create_document' || act.action === 'create_word'
+                  ? act.name || ('title' in act && act.title ? `${act.title}.docx` : 'Документ.docx')
+                  : act.action === 'create_file'
+                    ? act.name || act.path
+                    : act.action === 'open_file'
+                      ? act.path
+                      : undefined);
 
             return (
               <AIActionCard
@@ -999,7 +1085,18 @@ const MessageBubble: React.FC<{
               </button>
             )}
 
-            {hasActiveTab && (
+            {codeBlocks.length === 0 && displayContent && hasActiveTab && (
+              <button
+                onClick={() => onInsert(displayContent)}
+                title="Вставить текст ответа в позицию курсора активного документа"
+                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ws-faint hover:bg-ws-hover hover:text-ws"
+              >
+                <CornerDownLeft size={10} />
+                Вставить в документ
+              </button>
+            )}
+
+            {hasActiveTab && displayContent && (
               <button
                 onClick={() => onReplace(displayContent)}
                 title="Заменить содержимое документа этим ответом"

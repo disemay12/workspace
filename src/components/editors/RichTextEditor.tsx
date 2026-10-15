@@ -252,6 +252,34 @@ export const RichTextEditor: React.FC<Props> = ({
     }
   }, [tab.content, viewMode]);
 
+  /* ---------------- Вставка текста из чата AI ---------------- */
+  useEffect(() => {
+    const handleInsert = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { tabId?: string; text?: string } | undefined;
+      if (!detail?.text || detail.tabId !== tab.id) return;
+      const insertStr = detail.text;
+      const textarea = textareaRef.current;
+      if (textarea) {
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        const before = tab.content.slice(0, start);
+        const after = tab.content.slice(end);
+        const next = `${before}${insertStr}${after}`;
+        onChange(next);
+        window.setTimeout(() => {
+          textarea.focus();
+          textarea.setSelectionRange(start + insertStr.length, start + insertStr.length);
+        }, 10);
+      } else {
+        const next = tab.content ? `${tab.content}\n\n${insertStr}` : insertStr;
+        onChange(next);
+      }
+    };
+
+    window.addEventListener('workspace:insert-text', handleInsert);
+    return () => window.removeEventListener('workspace:insert-text', handleInsert);
+  }, [tab.id, tab.content, onChange]);
+
   /* ---------------- Синхронизация прокрутки ---------------- */
 
   const handleEditorScroll = () => {

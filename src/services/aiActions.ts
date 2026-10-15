@@ -1,4 +1,6 @@
 import * as XLSX from 'xlsx';
+import { htmlToDocxBase64 } from '../lib/docx';
+import { markdownToDocumentHtml } from '../lib/aiDocument';
 
 /* ============================================================
    Типы действий AI по управлению программой WorkSpace
@@ -20,6 +22,13 @@ export interface AICreateFilePayload {
   content?: string;
 }
 
+export interface AICreateDocumentPayload {
+  action: 'create_document' | 'create_word';
+  name?: string;
+  title?: string;
+  content?: string;
+}
+
 export interface AIOpenFilePayload {
   action: 'open_file';
   path: string;
@@ -38,6 +47,7 @@ export interface AIReplaceDocPayload {
 export type AIActionPayload =
   | AICreateTablePayload
   | AICreateFilePayload
+  | AICreateDocumentPayload
   | AIOpenFilePayload
   | AIInsertEditorPayload
   | AIReplaceDocPayload;
@@ -88,7 +98,7 @@ export function parseAIActions(content: string): AIActionPayload[] {
 
   // 3. Если не найдено выше, ищем блок ```json ... ``` с "action": "create_table" и т.п.
   if (actions.length === 0) {
-    const jsonBlockRegex = /```(?:json)?\s*\n(\{\s*"action"\s*:\s*"(?:create_table|create_file|open_file|insert_into_editor|replace_document)"[\s\S]*?\})\n```/gi;
+    const jsonBlockRegex = /```(?:json)?\s*\n(\{\s*"action"\s*:\s*"(?:create_table|create_file|create_document|create_word|open_file|insert_into_editor|replace_document)"[\s\S]*?\})\n```/gi;
     while ((match = jsonBlockRegex.exec(content)) !== null) {
       const raw = match[1].trim();
       const parsed = tryParseJson(raw);
@@ -112,6 +122,8 @@ function isValidAction(obj: any): obj is AIActionPayload {
   switch (action) {
     case 'create_table':
       return Boolean(Array.isArray(obj.columns) || Array.isArray(obj.rows) || obj.name);
+    case 'create_document':
+    case 'create_word':
     case 'create_file':
       return Boolean(obj.name || obj.path || typeof obj.content === 'string');
     case 'open_file':
@@ -149,6 +161,7 @@ export function stripActionBlocks(content: string): string {
   let cleaned = content
     .replace(/```(?:workspace-action|workspace_action)\s*\n[\s\S]*?\n```/gi, '')
     .replace(/<workspace[-_]action>\s*[\s\S]*?\s*<\/workspace[-_]action>/gi, '')
+    .replace(/```(?:json)?\s*\n\{\s*"action"\s*:\s*"(?:create_table|create_file|create_document|create_word|open_file|insert_into_editor|replace_document)"[\s\S]*?\}\n```/gi, '')
     .trim();
 
   return cleaned;
@@ -309,4 +322,15 @@ export function sanitizeFileName(name: string, defaultExt = '.xlsx'): string {
     cleaned += defaultExt;
   }
   return cleaned;
+}
+
+/**
+ * Создаёт бинарный base64-буфер файла Word (.docx) из текста или Markdown.
+ */
+export async function generateDocxBase64(content = '', title?: string): Promise<string> {
+  const fullContent = title && !content.startsWith('#')
+    ? `# ${title}\n\n${content}`
+    : (content || '<p></p>');
+  const html = markdownToDocumentHtml(fullContent);
+  return await htmlToDocxBase64(html);
 }

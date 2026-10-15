@@ -188,6 +188,20 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
         setLoading(false);
       } catch (err) {
         if (cancelled) return;
+        // Резервное восстановление: файл мог быть создан как Markdown/текст вместо бинарного ZIP
+        const recoveredText = tryDecodeText(tab.content);
+        if (recoveredText && recoveredText.trim()) {
+          const html = markdownToDocumentHtml(recoveredText);
+          setPendingHtml(html || '<p></p>');
+          setLoading(false);
+          void htmlToDocxBase64(html)
+            .then((b64) => {
+              if (!cancelled) onChange(b64);
+            })
+            .catch(() => {});
+          return;
+        }
+
         setError(`Не удалось разобрать документ: ${(err as Error).message}`);
         setLoading(false);
       }
@@ -292,6 +306,41 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
 
     window.addEventListener('workspace:ai-answer', handler);
     return () => window.removeEventListener('workspace:ai-answer', handler);
+  }, [handleInput, tab.id]);
+
+  /* ---------------- Вставка текста и замена документа из чата AI ---------------- */
+
+  useEffect(() => {
+    const handleInsert = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { tabId?: string; text?: string } | undefined;
+      if (!detail?.text || detail.tabId !== tab.id) return;
+      const html = markdownToDocumentHtml(detail.text);
+      if (!html) return;
+      insertHtmlAt(editorRef.current, null, html);
+      handleInput();
+    };
+
+    const handleReplace = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { tabId?: string; text?: string } | undefined;
+      if (detail?.tabId !== tab.id) return;
+      const root = editorRef.current;
+      if (!root) return;
+      const html = markdownToDocumentHtml(detail.text || '');
+      isSyncing.current = true;
+      root.innerHTML = html || '<p></p>';
+      setWordCount(countWords(root.innerText));
+      queueMicrotask(() => {
+        isSyncing.current = false;
+      });
+      handleInput();
+    };
+
+    window.addEventListener('workspace:insert-text', handleInsert);
+    window.addEventListener('workspace:replace-document', handleReplace);
+    return () => {
+      window.removeEventListener('workspace:insert-text', handleInsert);
+      window.removeEventListener('workspace:replace-document', handleReplace);
+    };
   }, [handleInput, tab.id]);
 
   /** Снять текущее оформление с каретки — чтобы кнопки и списки показывали реальное состояние. */
@@ -1037,4 +1086,28 @@ function countWords(text: string): number {
   const trimmed = text.trim();
   if (!trimmed) return 0;
   return trimmed.split(/\s+/).length;
+}
+
+/**
+ * Пытается декодировать текст из base64 или сырой строки.
+ */
+function tryDecodeText(raw: string): string | null {
+  if (!raw) return null;
+  try {
+    const clean = raw.replace(/\s+/g, '');
+    const binString = atob(clean);
+    const bytes = Uint8Array.from(binString, (c) => c.charCodeAt(0));
+    const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    if (decoded && decoded.trim() && !decoded.includes('\uFFFD') && /[\w\u0400-\u04FF\s<>]/.test(decoded)) {
+      return decoded;
+    }
+  } catch {
+    // не base64
+  }
+
+  if (typeof raw === 'string' && /[\w\u0400-\u04FF\s#*<>]/.test(raw.slice(0, 200))) {
+    return raw;
+  }
+
+  return null;
 }
