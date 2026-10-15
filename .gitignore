@@ -21,6 +21,8 @@ release/
 build/
 out/
 WorkSpace/
+WorkSpace-Portable/
+WorkSpace-Portable.zip
 BuildersWorkspace/
 *.tsbuildinfo
 

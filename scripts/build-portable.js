@@ -72,10 +72,17 @@ for (const file of fs.readdirSync(resourcesDir)) {
   }
 }
 
-// Если в корне есть secrets.local.ps1, копируем его в app/ для портативности
-const rootSecrets = path.join(rootDir, 'secrets.local.ps1');
-if (fs.existsSync(rootSecrets)) {
-  copyFileIfChanged(rootSecrets, path.join(appDir, 'secrets.local.ps1'));
+// Никакие локальные секреты (secrets.local.ps1, ai-settings.json) НЕ должны попадать в сборку
+const sensitiveFiles = [
+  path.join(appDir, 'secrets.local.ps1'),
+  path.join(outDir, 'secrets.local.ps1'),
+  path.join(appDir, 'ai-settings.json'),
+  path.join(outDir, 'ai-settings.json'),
+];
+for (const file of sensitiveFiles) {
+  if (fs.existsSync(file)) {
+    try { fs.unlinkSync(file); } catch {}
+  }
 }
 
 // 5. Компиляция оконного загрузчика WorkSpace.exe
