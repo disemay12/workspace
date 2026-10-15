@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Content-Security-Policy: работаем офлайн, поэтому разрешены только
+      локальные ресурсы. Monaco Editor подключается из локального бандла
+      (см. src/monacoSetup.ts), API-запросы к провайдерам AI идут через
+      connect-src https:/http:.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https: http: ws: wss:; media-src 'self' data: blob:"
+    />
+    <title>WorkSpace — Документы, Офис и AI</title>
+    <script>
+      // Тема применяется до первой отрисовки, чтобы не было вспышки светлого фона
+      (function () {
+        try {
+          var saved = localStorage.getItem('workspace_theme');
+          var theme =
+            saved === 'light' || saved === 'dark'
+              ? saved
+              : window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark';
+          document.documentElement.classList.toggle('dark', theme === 'dark');
+          document.documentElement.style.colorScheme = theme;
+        } catch (e) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
+  </head>
+  <!-- Цвета задаются токенами темы из src/index.css; хардкод здесь
+       перекрывал бы переменные и ломал переключение светлой темы. -->
+  <body class="overflow-hidden">
+    <script>
+      window.addEventListener('error', function (e) {
+        var box = document.createElement('pre');
+        box.id = 'boot-error';
+        box.textContent = 'BOOT ' + e.message + '\n' + (e.filename || '') + ':' + e.lineno + '\n' + (e.error && e.error.stack || '');
+        document.body.appendChild(box);
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        var box = document.createElement('pre');
+        box.id = 'boot-error';
+        box.textContent = 'REJ ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason);
+        document.body.appendChild(box);
+      });
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

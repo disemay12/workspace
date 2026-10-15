@@ -1,0 +1,54 @@
+# ---------- Секреты и локальные настройки ----------
+# Файлы с реальными ключами НИКОГДА не попадают в репозиторий.
+secrets.local.ps1
+secrets.local.*
+*.local.ps1
+.env
+.env.*
+!.env.example
+cr*.json
+credentials*.json
+*credentials*.env
+
+# ---------- Зависимости ----------
+node_modules/
+.pnpm-store/
+
+# ---------- Артефакты сборки ----------
+dist/
+dist-electron/
+release/
+build/
+out/
+WorkSpace/
+BuildersWorkspace/
+*.tsbuildinfo
+
+# ---------- Тестовые артефакты проверок ----------
+test-workspace/
+*-check.json
+final-report.txt
+smoke-out.txt
+smoke-result.json
+smoke-screenshot.png
+render-screenshot.png
+.tmp-probe*/
+_ilprobe/
+__il_*/
+__ws_probe_*/
+dist-verify/
+probe-*.js
+WorkSpace.7z
+
+# ---------- Логи и временные файлы ----------
+*.log
+npm-debug.log*
+yarn-error.log*
+*.ws-tmp
+
+# ---------- Редакторы и ОС ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
