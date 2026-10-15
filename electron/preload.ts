@@ -86,9 +86,10 @@ const electronAPI = {
     ipcRenderer.invoke('fs:writeFile', filePath, content, encoding),
   createFile: (
     filePath: string,
-    initialContent = ''
+    initialContent = '',
+    encoding?: string
   ): Promise<{ success: boolean; error?: string }> =>
-    ipcRenderer.invoke('fs:createFile', filePath, initialContent),
+    ipcRenderer.invoke('fs:createFile', filePath, initialContent, encoding),
   createDirectory: (dirPath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:createDirectory', dirPath),
   deletePath: (targetPath: string): Promise<{ success: boolean; error?: string }> =>

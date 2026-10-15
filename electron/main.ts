@@ -475,18 +475,34 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle('fs:createFile', async (_event, filePath: string, initialContent = '') => {
-  try {
-    await fs.promises.writeFile(filePath, initialContent, { flag: 'wx' });
-    return { success: true };
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code === 'EEXIST') {
-      return { success: false, error: 'Файл с таким именем уже существует' };
+ipcMain.handle(
+  'fs:createFile',
+  async (_event, filePath: string, initialContent = '', encoding?: string) => {
+    try {
+      const isBase64 =
+        encoding === 'base64' ||
+        (typeof initialContent === 'string' &&
+          initialContent.length > 0 &&
+          /\.(xlsx|xls|docx|doc|pptx|png|jpg|ico)$/i.test(filePath) &&
+          /^[A-Za-z0-9+/=\r\n]+$/.test(initialContent));
+
+      if (isBase64) {
+        await fs.promises.writeFile(filePath, Buffer.from(initialContent.replace(/\s+/g, ''), 'base64'), {
+          flag: 'wx',
+        });
+      } else {
+        await fs.promises.writeFile(filePath, initialContent, { flag: 'wx' });
+      }
+      return { success: true };
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === 'EEXIST') {
+        return { success: false, error: 'Файл с таким именем уже существует' };
+      }
+      return { success: false, error: e.message };
     }
-    return { success: false, error: e.message };
   }
-});
+);
 
 ipcMain.handle('fs:createDirectory', async (_event, dirPath: string) => {
   try {

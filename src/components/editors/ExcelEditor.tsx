@@ -128,9 +128,17 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       setLoading(true);
       setError('');
 
-      const workbook = isCsv
-        ? XLSX.read(tab.content, { type: 'string' })
-        : XLSX.read(tab.content, { type: 'base64' });
+      const isEmpty = !tab.content || tab.content.trim() === '';
+      const workbook = isEmpty
+        ? (() => {
+            const wb = XLSX.utils.book_new();
+            const emptyWs = XLSX.utils.aoa_to_sheet([[]]);
+            XLSX.utils.book_append_sheet(wb, emptyWs, 'Лист 1');
+            return wb;
+          })()
+        : isCsv
+          ? XLSX.read(tab.content, { type: 'string' })
+          : XLSX.read(tab.content, { type: 'base64' });
 
       const parsed: Workbook = {};
       workbook.SheetNames.forEach((name) => {

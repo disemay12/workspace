@@ -350,11 +350,17 @@ export function useWorkspace() {
   /* ---------------- Файловые операции ---------------- */
 
   const createFile = useCallback(
-    async (parentDir: string, name: string, content = ''): Promise<string | null> => {
-      const target = joinPath(parentDir, name);
+    async (
+      parentDir: string,
+      name: string,
+      content = '',
+      encoding?: string
+    ): Promise<string | null> => {
+      const targetDir = parentDir || rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
+      const target = joinPath(targetDir, name);
       try {
-        await fileSystemService.createFile(target, content);
-        if (tree[parentDir]) await loadDirectory(parentDir);
+        await fileSystemService.createFile(target, content, encoding);
+        if (tree[targetDir]) await loadDirectory(targetDir);
         else await refreshTree();
         await openFile(target);
         flash(`Создан файл: ${name}`);
@@ -364,7 +370,7 @@ export function useWorkspace() {
         return null;
       }
     },
-    [tree, loadDirectory, refreshTree, openFile, flash]
+    [rootPath, tree, loadDirectory, refreshTree, openFile, flash]
   );
 
   const createFolder = useCallback(

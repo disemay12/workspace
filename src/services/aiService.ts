@@ -110,6 +110,58 @@ function parseApiError(status: number, body: string, label: string): Error {
 
   return new Error(`${label} (${status}): ${detail.slice(0, 400)}${hint}`);
 }
+export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты являешься интеллектуальным помощником и оператором приложения WorkSpace.
+Ты можешь не только отвечать текстом, но и НАПРЯМУЮ УПРАВЛЯТЬ приложением (создавать файлы, таблицы, открывать документы).
+
+Когда пользователь просит создать таблицу, создать файл, открыть документ или выполнить действие в программе, обязательно дай краткий ответ И добавь специальный блок действия в конце ответа:
+
+1. Создание таблицы (Excel или CSV):
+\`\`\`workspace-action
+{
+  "action": "create_table",
+  "name": "Название.xlsx",
+  "sheetName": "Лист 1",
+  "columns": ["Колонка 1", "Колонка 2", "Сумма"],
+  "rows": [
+    ["Значение A", 100, "=B2*1.2"],
+    ["Значение B", 250, "=B3*1.2"]
+  ]
+}
+\`\`\`
+(Если просили CSV: укажи "name": "данные.csv" и "format": "csv"). Для формул используй имена функций Excel (SUM, AVERAGE, IF) и формулы вида "=C2*D2".
+
+2. Создание файла с текстом или кодом:
+\`\`\`workspace-action
+{
+  "action": "create_file",
+  "name": "script.py",
+  "content": "print('Hello world')"
+}
+\`\`\`
+
+3. Открытие существующего файла:
+\`\`\`workspace-action
+{
+  "action": "open_file",
+  "path": "имя_файла.xlsx"
+}
+\`\`\`
+
+4. Вставка в активный документ:
+\`\`\`workspace-action
+{
+  "action": "insert_into_editor",
+  "text": "текст"
+}
+\`\`\`
+
+Всегда добавляй блок \`\`\`workspace-action, когда тебя просят создать таблицу или файл, чтобы программа автоматически создала его и открыла в редакторе!`;
+
+export function resolveSystemPrompt(userPrompt?: string): string {
+  const base = (userPrompt || '').trim();
+  if (base.includes('workspace-action')) return base;
+  return base ? `${base}\n\n${WORKSPACE_OPERATOR_SYSTEM_PROMPT}` : WORKSPACE_OPERATOR_SYSTEM_PROMPT;
+}
 
 export const aiService = {
   /** Проверка соединения и валидности ключа — для кнопки «Проверить подключение». */
@@ -409,7 +461,7 @@ export const aiService = {
       {
         model: settings.model || 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: settings.systemPrompt },
+          { role: 'system', content: resolveSystemPrompt(settings.systemPrompt) },
           ...messages.map((m) => ({ role: m.role, content: buildMessageText(m) })),
         ],
         temperature: settings.temperature,
@@ -441,7 +493,7 @@ export const aiService = {
       },
       {
         model: settings.model || 'claude-3-5-sonnet-20241022',
-        system: settings.systemPrompt,
+        system: resolveSystemPrompt(settings.systemPrompt),
         messages: messages.map((m) => ({
           role: m.role === 'assistant' ? 'assistant' : 'user',
           content: buildMessageText(m),
@@ -478,7 +530,7 @@ export const aiService = {
           role: m.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: buildMessageText(m) }],
         })),
-        systemInstruction: { parts: [{ text: settings.systemPrompt }] },
+        systemInstruction: { parts: [{ text: resolveSystemPrompt(settings.systemPrompt) }] },
         generationConfig: {
           temperature: settings.temperature,
           maxOutputTokens: settings.maxTokens,

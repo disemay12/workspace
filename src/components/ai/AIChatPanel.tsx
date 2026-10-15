@@ -15,13 +15,25 @@ import {
   History,
   X,
   FileText,
+  FileSpreadsheet,
+  FilePlus,
+  FolderOpen,
+  Play,
+  ExternalLink,
 } from 'lucide-react';
 import { AISettings, ChatMessage, ChatSession, OpenTab } from '../../types';
 import { aiService } from '../../services/aiService';
 import { SYSTEM_PRESETS, PROVIDER_PRESETS } from '../../state/settings';
 import { cn, extractCodeBlocks, uid } from '../../lib/utils';
 import { renderRichMarkdown, renderMermaidBlocks } from '../../lib/markdown';
-import { AIBadge, Button, IconButton, Textarea } from '../ui';
+import {
+  AIActionPayload,
+  ParsedMarkdownTable,
+  parseAIActions,
+  detectMarkdownTables,
+  stripActionBlocks,
+} from '../../services/aiActions';
+import { AIBadge, Button, IconButton, Spinner, Textarea } from '../ui';
 
 interface Props {
   settings: AISettings;
@@ -47,6 +59,15 @@ interface Props {
    * предложить применить сгенерированную формулу.
    */
   onAnswerComplete?: (answer: string) => void;
+  onCreateTable?: (
+    name: string,
+    columns: string[],
+    rows: (string | number | boolean | null)[][],
+    sheetName?: string,
+    format?: 'xlsx' | 'csv'
+  ) => Promise<string | null>;
+  onCreateFile?: (name: string, content: string) => Promise<string | null>;
+  onOpenFile?: (path: string) => Promise<void>;
 }
 
 export const AIChatPanel: React.FC<Props> = ({
@@ -68,6 +89,9 @@ export const AIChatPanel: React.FC<Props> = ({
   pendingPrompt,
   onPendingPromptConsumed,
   onAnswerComplete,
+  onCreateTable,
+  onCreateFile,
+  onOpenFile,
 }) => {
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
@@ -76,6 +100,12 @@ export const AIChatPanel: React.FC<Props> = ({
   const [selectionText, setSelectionText] = useState('');
   const [copiedId, setCopiedId] = useState('');
   const [showHistory, setShowHistory] = useState(false);
+
+  // Состояние выполнения действий AI (создание таблиц, файлов и т.п.)
+  const [actionStates, setActionStates] = useState<
+    Record<string, { status: 'idle' | 'running' | 'done' | 'error'; result?: string; error?: string }>
+  >({});
+  const executedActionsRef = useRef<Set<string>>(new Set());
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -220,6 +250,85 @@ export const AIChatPanel: React.FC<Props> = ({
       onOpenSettings,
       onAnswerComplete,
     ]
+  );
+
+  /* ---------- Выполнение действий управления программой ---------- */
+
+  const executeAction = useCallback(
+    async (action: AIActionPayload, actionKey: string) => {
+      setActionStates((prev) => ({
+        ...prev,
+        [actionKey]: { status: 'running' },
+      }));
+
+      try {
+        let resultPath: string | null = null;
+        if (action.action === 'create_table') {
+          if (onCreateTable) {
+            resultPath = await onCreateTable(
+              action.name || 'Таблица.xlsx',
+              action.columns || [],
+              action.rows || [],
+              action.sheetName,
+              action.format
+            );
+          }
+        } else if (action.action === 'create_file') {
+          if (onCreateFile) {
+            resultPath = await onCreateFile(
+              action.name || action.path || 'файл.txt',
+              action.content || ''
+            );
+          }
+        } else if (action.action === 'open_file') {
+          if (onOpenFile) {
+            await onOpenFile(action.path);
+            resultPath = action.path;
+          }
+        } else if (action.action === 'insert_into_editor') {
+          onInsertIntoEditor(action.text);
+          resultPath = 'Вставлено в редактор';
+        } else if (action.action === 'replace_document') {
+          onApplyToDocument(action.text);
+          resultPath = 'Документ заменён';
+        }
+
+        setActionStates((prev) => ({
+          ...prev,
+          [actionKey]: { status: 'done', result: resultPath || undefined },
+        }));
+      } catch (err) {
+        setActionStates((prev) => ({
+          ...prev,
+          [actionKey]: { status: 'error', error: (err as Error).message },
+        }));
+      }
+    },
+    [onCreateTable, onCreateFile, onOpenFile, onInsertIntoEditor, onApplyToDocument]
+  );
+
+  // Автоматическое выполнение действий из готовых ответов модели
+  useEffect(() => {
+    messages.forEach((msg) => {
+      if (msg.role !== 'assistant' || msg.streaming) return;
+      const acts = parseAIActions(msg.content);
+      acts.forEach((act, idx) => {
+        const actionKey = `${msg.id}_${idx}`;
+        if (!executedActionsRef.current.has(actionKey)) {
+          executedActionsRef.current.add(actionKey);
+          void executeAction(act, actionKey);
+        }
+      });
+    });
+  }, [messages, executeAction]);
+
+  const handleCreateTableFromMarkdown = useCallback(
+    async (table: ParsedMarkdownTable, format: 'xlsx' | 'csv' = 'xlsx') => {
+      if (!onCreateTable) return;
+      const name = format === 'csv' ? 'Таблица_данных.csv' : 'Таблица_данных.xlsx';
+      await onCreateTable(name, table.columns, table.rows, 'Лист 1', format);
+    },
+    [onCreateTable]
   );
 
   const stopStreaming = () => {
@@ -451,6 +560,10 @@ export const AIChatPanel: React.FC<Props> = ({
             onInsert={(text) => onInsertIntoEditor(text)}
             onReplace={(text) => onApplyToDocument(text)}
             hasActiveTab={Boolean(activeTab)}
+            actionStates={actionStates}
+            onExecuteAction={executeAction}
+            onOpenFile={onOpenFile}
+            onCreateTableFromMarkdown={handleCreateTableFromMarkdown}
           />
         ))}
       </div>
@@ -535,6 +648,178 @@ export const AIChatPanel: React.FC<Props> = ({
    Пузырь сообщения
    ============================================================ */
 
+/* ============================================================
+   Карточка действия AI (создание таблицы, файла и т.п.)
+   ============================================================ */
+
+const AIActionCard: React.FC<{
+  action: AIActionPayload;
+  status: 'idle' | 'running' | 'done' | 'error';
+  result?: string;
+  error?: string;
+  onExecute: () => void;
+  onOpen?: () => void;
+}> = ({ action, status, result, error, onExecute, onOpen }) => {
+  if (action.action === 'create_table') {
+    const colCount = action.columns?.length || 0;
+    const rowCount = action.rows?.length || 0;
+    const isCsv = action.format === 'csv' || (action.name && action.name.toLowerCase().endsWith('.csv'));
+    const fileName = action.name || (isCsv ? 'Таблица.csv' : 'Таблица.xlsx');
+
+    return (
+      <div className="mt-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-xs">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start gap-2 min-w-0">
+            <div className="mt-0.5 rounded bg-emerald-500/20 p-1 text-emerald-400 shrink-0">
+              <FileSpreadsheet size={15} />
+            </div>
+            <div className="min-w-0">
+              <div className="font-semibold text-ws truncate">
+                Таблица: <span className="text-emerald-400 font-mono">{fileName}</span>
+              </div>
+              <div className="text-[11px] text-ws-muted mt-0.5">
+                {colCount > 0 && `${colCount} столбцов`}
+                {rowCount > 0 && ` · ${rowCount} строк`}
+                {action.sheetName && ` · Лист: «${action.sheetName}»`}
+                {` · ${isCsv ? 'CSV' : 'Excel (.xlsx)'}`}
+              </div>
+            </div>
+          </div>
+
+          <div className="shrink-0">
+            {status === 'running' ? (
+              <span className="flex items-center gap-1.5 text-[11px] text-ws-accent">
+                <Spinner size={12} />
+                Создание...
+              </span>
+            ) : status === 'done' ? (
+              <div className="flex items-center gap-1.5">
+                <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                  <Check size={12} />
+                  Создана
+                </span>
+                {onOpen && (
+                  <button
+                    onClick={onOpen}
+                    title="Перейти к открытой таблице"
+                    className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws hover:bg-ws-hover transition-colors"
+                  >
+                    <ExternalLink size={10} />
+                    Открыть
+                  </button>
+                )}
+              </div>
+            ) : status === 'error' ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-ws-danger" title={error}>
+                  Ошибка
+                </span>
+                <button
+                  onClick={onExecute}
+                  className="rounded bg-ws-surface px-2 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+                >
+                  Повторить
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={onExecute}
+                className="flex items-center gap-1 rounded bg-emerald-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-emerald-500 shadow-sm transition-all"
+              >
+                <Play size={10} />
+                Создать и открыть
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (action.action === 'create_file') {
+    const fileName = action.name || action.path || 'Новый файл';
+    const contentLen = action.content?.length || 0;
+
+    return (
+      <div className="mt-2 rounded-lg border border-blue-500/30 bg-blue-500/10 p-2.5 text-xs">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-start gap-2 min-w-0">
+            <div className="mt-0.5 rounded bg-blue-500/20 p-1 text-blue-400 shrink-0">
+              <FilePlus size={15} />
+            </div>
+            <div className="min-w-0">
+              <div className="font-semibold text-ws truncate">
+                Файл: <span className="text-blue-400 font-mono">{fileName}</span>
+              </div>
+              <div className="text-[11px] text-ws-muted mt-0.5">
+                {contentLen > 0 ? `${contentLen} символов` : 'Новый документ'}
+              </div>
+            </div>
+          </div>
+
+          <div className="shrink-0">
+            {status === 'running' ? (
+              <span className="flex items-center gap-1.5 text-[11px] text-ws-accent">
+                <Spinner size={12} />
+                Создание...
+              </span>
+            ) : status === 'done' ? (
+              <div className="flex items-center gap-1.5">
+                <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                  <Check size={12} />
+                  Создан
+                </span>
+                {onOpen && (
+                  <button
+                    onClick={onOpen}
+                    className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws hover:bg-ws-hover transition-colors"
+                  >
+                    <ExternalLink size={10} />
+                    Открыть
+                  </button>
+                )}
+              </div>
+            ) : (
+              <button
+                onClick={onExecute}
+                className="flex items-center gap-1 rounded bg-blue-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-blue-500 shadow-sm transition-all"
+              >
+                <Play size={10} />
+                Создать
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (action.action === 'open_file') {
+    return (
+      <div className="mt-2 rounded-lg border border-ws bg-ws-surface p-2 text-xs flex items-center justify-between">
+        <div className="flex items-center gap-2 truncate">
+          <FolderOpen size={14} className="text-amber-400 shrink-0" />
+          <span className="text-ws truncate">
+            Открыть: <span className="font-mono text-ws-accent">{action.path}</span>
+          </span>
+        </div>
+        <button
+          onClick={onExecute}
+          className="rounded bg-ws-elevated border border-ws px-2 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+        >
+          {status === 'done' ? 'Открыт' : 'Открыть'}
+        </button>
+      </div>
+    );
+  }
+
+  return null;
+};
+
+/* ============================================================
+   Пузырь сообщения
+   ============================================================ */
+
 const MessageBubble: React.FC<{
   message: ChatMessage;
   isCopied: boolean;
@@ -542,12 +827,46 @@ const MessageBubble: React.FC<{
   onInsert: (text: string) => void;
   onReplace: (text: string) => void;
   hasActiveTab: boolean;
-}> = ({ message, isCopied, onCopy, onInsert, onReplace, hasActiveTab }) => {
+  actionStates: Record<string, { status: 'idle' | 'running' | 'done' | 'error'; result?: string; error?: string }>;
+  onExecuteAction: (action: AIActionPayload, actionKey: string) => void;
+  onOpenFile?: (path: string) => void;
+  onCreateTableFromMarkdown?: (table: ParsedMarkdownTable, format: 'xlsx' | 'csv') => void;
+}> = ({
+  message,
+  isCopied,
+  onCopy,
+  onInsert,
+  onReplace,
+  hasActiveTab,
+  actionStates,
+  onExecuteAction,
+  onOpenFile,
+  onCreateTableFromMarkdown,
+}) => {
   const isUser = message.role === 'user';
   const codeBlocks = useMemo(
     () => (isUser ? [] : extractCodeBlocks(message.content)),
     [isUser, message.content]
   );
+
+  const actions = useMemo(
+    () => (isUser ? [] : parseAIActions(message.content)),
+    [isUser, message.content]
+  );
+
+  const mdTables = useMemo(
+    () => (!isUser && actions.length === 0 ? detectMarkdownTables(message.content) : []),
+    [isUser, actions.length, message.content]
+  );
+
+  const displayContent = useMemo(() => {
+    if (isUser) return message.content;
+    const cleaned = stripActionBlocks(message.content);
+    if (!cleaned && actions.length > 0) {
+      return 'Выполняю команду по управлению рабочей областью...';
+    }
+    return cleaned;
+  }, [isUser, message.content, actions.length]);
 
   if (isUser) {
     return (
@@ -573,13 +892,69 @@ const MessageBubble: React.FC<{
 
       <div className="min-w-0 flex-1">
         <div className="rounded-lg rounded-tl-sm border border-ws bg-ws-surface px-3 py-2">
-          {message.content ? (
-            <MarkdownLite content={message.content} />
-          ) : (
+          {displayContent ? (
+            <MarkdownLite content={displayContent} />
+          ) : message.streaming ? (
             <span className="flex items-center gap-1.5 text-xs text-ws-faint">
               <span className="h-1.5 w-1.5 animate-pulse-soft rounded-full bg-ws-accent" />
               Думает…
             </span>
+          ) : null}
+
+          {/* Карточки действий AI */}
+          {actions.map((act, idx) => {
+            const actionKey = `${message.id}_${idx}`;
+            const state = actionStates[actionKey] || { status: 'idle' };
+            const targetPath =
+              state.result ||
+              (act.action === 'create_table'
+                ? act.name
+                : act.action === 'create_file'
+                  ? act.name || act.path
+                  : act.action === 'open_file'
+                    ? act.path
+                    : undefined);
+
+            return (
+              <AIActionCard
+                key={actionKey}
+                action={act}
+                status={state.status}
+                result={state.result}
+                error={state.error}
+                onExecute={() => onExecuteAction(act, actionKey)}
+                onOpen={targetPath && onOpenFile ? () => onOpenFile(targetPath) : undefined}
+              />
+            );
+          })}
+
+          {/* Быстрое превращение Markdown-таблицы в рабочий файл */}
+          {mdTables.length > 0 && !message.streaming && (
+            <div className="mt-2.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-400">
+                <FileSpreadsheet size={13} />
+                <span>
+                  Обнаружена таблица данных ({mdTables[0].columns.length} столбцов, {mdTables[0].rows.length} строк)
+                </span>
+              </div>
+              <p className="mt-0.5 text-[10px] text-ws-muted">
+                Создайте полноценный рабочий файл таблицы в проекте в один клик:
+              </p>
+              <div className="mt-2 flex items-center gap-1.5">
+                <button
+                  onClick={() => onCreateTableFromMarkdown?.(mdTables[0], 'xlsx')}
+                  className="flex items-center gap-1 rounded bg-emerald-600 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-emerald-500 transition-colors shadow-sm"
+                >
+                  <Play size={9} /> Создать Excel (.xlsx)
+                </button>
+                <button
+                  onClick={() => onCreateTableFromMarkdown?.(mdTables[0], 'csv')}
+                  className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-2 py-0.5 text-[10px] text-ws hover:bg-ws-hover transition-colors"
+                >
+                  Создать CSV (.csv)
+                </button>
+              </div>
+            </div>
           )}
         </div>
 
@@ -590,9 +965,7 @@ const MessageBubble: React.FC<{
           </div>
         )}
 
-        {/* Действия над ответом. Всегда видимы с пониженной непрозрачностью —
-            hover делает их контрастнее, но они остаются доступными
-            (в т.ч. при управлении с клавиатуры). */}
+        {/* Действия над ответом */}
         {message.content && !message.streaming && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1 opacity-60 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
             <button
@@ -628,7 +1001,7 @@ const MessageBubble: React.FC<{
 
             {hasActiveTab && (
               <button
-                onClick={() => onReplace(message.content)}
+                onClick={() => onReplace(displayContent)}
                 title="Заменить содержимое документа этим ответом"
                 className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ws-faint hover:bg-ws-hover hover:text-ws"
               >

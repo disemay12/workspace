@@ -36,6 +36,7 @@ import { ImageViewer } from './components/editors/ImageViewer';
 import { VideoEditor } from './components/editors/VideoEditor';
 import { TerminalPanel } from './components/terminal/TerminalPanel';
 import { copyToClipboard, getImgurClientId, uploadFilePath, uploadAlbum, uploadMany, gdriveUpload } from './services/shareService';
+import { generateExcelBase64, generateCsvContent, sanitizeFileName } from './services/aiActions';
 
 const App: React.FC = () => {
   const ws = useWorkspace();
@@ -365,6 +366,70 @@ const App: React.FC = () => {
       ws.updateTabContent(tab.id, text);
       editorApplier.current?.({ from: 0, to: tab.content.length, text });
       ws.flash('Документ заменён ответом AI');
+    },
+    [ws]
+  );
+
+  const handleAICreateTable = useCallback(
+    async (
+      name: string,
+      columns: string[],
+      rows: (string | number | boolean | null)[][],
+      sheetName = 'Лист 1',
+      format: 'xlsx' | 'csv' = 'xlsx'
+    ): Promise<string | null> => {
+      try {
+        const isCsv = format === 'csv' || name.toLowerCase().endsWith('.csv');
+        const finalName = sanitizeFileName(name, isCsv ? '.csv' : '.xlsx');
+        const content = isCsv
+          ? generateCsvContent(columns, rows)
+          : generateExcelBase64(columns, rows, sheetName);
+        const encoding = isCsv ? 'utf-8' : 'base64';
+
+        const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
+        const createdPath = await ws.createFile(parentDir, finalName, content, encoding);
+        if (createdPath) {
+          ws.flash(`Создана таблица: ${finalName}`);
+        }
+        return createdPath;
+      } catch (err) {
+        ws.flash(`Ошибка создания таблицы: ${(err as Error).message}`);
+        return null;
+      }
+    },
+    [ws]
+  );
+
+  const handleAICreateFile = useCallback(
+    async (name: string, content = ''): Promise<string | null> => {
+      try {
+        const finalName = sanitizeFileName(name, '.txt');
+        const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
+        const createdPath = await ws.createFile(parentDir, finalName, content, 'utf-8');
+        if (createdPath) {
+          ws.flash(`Создан файл: ${finalName}`);
+        }
+        return createdPath;
+      } catch (err) {
+        ws.flash(`Ошибка создания файла: ${(err as Error).message}`);
+        return null;
+      }
+    },
+    [ws]
+  );
+
+  const handleAIOpenFile = useCallback(
+    async (filePath: string): Promise<void> => {
+      try {
+        let target = filePath;
+        if (!filePath.includes('\\') && !filePath.includes('/')) {
+          const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
+          target = joinPath(parentDir, filePath);
+        }
+        await ws.openFile(target);
+      } catch (err) {
+        ws.flash(`Не удалось открыть файл: ${(err as Error).message}`);
+      }
     },
     [ws]
   );
@@ -774,6 +839,9 @@ const App: React.FC = () => {
               pendingPrompt={pendingPrompt}
               onPendingPromptConsumed={() => setPendingPrompt(null)}
               onAnswerComplete={handleAIAnswer}
+              onCreateTable={handleAICreateTable}
+              onCreateFile={handleAICreateFile}
+              onOpenFile={handleAIOpenFile}
             />
           </div>
         )}

@@ -281,9 +281,9 @@ export const fileSystemService = {
     if (!res.success) throw new Error(res.error || 'Ошибка записи файла');
   },
 
-  async createFile(filePath: string, initialContent = ''): Promise<void> {
+  async createFile(filePath: string, initialContent = '', encoding?: string): Promise<void> {
     if (!this.isElectron()) throw new Error('Создание файлов доступно только в настольном приложении');
-    const res = await window.electronAPI!.createFile(filePath, initialContent);
+    const res = await window.electronAPI!.createFile(filePath, initialContent, encoding);
     if (!res.success) throw new Error(res.error || 'Ошибка создания файла');
   },
 

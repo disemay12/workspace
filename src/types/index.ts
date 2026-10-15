@@ -181,7 +181,7 @@ declare global {
       listDirectory: (dirPath: string) => Promise<{ success: boolean; items: FileItem[]; error?: string }>;
       readFile: (filePath: string, encoding?: string) => Promise<{ success: boolean; content?: string; isBinary?: boolean; error?: string }>;
       writeFile: (filePath: string, content: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
-      createFile: (filePath: string, initialContent?: string) => Promise<{ success: boolean; error?: string }>;
+      createFile: (filePath: string, initialContent?: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
       createDirectory: (dirPath: string) => Promise<{ success: boolean; error?: string }>;
       deletePath: (targetPath: string) => Promise<{ success: boolean; error?: string }>;
       renamePath: (oldPath: string, newPath: string) => Promise<{ success: boolean; error?: string }>;
