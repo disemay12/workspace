@@ -20,7 +20,8 @@
     "checks:sync": "node scripts/sync-checks.js",
     "checks": "npm run checks:build && npm run checks:sync && node dist-electron/run-all-checks.js",
     "pack": "npm run build && electron-builder --win --x64 --dir",
-    "dist": "npm run build && electron-builder --win --x64"
+    "dist": "npm run build && electron-builder --win --x64",
+    "build:portable": "node scripts/build-portable.js"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

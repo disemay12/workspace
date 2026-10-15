@@ -28,7 +28,7 @@ call npm install
 if errorlevel 1 goto install_failed
 
 :do_build
-call npm run build
+call npm run build:portable
 if errorlevel 1 goto build_failed
 
 echo.
@@ -38,8 +38,10 @@ echo  ============================================
 echo.
 echo   Frontend:        dist\
 echo   Main process:    dist-electron\
+echo   Portable app:    WorkSpace\WorkSpace.exe
 echo.
-echo   Run with: start-prod.bat
+echo   Run with: WorkSpace\WorkSpace.exe
+echo   Or:       start-prod.bat
 echo   Or:       npx electron dist-electron/main.js
 echo.
 pause
