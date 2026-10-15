@@ -292,6 +292,13 @@ declare global {
       terminalKill?: (id: string) => Promise<{ success: boolean }>;
       onTerminalData?: (cb: (data: { id: string; data: string }) => void) => () => void;
       onTerminalExit?: (cb: (data: { id: string; code: number }) => void) => () => void;
+
+      /* ---------- Интеграция с Проводником Windows ---------- */
+      getContextMenuStatus?: () => Promise<{ installed: boolean; exePath: string; error?: string }>;
+      installContextMenu?: () => Promise<{ success: boolean; error?: string }>;
+      removeContextMenu?: () => Promise<{ success: boolean; error?: string }>;
+      getInitialExternalPath?: () => Promise<{ path: string; isDirectory: boolean } | null>;
+      onOpenExternalPath?: (cb: (data: { path: string; isDirectory: boolean }) => void) => () => void;
     };
   }
 }

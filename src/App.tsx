@@ -239,6 +239,47 @@ const App: React.FC = () => {
   }, [ws.activeTabId, ws.tabs, ws.rootPath, ws.saveTab, ws.saveAll]);
 
   /* ============================================================
+     Открытие файлов и папок из проводника Windows (контекстное меню)
+     ============================================================ */
+  useEffect(() => {
+    if (!window.electronAPI?.onOpenExternalPath) return;
+
+    const handleExternalTarget = async (data: { path: string; isDirectory: boolean }) => {
+      if (!data?.path) return;
+      try {
+        if (data.isDirectory) {
+          await ws.openWorkspace(data.path);
+          ws.flash(`Открыта папка: ${baseName(data.path)}`);
+        } else {
+          const parentDir = data.path.slice(
+            0,
+            Math.max(data.path.lastIndexOf('\\'), data.path.lastIndexOf('/'))
+          );
+          if (!ws.rootPath) {
+            await ws.openWorkspace(parentDir);
+          }
+          await ws.openFile(data.path);
+          ws.flash(`Открыт файл: ${baseName(data.path)}`);
+        }
+      } catch (err) {
+        ws.flash(`Ошибка открытия: ${(err as Error).message}`);
+      }
+    };
+
+    // Проверяем аргумент при холодном запуске
+    void window.electronAPI.getInitialExternalPath?.().then((init) => {
+      if (init) void handleExternalTarget(init);
+    });
+
+    // Слушаем открытие при уже работающем приложении (second-instance)
+    const unsub = window.electronAPI.onOpenExternalPath((data) => {
+      void handleExternalTarget(data);
+    });
+
+    return unsub;
+  }, [ws]);
+
+  /* ============================================================
      Запрос контекста у активного редактора (для Ctrl+K)
      ============================================================ */
   const editorContextGetter = useRef<(() => { text: string; from: number; to: number }) | null>(null);

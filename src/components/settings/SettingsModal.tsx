@@ -17,6 +17,7 @@ import {
   FileKey,
   Download,
   Info,
+  Monitor,
 } from 'lucide-react';
 import { AISettings, AIProvider } from '../../types';
 import { PROVIDER_PRESETS, PROVIDER_ORDER, SYSTEM_PRESETS, keyVault } from '../../state/settings';
@@ -24,6 +25,7 @@ import { aiService } from '../../services/aiService';
 import { cn } from '../../lib/utils';
 import { Button, Field, Input, Modal, Select, Textarea } from '../ui';
 import { IntegrationsSettings } from './IntegrationsSettings';
+import { SystemSettings } from './SystemSettings';
 
 interface Props {
   open: boolean;
@@ -39,7 +41,7 @@ interface Props {
   onNotify?: (message: string) => void;
 }
 
-type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations';
+type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system';
 
 interface SecretsInfo {
   found: boolean;
@@ -246,6 +248,7 @@ export const SettingsModal: React.FC<Props> = ({
     { id: 'prompt', label: 'Промт', icon: <Sparkles size={13} /> },
     { id: 'keys', label: 'Хранилище', icon: <ShieldCheck size={13} /> },
     { id: 'integrations', label: 'Сервисы', icon: <Cloud size={13} /> },
+    { id: 'system', label: 'Система', icon: <Monitor size={13} /> },
   ];
 
   return (
@@ -715,6 +718,7 @@ export const SettingsModal: React.FC<Props> = ({
       )}
 
       {tab === 'integrations' && <IntegrationsSettings onNotify={onNotify || (() => undefined)} />}
+      {tab === 'system' && <SystemSettings onNotify={onNotify} />}
     </Modal>
   );
 };

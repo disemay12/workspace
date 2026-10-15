@@ -356,6 +356,23 @@ const electronAPI = {
     ipcRenderer.on('terminal:exit', listener);
     return () => ipcRenderer.removeListener('terminal:exit', listener);
   },
+
+  /* ---------- Интеграция с Проводником Windows ---------- */
+  getContextMenuStatus: (): Promise<{ installed: boolean; exePath: string; error?: string }> =>
+    ipcRenderer.invoke('system:getContextMenuStatus'),
+  installContextMenu: (): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('system:installContextMenu'),
+  removeContextMenu: (): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('system:removeContextMenu'),
+  getInitialExternalPath: (): Promise<{ path: string; isDirectory: boolean } | null> =>
+    ipcRenderer.invoke('system:getInitialExternalPath'),
+  onOpenExternalPath: (
+    cb: (data: { path: string; isDirectory: boolean }) => void
+  ): (() => void) => {
+    const listener = (_e: unknown, data: { path: string; isDirectory: boolean }) => cb(data);
+    ipcRenderer.on('app:openExternalPath', listener);
+    return () => ipcRenderer.removeListener('app:openExternalPath', listener);
+  },
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

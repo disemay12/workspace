@@ -13,6 +13,7 @@ import { registerHostedImageUpload } from './imageHost';
 import { registerAiSettings } from './aiSettings';
 import { setWatchRoot } from './watcher';
 import { registerTerminal } from './terminal';
+import { registerContextMenuIpc } from './contextMenu';
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -21,7 +22,61 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
+/**
+ * Извлекает путь к файлу или папке из аргументов командной строки.
+ */
+function extractTargetArg(args: string[]): { path: string; isDirectory: boolean } | null {
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i].trim();
+    if (!arg || arg.startsWith('-')) continue;
+    const lower = arg.toLowerCase();
+    if (
+      lower.endsWith('.js') ||
+      lower.endsWith('.ts') ||
+      lower.endsWith('electron.exe') ||
+      lower.endsWith('workspace.exe')
+    ) {
+      continue;
+    }
+    try {
+      if (fs.existsSync(arg)) {
+        const fullPath = path.resolve(arg);
+        const stat = fs.statSync(fullPath);
+        return { path: fullPath, isDirectory: stat.isDirectory() };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+let pendingStartupPath: { path: string; isDirectory: boolean } | null = extractTargetArg(process.argv);
+
+// Единый экземпляр приложения: при повторном запуске (например, из контекстного меню)
+// фокус передаётся в уже работающее окно, и открывается запрошенный файл/папка.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_event, commandLine) => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+
+      const target = extractTargetArg(commandLine);
+      if (target) {
+        mainWindow.webContents.send('app:openExternalPath', target);
+      }
+    }
+  });
+}
+
 let mainWindow: BrowserWindow | null = null;
+
+ipcMain.handle('system:getInitialExternalPath', () => {
+  const p = pendingStartupPath;
+  pendingStartupPath = null;
+  return p;
+});
 
 /**
  * Разрешение на закрытие окна. Устанавливается, когда пользователь
@@ -136,6 +191,14 @@ function createWindow() {
   mainWindow.on('maximize', notifyMaximizeState);
   mainWindow.on('unmaximize', notifyMaximizeState);
 
+  // Передаём файл или папку, переданные в аргументах запуска
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (pendingStartupPath) {
+      mainWindow?.webContents.send('app:openExternalPath', pendingStartupPath);
+      pendingStartupPath = null;
+    }
+  });
+
   /**
    * Закрытие окна перехватывается, чтобы рендерер успел спросить
    * пользователя о несохранённых файлах. Без этого изменения терялись.
@@ -163,6 +226,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  registerContextMenuIpc();
   registerVideo();
   registerTerminal(() => mainWindow);
   createWindow();
