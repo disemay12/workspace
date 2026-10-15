@@ -21,6 +21,7 @@ interface StoredSettings {
   maxTokens?: number;
   systemPrompt?: string;
   activePresetId?: string;
+  modelsCache?: Record<string, string[]>;
   /** Зашифрованные ключи по провайдерам. Открытый текст сюда не пишется. */
   keys?: Record<string, string>;
 }

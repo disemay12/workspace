@@ -76,6 +76,7 @@ export interface AISettings {
   maxTokens: number;
   systemPrompt: string;
   activePresetId?: string;
+  modelsCache?: Record<string, string[]>;
 }
 
 export interface ChatAttachment {
@@ -260,6 +261,11 @@ declare global {
       aiProbe: (
         url: string
       ) => Promise<{ reachable: boolean; status?: number; error?: string }>;
+      aiListModels?: (req: {
+        provider: string;
+        baseUrl?: string;
+        apiKey?: string;
+      }) => Promise<{ success: boolean; models: string[]; error?: string }>;
       onAiChunk: (cb: (data: { requestId: string; chunk: string }) => void) => () => void;
       onAiEnd: (cb: (data: { requestId: string }) => void) => () => void;
       onAiError: (

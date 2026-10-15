@@ -353,6 +353,66 @@ export function useAISettings() {
     []
   );
 
+  // Кэш моделей, загруженных от API провайдеров
+  const [modelsCache, setModelsCache] = useState<Record<string, string[]>>(() => {
+    try {
+      const raw = window.localStorage.getItem('workspace_ai_models_cache');
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return {};
+  });
+
+  const fetchModels = useCallback(
+    async (override?: Partial<AISettings>) => {
+      const target = { ...settings, ...override };
+      try {
+        const { aiService } = await import('../services/aiService');
+        const res = await aiService.fetchModels(target);
+        if (res.success && res.models && res.models.length > 0) {
+          setModelsCache((prev) => {
+            const next = { ...prev, [target.provider]: res.models };
+            try {
+              window.localStorage.setItem('workspace_ai_models_cache', JSON.stringify(next));
+            } catch {}
+            persistPersistent({ ...target, modelsCache: next });
+            return next;
+          });
+
+          // Если текущей модели нет в новом списке, автоматически выбираем первую модель
+          if (
+            !target.model ||
+            (!res.models.includes(target.model) &&
+              !PROVIDER_PRESETS[target.provider]?.models.includes(target.model))
+          ) {
+            setSettingsState((prev) => {
+              const updated = { ...prev, model: res.models[0] };
+              try {
+                const { apiKey: _omit, ...safe } = updated;
+                window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
+              } catch {}
+              persistPersistent(updated);
+              return updated;
+            });
+          }
+        }
+        return res;
+      } catch (err) {
+        return { success: false, models: [], error: (err as Error).message };
+      }
+    },
+    [settings]
+  );
+
+  const availableModels = useMemo(() => {
+    const fromApi = modelsCache[settings.provider] || [];
+    const fromPreset = PROVIDER_PRESETS[settings.provider]?.models || [];
+    const combined = Array.from(new Set([...fromApi, ...fromPreset]));
+    if (settings.model && !combined.includes(settings.model)) {
+      combined.push(settings.model);
+    }
+    return combined;
+  }, [modelsCache, settings.provider, settings.model]);
+
   /** Смена провайдера с подстановкой базового URL и модели по умолчанию. */
   const changeProvider = useCallback(
     async (provider: AIProvider) => {
@@ -363,12 +423,13 @@ export function useAISettings() {
         : await keyVault.get(provider);
       setProviderKey(key);
       setSettingsState((prev) => {
+        const cached = modelsCache[provider] || [];
         const next: AISettings = {
           ...prev,
           provider,
           apiKey: key,
           baseUrl: preset.baseUrl,
-          model: preset.models[0] || prev.model,
+          model: cached[0] || preset.models[0] || prev.model,
         };
         try {
           const { apiKey: _omit, ...safe } = next;
@@ -381,21 +442,31 @@ export function useAISettings() {
       });
       setKeyLoaded(true);
     },
-    []
+    [modelsCache]
   );
 
   /** Сохранение ключа: в профиль пользователя и в локальный кэш. */
-  const saveApiKey = useCallback(async (apiKey: string) => {
-    let snapshot: AISettings | null = null;
-    setSettingsState((prev) => {
-      const provider = prev.provider;
-      void keyVault.set(provider, apiKey);
-      setProviderKey(apiKey);
-      snapshot = { ...prev, apiKey };
-      return snapshot;
-    });
-    if (snapshot) await persistPersistent(snapshot, apiKey);
-  }, []);
+  const saveApiKey = useCallback(
+    async (apiKey: string) => {
+      let snapshot: AISettings | null = null;
+      setSettingsState((prev) => {
+        const provider = prev.provider;
+        void keyVault.set(provider, apiKey);
+        setProviderKey(apiKey);
+        snapshot = { ...prev, apiKey };
+        return snapshot;
+      });
+      if (snapshot !== null) {
+        const snap: AISettings = snapshot;
+        await persistPersistent(snap, apiKey);
+        // При сохранении ключа сразу автоматически опрашиваем API на список моделей
+        if (apiKey.trim()) {
+          void fetchModels({ ...snap, apiKey });
+        }
+      }
+    },
+    [fetchModels]
+  );
 
   // Первичная загрузка: постоянный файл важнее localStorage,
   // потому что localStorage обнуляется при пересборке приложения.
@@ -409,6 +480,9 @@ export function useAISettings() {
     void store.loadAiSettings().then(async (stored) => {
       if (cancelled) return;
       const saved = stored.settings ?? {};
+      if (saved.modelsCache) {
+        setModelsCache((prev) => ({ ...prev, ...saved.modelsCache }));
+      }
       const provider = (saved.provider as AIProvider) || settings.provider;
       let key = stored.keys?.[provider] ?? '';
       // Ключ из старого хранилища переносим в постоянное один раз.
@@ -440,6 +514,9 @@ export function useAISettings() {
   return {
     settings,
     preset,
+    availableModels,
+    modelsCache,
+    fetchModels,
     updateSettings,
     changeProvider,
     saveApiKey,

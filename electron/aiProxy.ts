@@ -162,4 +162,149 @@ export function registerAiProxy() {
       }
     });
   });
+
+  /**
+   * Запрос списка доступных моделей от API провайдера.
+   * Выполняется через модуль net главного процесса для обхода ограничений CORS.
+   */
+  ipcMain.handle(
+    'ai:listModels',
+    async (
+      _event,
+      req: { provider: string; baseUrl?: string; apiKey?: string }
+    ): Promise<{ success: boolean; models: string[]; error?: string }> => {
+      const { provider, baseUrl, apiKey } = req;
+
+      function requestJson(url: string, headers: Record<string, string>): Promise<any> {
+        return new Promise((resolve, reject) => {
+          try {
+            const request = net.request({ method: 'GET', url, redirect: 'follow' });
+            for (const [k, v] of Object.entries(headers)) {
+              try {
+                request.setHeader(k, v);
+              } catch {}
+            }
+
+            const timer = setTimeout(() => {
+              try {
+                request.abort();
+              } catch {}
+              reject(new Error('Превышен таймаут ответа API (12 сек)'));
+            }, 12000);
+
+            request.on('response', (response) => {
+              let body = '';
+              response.on('data', (chunk: Buffer) => {
+                body += chunk.toString('utf-8');
+              });
+              response.on('end', () => {
+                clearTimeout(timer);
+                const status = response.statusCode || 0;
+                if (status < 200 || status >= 300) {
+                  let msg = `HTTP ${status}`;
+                  try {
+                    const parsed = JSON.parse(body);
+                    msg = parsed?.error?.message || parsed?.message || msg;
+                  } catch {}
+                  return reject(new Error(msg));
+                }
+                try {
+                  resolve(JSON.parse(body));
+                } catch {
+                  reject(new Error('Некорректный JSON в ответе API'));
+                }
+              });
+              response.on('error', (err: Error) => {
+                clearTimeout(timer);
+                reject(err);
+              });
+            });
+
+            request.on('error', (err: Error) => {
+              clearTimeout(timer);
+              reject(err);
+            });
+
+            request.end();
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+
+      try {
+        let models: string[] = [];
+
+        if (provider === 'gemini') {
+          const base = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+          const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey.trim())}` : '';
+          const url = `${base}/models${keyParam}`;
+          const headers: Record<string, string> = apiKey ? { 'x-goog-api-key': apiKey.trim() } : {};
+          const data = await requestJson(url, headers);
+          if (Array.isArray(data?.models)) {
+            models = data.models
+              .filter((m: any) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
+              .map((m: any) => String(m.name || '').replace(/^models\//, ''))
+              .filter(Boolean);
+          }
+        } else if (provider === 'anthropic') {
+          const base = (baseUrl || 'https://api.anthropic.com/v1').replace(/\/+$/, '');
+          const url = `${base}/models`;
+          const headers: Record<string, string> = {
+            'x-api-key': apiKey ? apiKey.trim() : '',
+            'anthropic-version': '2023-06-01',
+          };
+          const data = await requestJson(url, headers);
+          if (Array.isArray(data?.data)) {
+            models = data.data.map((m: any) => m.id).filter(Boolean);
+          }
+        } else if (provider === 'ollama') {
+          const base = (baseUrl || 'http://localhost:11434/v1').replace(/\/+$/, '');
+          try {
+            const data = await requestJson(`${base}/models`, {});
+            if (Array.isArray(data?.data)) {
+              models = data.data.map((m: any) => m.id || m.name).filter(Boolean);
+            }
+          } catch {}
+          if (models.length === 0) {
+            try {
+              const rootUrl = base.replace(/\/v1\/?$/, '');
+              const data = await requestJson(`${rootUrl}/api/tags`, {});
+              if (Array.isArray(data?.models)) {
+                models = data.models.map((m: any) => m.name || m.model).filter(Boolean);
+              }
+            } catch {}
+          }
+        } else {
+          // OpenAI, DeepSeek, OpenRouter, Starimg, Custom и любые OpenAI-совместимые шлюзы
+          const cleanBase = (baseUrl || 'https://api.openai.com/v1')
+            .replace(/\/+$/, '')
+            .replace(/\/chat\/completions$/, '');
+          const url = `${cleanBase}/models`;
+          const headers: Record<string, string> = { Accept: 'application/json' };
+          if (apiKey && apiKey.trim()) {
+            headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+          }
+          if (provider === 'openrouter') {
+            headers['HTTP-Referer'] = 'https://workspace.local';
+            headers['X-Title'] = 'WorkSpace';
+          }
+          const data = await requestJson(url, headers);
+          let raw: any[] = [];
+          if (Array.isArray(data?.data)) raw = data.data;
+          else if (Array.isArray(data?.models)) raw = data.models;
+          else if (Array.isArray(data)) raw = data;
+
+          models = raw
+            .map((m: any) => (typeof m === 'string' ? m : m.id || m.name))
+            .filter(Boolean);
+        }
+
+        const unique = Array.from(new Set(models)).sort((a, b) => a.localeCompare(b));
+        return { success: true, models: unique };
+      } catch (err) {
+        return { success: false, models: [], error: (err as Error).message };
+      }
+    }
+  );
 }

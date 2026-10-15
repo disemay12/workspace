@@ -758,6 +758,7 @@ const App: React.FC = () => {
             <AIChatPanel
               settings={ai.settings}
               isConfigured={ai.isConfigured}
+              availableModels={ai.availableModels}
               onUpdateModel={(model) => ai.updateSettings({ model })}
               activeTab={ws.activeTab}
               sessions={chat.sessions}
@@ -793,6 +794,9 @@ const App: React.FC = () => {
         onChangeProvider={(p) => void ai.changeProvider(p)}
         onUpdateSettings={ai.updateSettings}
         onSaveApiKey={ai.saveApiKey}
+        availableModels={ai.availableModels}
+        onFetchModels={ai.fetchModels}
+        modelsCache={ai.modelsCache}
         initialTab={settingsTab}
         onNotify={ws.flash}
       />

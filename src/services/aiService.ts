@@ -142,6 +142,83 @@ export const aiService = {
     }
   },
 
+  /**
+   * Запрос списка доступных моделей от API провайдера.
+   * В среде Electron запрос выполняется в главном процессе через IPC (обход CORS).
+   */
+  async fetchModels(
+    settings: AISettings
+  ): Promise<{ success: boolean; models: string[]; error?: string }> {
+    const provider = settings.provider;
+    const baseUrl = settings.baseUrl || PROVIDER_PRESETS[provider]?.baseUrl;
+    const apiKey = settings.apiKey;
+
+    if (isElectron() && window.electronAPI?.aiListModels) {
+      return await window.electronAPI.aiListModels({
+        provider,
+        baseUrl,
+        apiKey,
+      });
+    }
+
+    // Браузерный fallback
+    try {
+      if (provider === 'gemini') {
+        const base = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+        const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey.trim())}` : '';
+        const res = await fetch(`${base}/models${keyParam}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+        const data = await res.json();
+        const rawModels: string[] = (data.models || [])
+          .filter((m: any) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
+          .map((m: any) => String(m.name || '').replace(/^models\//, ''))
+          .filter((m: string) => Boolean(m));
+        const unique = Array.from(new Set(rawModels)).sort((a, b) => a.localeCompare(b));
+        return { success: true, models: unique };
+      }
+
+      if (provider === 'anthropic') {
+        const base = (baseUrl || 'https://api.anthropic.com/v1').replace(/\/+$/, '');
+        const res = await fetch(`${base}/models`, {
+          headers: {
+            'x-api-key': apiKey.trim(),
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+        const data = await res.json();
+        const rawModels: string[] = (data.data || []).map((m: any) => String(m.id || '')).filter(Boolean);
+        const unique = Array.from(new Set(rawModels)).sort((a, b) => a.localeCompare(b));
+        return { success: true, models: unique };
+      }
+
+      // OpenAI и совместимые
+      const cleanBase = (baseUrl || 'https://api.openai.com/v1')
+        .replace(/\/+$/, '')
+        .replace(/\/chat\/completions$/, '');
+      const headers: Record<string, string> = { Accept: 'application/json' };
+      if (apiKey.trim()) headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+      if (provider === 'openrouter') {
+        headers['HTTP-Referer'] = 'https://workspace.local';
+        headers['X-Title'] = 'WorkSpace';
+      }
+      const res = await fetch(`${cleanBase}/models`, { headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      const data = await res.json();
+      let raw: any[] = [];
+      if (Array.isArray(data?.data)) raw = data.data;
+      else if (Array.isArray(data?.models)) raw = data.models;
+      else if (Array.isArray(data)) raw = data;
+
+      const rawModels: string[] = raw.map((m: any) => String(typeof m === 'string' ? m : m.id || m.name || '')).filter(Boolean);
+      const unique = Array.from(new Set(rawModels)).sort((a, b) => a.localeCompare(b));
+      return { success: true, models: unique };
+    } catch (err) {
+      return { success: false, models: [], error: (err as Error).message };
+    }
+  },
+
   resolveEndpoint(settings: AISettings): string {
     const base = (settings.baseUrl || PROVIDER_PRESETS[settings.provider].baseUrl)
       .trim()

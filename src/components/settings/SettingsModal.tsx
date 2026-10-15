@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Settings as SettingsIcon,
   Sparkles,
@@ -32,6 +32,9 @@ interface Props {
   onChangeProvider: (provider: AIProvider) => void | Promise<void>;
   onUpdateSettings: (patch: Partial<AISettings>) => void;
   onSaveApiKey: (key: string) => void | Promise<void>;
+  availableModels?: string[];
+  onFetchModels?: (override?: Partial<AISettings>) => Promise<{ success: boolean; models: string[]; error?: string }>;
+  modelsCache?: Record<string, string[]>;
   initialTab?: Tab;
   onNotify?: (message: string) => void;
 }
@@ -56,6 +59,9 @@ export const SettingsModal: React.FC<Props> = ({
   onChangeProvider,
   onUpdateSettings,
   onSaveApiKey,
+  availableModels,
+  onFetchModels,
+  modelsCache,
   initialTab = 'provider',
   onNotify,
 }) => {
@@ -70,8 +76,26 @@ export const SettingsModal: React.FC<Props> = ({
   const [secrets, setSecrets] = useState<SecretsInfo | null>(null);
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelFetchResult, setModelFetchResult] = useState<{ ok: boolean; message: string; count?: number } | null>(null);
+  const [modelSearch, setModelSearch] = useState('');
 
   const preset = PROVIDER_PRESETS[settings.provider];
+
+  const providerModels = useMemo<string[]>(() => {
+    const fromApi = modelsCache?.[settings.provider] || [];
+    const fromPreset = preset.models || [];
+    const fromProps = availableModels || [];
+    const set = new Set<string>([...fromApi, ...fromProps, ...fromPreset]);
+    if (settings.model) set.add(settings.model);
+    return Array.from(set);
+  }, [modelsCache, settings.provider, preset.models, availableModels, settings.model]);
+
+  const filteredModels = useMemo<string[]>(() => {
+    if (!modelSearch.trim()) return providerModels;
+    const q = modelSearch.toLowerCase();
+    return providerModels.filter((m: string) => m.toLowerCase().includes(q));
+  }, [providerModels, modelSearch]);
 
   // При открытии синхронизируем черновик ключа и список сохранённых провайдеров
   useEffect(() => {
@@ -115,6 +139,14 @@ export const SettingsModal: React.FC<Props> = ({
         ok: true,
         message: `Ключ импортирован (${targetProvider === 'starimg' ? 'Starimg AI' : 'свой endpoint'}), модель: ${res.model || '—'}`,
       });
+
+      if (res.apiKey) {
+        void handleFetchModels({
+          provider: targetProvider,
+          baseUrl: res.baseUrl || settings.baseUrl,
+          apiKey: res.apiKey,
+        });
+      }
     } finally {
       setImporting(false);
     }
@@ -123,7 +155,40 @@ export const SettingsModal: React.FC<Props> = ({
   // Обновляем черновик при смене провайдера
   useEffect(() => {
     setKeyDraft(settings.apiKey);
+    setModelFetchResult(null);
+    setModelSearch('');
   }, [settings.provider, settings.apiKey]);
+
+  const handleFetchModels = async (override?: Partial<AISettings>) => {
+    setLoadingModels(true);
+    setModelFetchResult(null);
+    try {
+      const target = { ...settings, apiKey: keyDraft.trim(), ...override };
+      const res = onFetchModels
+        ? await onFetchModels(target)
+        : await aiService.fetchModels(target);
+
+      if (res.success && res.models && res.models.length > 0) {
+        setModelFetchResult({
+          ok: true,
+          count: res.models.length,
+          message: `Загружено ${res.models.length} моделей от API`,
+        });
+      } else {
+        setModelFetchResult({
+          ok: false,
+          message: res.error || 'Провайдер не вернул список моделей',
+        });
+      }
+    } catch (err) {
+      setModelFetchResult({
+        ok: false,
+        message: (err as Error).message || 'Ошибка загрузки моделей',
+      });
+    } finally {
+      setLoadingModels(false);
+    }
+  };
 
   const handleSaveKey = async () => {
     try {
@@ -131,6 +196,9 @@ export const SettingsModal: React.FC<Props> = ({
       void keyVault.listConfigured().then(setConfiguredProviders);
       setSavedFlash(true);
       window.setTimeout(() => setSavedFlash(false), 1800);
+      if (keyDraft.trim()) {
+        void handleFetchModels({ apiKey: keyDraft.trim() });
+      }
     } catch (err) {
       setTestResult({
         ok: false,
@@ -143,10 +211,24 @@ export const SettingsModal: React.FC<Props> = ({
     setTesting(true);
     setTestResult(null);
     // Тестируем с ключом из черновика, не дожидаясь сохранения
-    const result = await aiService.testConnection({ ...settings, apiKey: keyDraft.trim() });
+    const effective = { ...settings, apiKey: keyDraft.trim() };
+    const result = await aiService.testConnection(effective);
     setTestResult(result);
     setTesting(false);
+    if (result.ok) {
+      void handleFetchModels(effective);
+    }
   };
+
+  // При открытии вкладки «Модель» загружаем список, если он ещё не получен
+  useEffect(() => {
+    if (tab === 'model') {
+      const currentModels = modelsCache?.[settings.provider] || [];
+      if (currentModels.length === 0 && (keyDraft.trim() || settings.apiKey || !preset.requiresKey)) {
+        void handleFetchModels();
+      }
+    }
+  }, [tab, settings.provider]);
 
   const handleClearKey = async (provider: AIProvider) => {
     await keyVault.set(provider, '');
@@ -402,18 +484,50 @@ export const SettingsModal: React.FC<Props> = ({
       {/* ---- Модель и параметры ---- */}
       {tab === 'model' && (
         <div className="space-y-4">
-          <Field label="Модель" hint="Выберите из списка провайдера или введите идентификатор вручную.">
-            {preset.models.length > 0 ? (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-semibold text-ws">Модель ({preset.label})</label>
+              <button
+                type="button"
+                onClick={() => void handleFetchModels()}
+                disabled={loadingModels}
+                className="flex items-center gap-1.5 text-[11px] text-ws-accent hover:underline disabled:opacity-50"
+              >
+                {loadingModels ? (
+                  <Loader2 size={11} className="animate-spin" />
+                ) : (
+                  <RefreshCw size={11} />
+                )}
+                <span>{loadingModels ? 'Запрос к API...' : 'Обновить список из API'}</span>
+              </button>
+            </div>
+
+            {providerModels.length > 8 && (
+              <Input
+                value={modelSearch}
+                onChange={(e) => setModelSearch(e.target.value)}
+                placeholder="Поиск модели по названию..."
+                spellCheck={false}
+                className="text-xs font-mono mb-1.5"
+              />
+            )}
+
+            {providerModels.length > 0 ? (
               <Select
                 value={settings.model}
                 onChange={(e) => onUpdateSettings({ model: e.target.value })}
               >
-                {preset.models.map((m) => (
+                {filteredModels.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
                 ))}
-                {!preset.models.includes(settings.model) && settings.model && (
+                {filteredModels.length === 0 && (
+                  <option value={settings.model} disabled>
+                    Ничего не найдено (по фильтру «{modelSearch}»)
+                  </option>
+                )}
+                {!filteredModels.includes(settings.model) && settings.model && (
                   <option value={settings.model}>{settings.model} (текущая)</option>
                 )}
               </Select>
@@ -421,12 +535,41 @@ export const SettingsModal: React.FC<Props> = ({
               <Input
                 value={settings.model}
                 onChange={(e) => onUpdateSettings({ model: e.target.value })}
-                placeholder="например, qwen2.5-coder"
+                placeholder="например, gpt-4o или deepseek-chat"
                 spellCheck={false}
                 className="font-mono"
               />
             )}
-          </Field>
+
+            {modelFetchResult && (
+              <div
+                className={cn(
+                  'flex items-center gap-2 rounded border px-3 py-1.5 text-[11px] mt-1',
+                  modelFetchResult.ok
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-ws-success'
+                    : 'border-amber-500/40 bg-amber-500/10 text-ws-warning'
+                )}
+              >
+                {modelFetchResult.ok ? (
+                  <Check size={12} className="shrink-0" />
+                ) : (
+                  <AlertTriangle size={12} className="shrink-0" />
+                )}
+                <span>{modelFetchResult.message}</span>
+              </div>
+            )}
+
+            {!modelFetchResult && (modelsCache?.[settings.provider]?.length ?? 0) > 0 && (
+              <p className="text-[11px] text-ws-faint mt-1">
+                ✓ Загружено {modelsCache![settings.provider].length} моделей от API ({preset.label})
+              </p>
+            )}
+            {!modelFetchResult && (modelsCache?.[settings.provider]?.length ?? 0) === 0 && (
+              <p className="text-[11px] text-ws-faint mt-1">
+                Показаны стандартные пресеты. Нажмите «Обновить список из API», чтобы загрузить все доступные модели вашего тарифа/ключа.
+              </p>
+            )}
+          </div>
 
           <Field label="Своя модель" hint="Добавьте идентификатор, если его нет в списке выше.">
             <div className="flex gap-2">

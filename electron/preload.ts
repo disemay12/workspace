@@ -117,6 +117,14 @@ const electronAPI = {
   aiProbe: (url: string): Promise<{ reachable: boolean; status?: number; error?: string }> =>
     ipcRenderer.invoke('ai:probe', url),
 
+  /** Запрос списка моделей от API провайдера без ограничений CORS. */
+  aiListModels: (req: {
+    provider: string;
+    baseUrl?: string;
+    apiKey?: string;
+  }): Promise<{ success: boolean; models: string[]; error?: string }> =>
+    ipcRenderer.invoke('ai:listModels', req),
+
   /** Подписки на события потока. Возвращают функцию отписки. */
   onAiChunk: (cb: (data: { requestId: string; chunk: string }) => void): (() => void) => {
     const listener = (_e: unknown, data: { requestId: string; chunk: string }) => cb(data);
@@ -294,6 +302,7 @@ const electronAPI = {
       maxTokens?: number;
       systemPrompt?: string;
       activePresetId?: string;
+      modelsCache?: Record<string, string[]>;
     };
     keys: Record<string, string>;
   }> => ipcRenderer.invoke('aiSettings:load'),
@@ -305,6 +314,7 @@ const electronAPI = {
     maxTokens?: number;
     systemPrompt?: string;
     activePresetId?: string;
+    modelsCache?: Record<string, string[]>;
     apiKey?: string;
   }): Promise<{ success: boolean }> => ipcRenderer.invoke('aiSettings:save', patch),
 

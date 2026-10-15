@@ -27,6 +27,7 @@ interface Props {
   settings: AISettings;
   isConfigured: boolean;
   onUpdateModel?: (model: string) => void;
+  availableModels?: string[];
   activeTab: OpenTab | null;
   sessions: ChatSession[];
   activeSessionId: string;
@@ -52,6 +53,7 @@ export const AIChatPanel: React.FC<Props> = ({
   settings,
   isConfigured,
   onUpdateModel,
+  availableModels,
   activeTab,
   sessions,
   activeSessionId,
@@ -325,12 +327,19 @@ export const AIChatPanel: React.FC<Props> = ({
           title="Быстрая смена модели"
           className="rounded border border-ws bg-ws-surface px-2 py-0.5 text-[11px] font-mono text-ws focus:border-ws-accent focus:outline-none max-w-[200px] truncate"
         >
-          {(PROVIDER_PRESETS[settings.provider]?.models || [settings.model]).map((m) => (
+          {(availableModels && availableModels.length > 0
+            ? availableModels
+            : PROVIDER_PRESETS[settings.provider]?.models || [settings.model]
+          ).map((m) => (
             <option key={m} value={m}>
               {m}
             </option>
           ))}
-          {!(PROVIDER_PRESETS[settings.provider]?.models || []).includes(settings.model) && (
+          {!(
+            (availableModels && availableModels.length > 0
+              ? availableModels
+              : PROVIDER_PRESETS[settings.provider]?.models) || []
+          ).includes(settings.model) && (
             <option value={settings.model}>{settings.model}</option>
           )}
         </select>
