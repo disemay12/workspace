@@ -1,4 +1,5 @@
 import * as XLSX from 'xlsx';
+import JSZip from 'jszip';
 import { OpenTab } from '../types';
 import { docxBase64ToHtml } from './docx';
 
@@ -122,9 +123,45 @@ export async function docxText(base64: string): Promise<string> {
   }
 }
 
-/** Текст активной вкладки: Word, таблица или обычный текстовый файл. */
+/** Текст презентации .pptx: слайды и заметки докладчика. */
+export async function pptxText(base64: string): Promise<string> {
+  if (!base64.trim()) return '';
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+
+    const zip = await JSZip.loadAsync(bytes);
+    const slides = Object.keys(zip.files)
+      .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
+      .sort(
+        (a, b) =>
+          Number(a.match(/slide(\d+)/)?.[1] ?? 0) - Number(b.match(/slide(\d+)/)?.[1] ?? 0)
+      );
+
+    const parts: string[] = [];
+    for (let index = 0; index < slides.length; index += 1) {
+      const file = zip.file(slides[index]);
+      if (!file) continue;
+      const xml = await file.async('string');
+      const doc = new DOMParser().parseFromString(xml, 'application/xml');
+      const runs = [...doc.getElementsByTagName('*')]
+        .filter((element) => (element.localName || element.nodeName).toLowerCase() === 't')
+        .map((element) => (element.textContent ?? '').trim())
+        .filter(Boolean);
+      if (runs.length > 0) parts.push(`### Слайд ${index + 1}\n${runs.join('\n')}`);
+    }
+    return parts.join('\n\n');
+  } catch {
+    return '';
+  }
+}
+
+/** Текст активной вкладки: Word, таблица, презентация или текстовый файл. */
 export async function tabToDocumentText(tab: OpenTab): Promise<string> {
   if (tab.type === 'word') return await docxText(tab.content);
+
+  if (tab.type === 'powerpoint') return await pptxText(tab.content);
 
   if (tab.type === 'excel') {
     if (tab.encoding !== 'base64') return tab.content;

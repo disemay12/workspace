@@ -11,14 +11,14 @@ import {
   Save,
 } from 'lucide-react';
 
-import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment } from './types';
+import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment, FileType } from './types';
 import { fileSystemService, getFileType } from './services/fileSystemService';
 import { useWorkspace } from './state/workspace';
 import { useAISettings, useChatSessions } from './state/settings';
 import { useTheme } from './hooks/useTheme';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { cn, baseName, extName, joinPath, uid } from './lib/utils';
-import { docxText, tabToDocumentText } from './lib/documentText';
+import { docxText, pptxText, tabToDocumentText } from './lib/documentText';
 import { extractLegacyDocText } from './lib/legacyDoc';
 
 import { TitleBar } from './components/workspace/TitleBar';
@@ -51,6 +51,9 @@ import {
   normalizeTableValue,
   sanitizeFileName,
 } from './services/aiActions';
+
+/** Форматы, в которые приложение умеет записывать правки ИИ. */
+const EDITABLE_TYPES = new Set<FileType>(['word', 'excel', 'markdown', 'richtext', 'text', 'code']);
 
 const App: React.FC = () => {
   const ws = useWorkspace();
@@ -436,6 +439,11 @@ const App: React.FC = () => {
         return;
       }
 
+      if (!EDITABLE_TYPES.has(tab.type)) {
+        ws.flash(`Формат ${tab.extension.toUpperCase() || tab.type} доступен только для просмотра`);
+        return;
+      }
+
       if (tab.type === 'excel') {
         window.dispatchEvent(
           new CustomEvent('workspace:excel-insert-text', {
@@ -483,6 +491,13 @@ const App: React.FC = () => {
     async (text: string) => {
       const tab = ws.activeTab;
       if (!tab) return;
+
+      if (!EDITABLE_TYPES.has(tab.type)) {
+        ws.flash(
+          `Формат ${tab.extension.toUpperCase() || tab.type} доступен только для просмотра — правку некуда записать`
+        );
+        return;
+      }
 
       if (tab.type === 'excel') {
         window.dispatchEvent(
@@ -1030,6 +1045,17 @@ const App: React.FC = () => {
           const text = workbook.SheetNames.map(
             (name) => `### Лист: ${name}\n${XLSX.utils.sheet_to_csv(workbook.Sheets[name])}`
           ).join('\n\n');
+          return {
+            name: baseName(filePath),
+            path: filePath,
+            content: text.slice(0, 40000),
+            truncated: text.length > 40000,
+          };
+        }
+        if (ext === 'pptx') {
+          const res = await fileSystemService.readFile(filePath, 'base64');
+          const text = await pptxText(res.content);
+          if (!text.trim()) return null;
           return {
             name: baseName(filePath),
             path: filePath,

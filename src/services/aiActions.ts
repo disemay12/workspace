@@ -1,6 +1,6 @@
 import * as XLSX from 'xlsx';
 import { htmlToDocxBase64 } from '../lib/docx';
-import { markdownToDocumentHtml } from '../lib/aiDocument';
+import { markdownToDocumentHtml, stripAssistantNoise } from '../lib/aiDocument';
 
 /* ============================================================
    Типы действий AI по управлению программой WorkSpace
@@ -556,13 +556,13 @@ function normalizeAction(input: unknown): AIActionPayload | null {
     case 'insert_into_editor': {
       const text = asString(body.text) ?? content;
       if (typeof text !== 'string' || !text.trim()) return null;
-      return { action: 'insert_into_editor', text };
+      return { action: 'insert_into_editor', text: stripAssistantNoise(text) };
     }
 
     case 'replace_document': {
       const text = asString(body.text) ?? content;
       if (typeof text !== 'string' || !text.trim()) return null;
-      return { action: 'replace_document', text };
+      return { action: 'replace_document', text: stripAssistantNoise(text) };
     }
 
     case 'open_settings': {

@@ -38,6 +38,7 @@ import { aiService } from '../../services/aiService';
 import { SYSTEM_PRESETS, PROVIDER_PRESETS } from '../../state/settings';
 import { cn, extractCodeBlocks, uid } from '../../lib/utils';
 import { renderRichMarkdown, renderMermaidBlocks } from '../../lib/markdown';
+import { stripAssistantNoise, stripEmoji } from '../../lib/aiDocument';
 import {
   AIActionPayload,
   AppActionKind,
@@ -62,7 +63,7 @@ const EDIT_INTENT =
  * чтобы она не попала в документ.
  */
 function buildDocumentBody(answer: string): string {
-  const lines = answer.split('\n');
+  const lines = stripAssistantNoise(answer).split('\n');
   const first = lines[0]?.trim() ?? '';
   if (
     lines.length > 1 &&
@@ -526,9 +527,9 @@ export const AIChatPanel: React.FC<Props> = ({
         truncated: selectionText.length > 40000,
       };
     }
-    // Word/Excel хранят содержимое вкладки в base64 — модели нужен текст,
-    // иначе она получает ZIP-пакет и отвечает, что не может прочитать файл.
-    if (activeTab.type === 'word' || activeTab.type === 'excel') {
+    // Word/Excel/PowerPoint хранят содержимое вкладки в base64 — модели нужен
+    // извлечённый текст, иначе она получает ZIP-пакет и «не видит» файл.
+    if (!['markdown', 'richtext', 'text', 'code'].includes(activeTab.type)) {
       return (await onResolveActiveDocument?.()) ?? undefined;
     }
     return {
@@ -1481,7 +1482,7 @@ const MessageBubble: React.FC<{
 
   const displayContent = useMemo(() => {
     if (isUser) return message.content;
-    const cleaned = stripActionBlocks(message.content);
+    const cleaned = stripEmoji(stripActionBlocks(message.content));
     if (!cleaned && actions.length > 0) {
       return 'Выполняю команду по управлению рабочей областью...';
     }

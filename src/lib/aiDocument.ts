@@ -7,7 +7,7 @@
  */
 
 export function markdownToDocumentHtml(markdown: string): string {
-  const source = normalizeHtmlTags(stripFence(markdown)).replace(/\r\n/g, '\n').trim();
+  const source = normalizeHtmlTags(stripEmoji(stripFence(markdown))).replace(/\r\n/g, '\n').trim();
   if (!source) return '';
 
   const blocks: string[] = [];
@@ -117,6 +117,53 @@ function normalizeHtmlTags(source: string): string {
     .replace(/<a\s[^>]*>([\s\S]*?)<\/a>/gi, '$1')
     // Остальные теги (таблицы, картинки, script/style) в документе не нужны.
     .replace(/<[^>]+>/g, '');
+}
+
+/**
+ * Эмодзи и служебные символы их отрисовки. Модель любит добавлять их в
+ * заголовки документов, где они выглядят как мусор.
+ */
+const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu;
+
+export function stripEmoji(text: string): string {
+  return text
+    .replace(EMOJI_RE, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/[ \t]+$/gm, '');
+}
+
+/** Хвостовые фразы-предложения, которые не являются содержимым документа. */
+const META_TAIL_RE =
+  /^(готово|хотите|если хотите|если нужно|могу|либо|уточните|что дальше|варианты|дайте знать|сообщите|примечание|p\.s\.|ps:)(?=\s|,|:|—|$)/i;
+
+/**
+ * Убирает из ответа модели эмодзи и хвост «Готово / Хотите, я создам файл? /
+ * Уточните…», чтобы в документ попадал только его текст.
+ */
+export function stripAssistantNoise(text: string): string {
+  const cleaned = stripEmoji(text).replace(/\r\n/g, '\n').trim();
+  const blocks = cleaned.split(/\n{2,}/);
+  if (blocks.length < 2) return cleaned;
+
+  const isMeta = (block: string) => {
+    const first = block
+      .trim()
+      .split('\n')[0]
+      .trim()
+      .replace(/^[#>*\-\s]+/, '')
+      .replace(/^\d+[.)]\s*/, '');
+    return META_TAIL_RE.test(first);
+  };
+
+  let cut = -1;
+  for (let i = 1; i < blocks.length; i += 1) {
+    if (isMeta(blocks[i]) && i / blocks.length >= 0.5) {
+      cut = i;
+      break;
+    }
+  }
+  if (cut > 0) blocks.length = cut;
+  return blocks.join('\n\n').trim();
 }
 
 /** Убирает обёртку из тройных кавычек, если модель всё-таки её добавила. */
