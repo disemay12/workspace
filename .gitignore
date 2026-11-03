@@ -72,3 +72,6 @@ ws-*.log
 ai-settings.json
 **/ai-settings.json
 gdrive.json
+
+graphify-out/
+
