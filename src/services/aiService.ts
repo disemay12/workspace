@@ -1,5 +1,5 @@
 import { AISettings, ChatMessage } from '../types';
-import { PROVIDER_PRESETS } from '../state/settings';
+import { PROVIDER_PRESETS, normalizeSettings } from '../state/settings';
 import { uid } from '../lib/utils';
 
 /** Максимальный размер прикрепляемого к запросу файла (символов). */
@@ -186,6 +186,16 @@ export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты — интеллектуа
 Используй это действие, когда просят «перенеси все данные из файла в таблицу». Не переписывай строки вручную: приложение прочитает файл целиком.
 Если пользователь просит «перенеси данные в нашу таблицу», используй edit_table для открытой таблицы или import_table с её именем в target.
 
+РЕДАКТИРОВАНИЕ ДОКУМЕНТА
+- Содержимое активного документа приходит в сообщении блоком «[Файл: имя]» или «[Прикреплённый файл: имя]». Ты уже видишь текст документа и имеешь право записи в него.
+- «Исправь ошибки», «перепиши», «сократи», «оформи», «приведи в порядок», «сделай красиво» — это команда заменить документ целиком: верни replace_document с полным новым текстом.
+- Дополнить документ или вставить фрагмент — insert_into_editor.
+- Запрещено отвечать «не могу редактировать документ Word», «вот рекомендации по оформлению» и вообще давать советы вместо правки. Если содержимого документа в сообщении нет, одной строкой попроси открыть файл и приложить его.
+- Оформление задавай Markdown-разметкой, приложение превратит её в настоящие стили Word: # — заголовок 1, ## — заголовок 2, ### — заголовок 3, - — маркированный список, 1. — нумерованный, **жирный**, > — цитата, | таблица |, --- — разделитель.
+- Перед блоком действия — одна короткая строка о том, что изменено. Сам текст документа в чат не дублируй: он попадёт в документ из блока действия.
+- Не добавляй в конец разбор «Что улучшено / что изменено»: этот текст тоже попадёт в документ.
+- Если блок действия вернуть не получается, отдай готовый текст документа обычным сообщением без вступления — приложение применит его к открытому документу.
+
 ВЛОЖЕННЫЕ ФАЙЛЫ
 - Если в сообщении пользователя есть блок «[Файл: имя]» — это уже прочитанное содержимое файла. Используй его напрямую.
 - Никогда не отвечай, что у тебя нет доступа к файлам или файловой системе: ты управляешь WorkSpace и можешь создавать и изменять файлы через действия.
@@ -220,6 +230,9 @@ export const aiService = {
       return { ok: false, message: 'API-ключ не указан' };
     }
 
+    const endpoint = this.resolveEndpoint(settings);
+    const model = settings.model || 'не выбрана';
+
     try {
       let received = '';
       const probe: ChatMessage[] = [
@@ -236,10 +249,10 @@ export const aiService = {
       });
       return {
         ok: true,
-        message: `Подключение успешно. Модель ответила: «${received.trim().slice(0, 40) || 'ок'}»`,
+        message: `Подключение успешно: ${endpoint} · модель ${model}. Ответ: «${received.trim().slice(0, 40) || 'ок'}»`,
       };
     } catch (err) {
-      return { ok: false, message: (err as Error).message };
+      return { ok: false, message: `${endpoint} · модель ${model}: ${(err as Error).message}` };
     }
   },
 
@@ -345,8 +358,11 @@ export const aiService = {
     signal?: AbortSignal,
     appContext?: string
   ): Promise<void> {
-    const preset = PROVIDER_PRESETS[settings.provider];
-    if (preset.requiresKey && !settings.apiKey.trim()) {
+    // Адрес и модель обязаны соответствовать провайдеру: иначе ключ Starimg
+    // уходит на api.openai.com и приложение «перестаёт подключаться».
+    const effective = normalizeSettings(settings);
+    const preset = PROVIDER_PRESETS[effective.provider];
+    if (preset.requiresKey && !effective.apiKey.trim()) {
       callbacks.onError(
         new Error(
           `API-ключ для ${preset.label} не указан. Откройте Настройки → AI и введите ваш персональный ключ.`
@@ -363,12 +379,12 @@ export const aiService = {
     }
 
     try {
-      if (settings.provider === 'anthropic') {
-        await this.streamAnthropic(clean, settings, callbacks, signal, appContext);
-      } else if (settings.provider === 'gemini') {
-        await this.streamGemini(clean, settings, callbacks, signal, appContext);
+      if (effective.provider === 'anthropic') {
+        await this.streamAnthropic(clean, effective, callbacks, signal, appContext);
+      } else if (effective.provider === 'gemini') {
+        await this.streamGemini(clean, effective, callbacks, signal, appContext);
       } else {
-        await this.streamOpenAICompatible(clean, settings, callbacks, signal, appContext);
+        await this.streamOpenAICompatible(clean, effective, callbacks, signal, appContext);
       }
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') return;

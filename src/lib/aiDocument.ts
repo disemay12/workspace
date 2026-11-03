@@ -7,7 +7,7 @@
  */
 
 export function markdownToDocumentHtml(markdown: string): string {
-  const source = stripFence(markdown).replace(/\r\n/g, '\n').trim();
+  const source = normalizeHtmlTags(stripFence(markdown)).replace(/\r\n/g, '\n').trim();
   if (!source) return '';
 
   const blocks: string[] = [];
@@ -88,6 +88,35 @@ export function markdownToDocumentHtml(markdown: string): string {
   }
 
   return blocks.join('');
+}
+
+/**
+ * Модель часто отвечает HTML-разметкой (<b>, <details>, <summary>).
+ * В документе такие теги не поддерживаются, и без этой замены они попадают
+ * в текст буквально: «<details> <summary><b>...».
+ */
+function normalizeHtmlTags(source: string): string {
+  return source
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<(b|strong)(\s[^>]*)?>/gi, '**')
+    .replace(/<\/(b|strong)>/gi, '**')
+    .replace(/<(i|em)(\s[^>]*)?>/gi, '*')
+    .replace(/<\/(i|em)>/gi, '*')
+    .replace(/<u(\s[^>]*)?>/gi, '__')
+    .replace(/<\/u>/gi, '__')
+    .replace(/<(s|strike|del)(\s[^>]*)?>/gi, '~~')
+    .replace(/<\/(s|strike|del)>/gi, '~~')
+    .replace(/<(code)(\s[^>]*)?>/gi, '`')
+    .replace(/<\/code>/gi, '`')
+    .replace(/<summary(\s[^>]*)?>/gi, '\n')
+    .replace(/<\/summary>/gi, '\n')
+    .replace(/<\/?details(\s[^>]*)?>/gi, '\n')
+    .replace(/<\/?(p|div|section|article)(\s[^>]*)?>/gi, '\n')
+    .replace(/<\/(li|h[1-6]|tr|blockquote)>/gi, '\n')
+    .replace(/<(li|h[1-6]|tr|blockquote)(\s[^>]*)?>/gi, '\n')
+    .replace(/<a\s[^>]*>([\s\S]*?)<\/a>/gi, '$1')
+    // Остальные теги (таблицы, картинки, script/style) в документе не нужны.
+    .replace(/<[^>]+>/g, '');
 }
 
 /** Убирает обёртку из тройных кавычек, если модель всё-таки её добавила. */

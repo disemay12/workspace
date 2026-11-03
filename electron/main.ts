@@ -11,6 +11,7 @@ import { registerVideo } from './video';
 import { registerYoutube } from './youtube';
 import { registerHostedImageUpload } from './imageHost';
 import { registerAiSettings } from './aiSettings';
+import { docBufferToText } from './docText';
 import { setWatchRoot } from './watcher';
 import { registerTerminal } from './terminal';
 import { registerContextMenuIpc } from './contextMenu';
@@ -690,6 +691,24 @@ ipcMain.handle('fs:listDirectory', async (_event, dirPath: string) => {
   }
 });
 
+/**
+ * Текст устаревшего .doc (Word 97-2003). Разбор идёт в главном процессе:
+ * формат требует Buffer и разбора OLE2-контейнера.
+ */
+ipcMain.handle(
+  'doc:extractText',
+  async (_event, payload: { path?: string; base64?: string } = {}) => {
+    try {
+      const buffer = payload.base64
+        ? Buffer.from(payload.base64, 'base64')
+        : await fs.promises.readFile(payload.path ?? '');
+      return { success: true, text: docBufferToText(buffer) };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  }
+);
+
 ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8') => {  try {
     const buffer = await fs.promises.readFile(filePath);
     if (encoding === 'base64') {
@@ -847,9 +866,10 @@ ipcMain.handle(
         await fs.promises.writeFile(filePath, payload, { flag: 'wx' });
       } catch (err) {
         const e = err as NodeJS.ErrnoException;
-        // Некоторые антивирусы/ФС возвращают EPERM на эксклюзивное создание,
-        // хотя обычная запись в эту папку разрешена.
-        if (e.code === 'EPERM') {
+        // Антивирус/git на мгновение держат каталог: одна повторная попытка
+        // без эксклюзивного флага и с паузой снимает EPERM/EACCES.
+        if (e.code === 'EPERM' || e.code === 'EACCES' || e.code === 'EBUSY') {
+          await new Promise((resolve) => setTimeout(resolve, 150));
           await fs.promises.writeFile(filePath, payload);
         } else {
           throw err;

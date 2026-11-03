@@ -116,6 +116,7 @@ export async function htmlToDocxBase64(html: string): Promise<string> {
   const word = zip.folder('word')!;
   word.file('document.xml', documentXml(bodyXml || '<w:p/>'));
   word.file('styles.xml', stylesXml());
+  word.file('numbering.xml', numberingXml());
   word.folder('_rels')!.file('document.xml.rels', documentRelsXml(images));
 
   for (const image of images.values()) {
@@ -550,6 +551,33 @@ function stylesXml(): string {
   );
 }
 
+/**
+ * Описание списков: numId 1 — маркированный, 2 — нумерованный.
+ * Без numbering.xml Word и собственный разбор считают любые списки
+ * нумерованными, и маркеры «•» превращаются в «1. 2. 3.».
+ */
+function numberingXml(): string {
+  const level = (fmt: string, text: string) =>
+    '<w:lvl w:ilvl="0"><w:start w:val="1"/>' +
+    `<w:numFmt w:val="${fmt}"/><w:lvlText w:val="${text}"/><w:lvlJc w:val="left"/>` +
+    '<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>' +
+    (fmt === 'bullet' ? '<w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr>' : '') +
+    '</w:lvl>';
+  return (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    `<w:numbering xmlns:w="${W_NS}">` +
+    '<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="singleLevel"/>' +
+    level('bullet', '\u2022') +
+    '</w:abstractNum>' +
+    '<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="singleLevel"/>' +
+    level('decimal', '%1.') +
+    '</w:abstractNum>' +
+    '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>' +
+    '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>' +
+    '</w:numbering>'
+  );
+}
+
 function contentTypesXml(images: Map<string, ImageEntry>): string {
   const defaults = new Map<string, string>([
     ['rels', 'application/vnd.openxmlformats-package.relationships+xml'],
@@ -562,6 +590,7 @@ function contentTypesXml(images: Map<string, ImageEntry>): string {
     `<Types xmlns="${CT_NS}">${body}` +
     '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
     '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>' +
+    '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>' +
     '</Types>'
   );
 }
@@ -586,6 +615,7 @@ function documentRelsXml(images: Map<string, ImageEntry>): string {
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     `<Relationships xmlns="${REL_NS}">${rels}` +
     '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
+    '<Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>' +
     '</Relationships>'
   );
 }

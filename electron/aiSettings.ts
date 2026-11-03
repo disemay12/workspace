@@ -98,12 +98,15 @@ export function registerAiSettings(): void {
   ipcMain.handle('aiSettings:load', () => {
     const data = read();
     const keys: Record<string, string> = {};
+    /** Ключи, которые не удалось расшифровать (профиль/компьютер сменились). */
+    const keyErrors: string[] = [];
     for (const [provider, stored] of Object.entries(data.keys ?? {})) {
       const value = open(stored);
       if (value) keys[provider] = value;
+      else keyErrors.push(provider);
     }
     const { keys: _omit, ...settings } = data;
-    return { settings, keys };
+    return { settings, keys, keyErrors };
   });
 
   ipcMain.handle(

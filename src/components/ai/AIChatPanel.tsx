@@ -30,8 +30,10 @@ import {
   Bell,
   MousePointerClick,
   FolderInput,
+  ShieldCheck,
+  ShieldAlert,
 } from 'lucide-react';
-import { AISettings, ChatMessage, ChatSession, OpenTab } from '../../types';
+import { AISettings, ChatAttachment, ChatMessage, ChatSession, OpenTab } from '../../types';
 import { aiService } from '../../services/aiService';
 import { SYSTEM_PRESETS, PROVIDER_PRESETS } from '../../state/settings';
 import { cn, extractCodeBlocks, uid } from '../../lib/utils';
@@ -47,6 +49,31 @@ import {
   stripActionBlocks,
 } from '../../services/aiActions';
 import { AIBadge, Button, IconButton, Spinner, Textarea } from '../ui';
+
+/** Действия, меняющие содержимое открытого документа. */
+const DOC_WRITE_ACTIONS = new Set<string>(['insert_into_editor', 'replace_document']);
+
+/** Просьба поработать с текстом документа, а не ответить на вопрос. */
+const EDIT_INTENT =
+  /(исправ|перепиш|перепис|оформ|сократ|приведи|сделай|структурир|отредакт|редактир|улучш|вычит|перевод|переведи|дополн|добавь|убери|замени|измени|обнови|сформат|выровняй)/i;
+
+/**
+ * Убирает из ответа вступительную фразу-комментарий («Вот вариант текста…»),
+ * чтобы она не попала в документ.
+ */
+function buildDocumentBody(answer: string): string {
+  const lines = answer.split('\n');
+  const first = lines[0]?.trim() ?? '';
+  if (
+    lines.length > 1 &&
+    first.length < 160 &&
+    /^(вот|ниже|готово|конечно|разумеется|держите|представляю)\s/i.test(first)
+  ) {
+    lines.shift();
+    while (lines.length > 0 && !lines[0].trim()) lines.shift();
+  }
+  return lines.join('\n').trim();
+}
 
 interface Props {
   settings: AISettings;
@@ -84,6 +111,11 @@ interface Props {
   onReadDroppedFiles?: (
     paths: string[]
   ) => Promise<{ name: string; path: string; content: string; truncated?: boolean }[]>;
+  /** Текст активного документа: Word-вкладка хранит base64, его нужно разобрать. */
+  onResolveActiveDocument?: () => Promise<ChatAttachment | null>;
+  /** Выданы ли ассистенту права на запись в открытый документ. */
+  docWriteAccess: boolean;
+  onToggleDocWriteAccess: (value: boolean) => void;
 }
 
 export const AIChatPanel: React.FC<Props> = ({
@@ -109,10 +141,13 @@ export const AIChatPanel: React.FC<Props> = ({
   appContext,
   onResolveAttachment,
   onReadDroppedFiles,
+  onResolveActiveDocument,
+  docWriteAccess,
+  onToggleDocWriteAccess,
 }) => {
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [attachFile, setAttachFile] = useState(false);
+  const [attachFile, setAttachFile] = useState(true);
   const [attachSelection, setAttachSelection] = useState(false);
   const [selectionText, setSelectionText] = useState('');
   const [copiedId, setCopiedId] = useState('');
@@ -131,6 +166,8 @@ export const AIChatPanel: React.FC<Props> = ({
     >
   >({});
   const executedActionsRef = useRef<Set<string>>(new Set());
+  /** Ответы, уже применённые к документу как готовый текст. */
+  const autoAppliedRef = useRef<Set<string>>(new Set());
   /** Действия из истории до открытия панели повторно не выполняются. */
   const mountedAtRef = useRef(Date.now());
   const autoRunBusyRef = useRef(false);
@@ -271,9 +308,15 @@ export const AIChatPanel: React.FC<Props> = ({
       };
 
       try {
+        // Переписывание целого документа не влезает в 4096 токенов:
+        // ответ обрывается на середине и в документ попадает половина текста.
+        const requestSettings = EDIT_INTENT.test(text)
+          ? { ...settings, maxTokens: Math.max(settings.maxTokens, 8192) }
+          : settings;
+
         await aiService.streamChat(
           [...base, apiUserMessage],
-          settings,
+          requestSettings,
           {
             onChunk: (partial) => {
               buffer = partial;
@@ -379,6 +422,7 @@ export const AIChatPanel: React.FC<Props> = ({
         const key = `${msg.id}_${idx}`;
         if (executedActionsRef.current.has(key)) return;
         if (requiresConfirmation(act)) return;
+        if (DOC_WRITE_ACTIONS.has(act.action) && !docWriteAccess) return;
         pending.push({ action: act, key });
       });
     }
@@ -396,7 +440,41 @@ export const AIChatPanel: React.FC<Props> = ({
       autoRunBusyRef.current = false;
       setActionTick((v) => v + 1);
     });
-  }, [messages, executeAction, actionTick]);
+  }, [messages, executeAction, actionTick, docWriteAccess]);
+
+  /**
+   * Ответ без блока действия, но с готовым текстом документа.
+   *
+   * Модели часто игнорируют протокол и присылают переписанный документ прямо
+   * в чат. Тогда применяем ответ к открытому документу сами — иначе правка
+   * остаётся только сообщением, и «в документе ничего не меняется».
+   */
+  useEffect(() => {
+    if (!docWriteAccess) return;
+    const tab = activeTab;
+    if (!tab) return;
+    if (!['word', 'markdown', 'richtext', 'text'].includes(tab.type)) return;
+
+    for (let index = 0; index < messages.length; index++) {
+      const msg = messages[index];
+      if (msg.role !== 'assistant' || msg.streaming) continue;
+      if (msg.timestamp < mountedAtRef.current) continue;
+      if (autoAppliedRef.current.has(msg.id)) continue;
+      if (parseAIActions(msg.content).length > 0) continue;
+
+      const answer = stripActionBlocks(msg.content).trim();
+      if (answer.length < 300) continue;
+
+      const request = [...messages.slice(0, index)].reverse().find((item) => item.role === 'user');
+      if (!request || !EDIT_INTENT.test(request.content)) continue;
+      // Вопрос или отказ модели — не повод перезаписывать документ.
+      if (/не могу|не имеет смысла|уточните|какой именно|пришлите/i.test(answer.slice(0, 300))) continue;
+
+      autoAppliedRef.current.add(msg.id);
+      void onApplyToDocument(buildDocumentBody(answer));
+      break;
+    }
+  }, [messages, docWriteAccess, activeTab, onApplyToDocument]);
 
   const handleCreateTableFromMarkdown = useCallback(
     async (table: ParsedMarkdownTable, format: 'xlsx' | 'csv' = 'xlsx') => {
@@ -438,8 +516,8 @@ export const AIChatPanel: React.FC<Props> = ({
   }, [pendingPrompt?.token]);
 
   /* ---------- Сборка вложения ---------- */
-  const buildAttachment = (): ChatMessage['attachedFile'] | undefined => {
-    if (!activeTab) return undefined;
+  const buildAttachment = async (): Promise<ChatMessage['attachedFile'] | undefined> => {
+    if (!activeTab || !attachFile) return undefined;
     if (attachSelection && selectionText) {
       return {
         name: `${activeTab.name} (выделенное)`,
@@ -448,22 +526,28 @@ export const AIChatPanel: React.FC<Props> = ({
         truncated: selectionText.length > 40000,
       };
     }
-    if (attachFile) {
-      return {
-        name: activeTab.name,
-        path: activeTab.path,
-        content: activeTab.content,
-        truncated: activeTab.content.length > 40000,
-      };
+    // Word/Excel хранят содержимое вкладки в base64 — модели нужен текст,
+    // иначе она получает ZIP-пакет и отвечает, что не может прочитать файл.
+    if (activeTab.type === 'word' || activeTab.type === 'excel') {
+      return (await onResolveActiveDocument?.()) ?? undefined;
     }
-    return undefined;
+    return {
+      name: activeTab.name,
+      path: activeTab.path,
+      content: activeTab.content,
+      truncated: activeTab.content.length > 40000,
+    };
   };
 
   const handleSend = () => {
     const text = input.trim() || (droppedFiles.length > 0 ? 'Проанализируй приложенные файлы' : '');
     if (!text) return;
-    void submit(text, buildAttachment(), droppedFiles.length > 0 ? droppedFiles : undefined);
+    const dropped = droppedFiles.length > 0 ? droppedFiles : undefined;
     setDroppedFiles([]);
+    void (async () => {
+      const attachment = await buildAttachment();
+      await submit(text, attachment, dropped);
+    })();
   };
 
   /* ---------- Перетаскивание файлов из Проводника ---------- */
@@ -697,11 +781,25 @@ export const AIChatPanel: React.FC<Props> = ({
             message={msg}
             isCopied={copiedId === msg.id}
             onCopy={() => copyMessage(msg.id, msg.content)}
-            onInsert={(text) => onInsertIntoEditor(text)}
-            onReplace={(text) => onApplyToDocument(text)}
+            onInsert={(text) => {
+              if (!docWriteAccess) onToggleDocWriteAccess(true);
+              onInsertIntoEditor(text);
+            }}
+            onReplace={(text) => {
+              if (!docWriteAccess) onToggleDocWriteAccess(true);
+              onApplyToDocument(text);
+            }}
             hasActiveTab={Boolean(activeTab)}
             actionStates={actionStates}
-            onExecuteAction={executeAction}
+            onExecuteAction={(action, key) => {
+              // Ручной запуск действия — это и есть согласие на запись:
+              // фиксируем ключ, чтобы автозапуск не выполнил его повторно.
+              executedActionsRef.current.add(key);
+              if (DOC_WRITE_ACTIONS.has(action.action) && !docWriteAccess) {
+                onToggleDocWriteAccess(true);
+              }
+              void executeAction(action, key);
+            }}
             onOpenFile={(path) => {
               void onRunAction({ action: 'open_file', path });
             }}
@@ -717,7 +815,7 @@ export const AIChatPanel: React.FC<Props> = ({
           <div className="mb-2 flex flex-wrap items-center gap-1.5">
             <button
               onClick={() => setAttachFile((v) => !v)}
-              title="Прикрепить содержимое открытого файла к запросу"
+              title="Содержимое открытого файла прикладывается к запросу. Нажмите, чтобы отключить."
               className={cn(
                 'flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors',
                 attachFile
@@ -742,6 +840,29 @@ export const AIChatPanel: React.FC<Props> = ({
               >
                 <Code2 size={10} />
                 Выделено: {selectionText.length} симв.
+              </button>
+            )}
+
+            {(activeTab.type === 'word' ||
+              activeTab.type === 'markdown' ||
+              activeTab.type === 'richtext' ||
+              activeTab.type === 'text') && (
+              <button
+                onClick={() => onToggleDocWriteAccess(!docWriteAccess)}
+                title={
+                  docWriteAccess
+                    ? 'Ассистент правит открытый документ сам. Нажмите, чтобы запретить запись.'
+                    : 'Запись запрещена. Нажмите, чтобы разрешить ассистенту изменять документ.'
+                }
+                className={cn(
+                  'flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors',
+                  docWriteAccess
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                    : 'border-amber-500/40 bg-amber-500/10 text-ws-warning'
+                )}
+              >
+                {docWriteAccess ? <ShieldCheck size={10} /> : <ShieldAlert size={10} />}
+                {docWriteAccess ? 'Права записи выданы' : 'Предоставить права на запись'}
               </button>
             )}
           </div>

@@ -218,7 +218,12 @@ declare global {
       listDirectory: (dirPath: string) => Promise<{ success: boolean; items: FileItem[]; error?: string }>;
       readFile: (filePath: string, encoding?: string) => Promise<{ success: boolean; content?: string; isBinary?: boolean; error?: string }>;
       readPreview: (filePath: string, maxBytes?: number) => Promise<{ success: boolean; base64?: string; size?: number; error?: string }>;
-      openPath: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+      /** Текст устаревшего .doc (Word 97-2003): разбор OLE2 в главном процессе. */
+      extractDocText: (payload: { path?: string; base64?: string }) => Promise<{
+        success: boolean;
+        text?: string;
+        error?: string;
+      }>;      openPath: (filePath: string) => Promise<{ success: boolean; error?: string }>;
       getPathForFile: (file: File) => string;
       writeFile: (filePath: string, content: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
       createFile: (filePath: string, initialContent?: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
@@ -262,6 +267,8 @@ declare global {
       loadAiSettings?: () => Promise<{
         settings: Partial<AISettings>;
         keys: Record<string, string>;
+        /** Провайдеры, чьи ключи не расшифровались на этом компьютере. */
+        keyErrors?: string[];
       }>;
       saveAiSettings?: (patch: Partial<AISettings> & { apiKey?: string }) => Promise<{ success: boolean }>;
 

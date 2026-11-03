@@ -141,6 +141,8 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState('');
   const [format, setFormat] = useState<FormatState>(EMPTY_FORMAT);
+  /** HTML до последней замены ассистентом — для кнопки «Вернуть прежний текст». */
+  const [aiSnapshot, setAiSnapshot] = useState<string | null>(null);
 
   const editorRef = useRef<HTMLDivElement>(null);
   /**
@@ -327,6 +329,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
       if (!root) return;
       const html = markdownToDocumentHtml(detail.text || '');
       isSyncing.current = true;
+      setAiSnapshot(root.innerHTML);
       root.innerHTML = html || '<p></p>';
       setWordCount(countWords(root.innerText));
       queueMicrotask(() => {
@@ -342,6 +345,20 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
       window.removeEventListener('workspace:replace-document', handleReplace);
     };
   }, [handleInput, tab.id]);
+
+  /** Возврат документа к состоянию до замены ассистентом. */
+  const restoreAiSnapshot = useCallback(() => {
+    const root = editorRef.current;
+    if (!root || aiSnapshot === null) return;
+    isSyncing.current = true;
+    root.innerHTML = aiSnapshot || '<p></p>';
+    setWordCount(countWords(root.innerText));
+    setAiSnapshot(null);
+    queueMicrotask(() => {
+      isSyncing.current = false;
+    });
+    handleInput();
+  }, [aiSnapshot, handleInput]);
 
   /** Снять текущее оформление с каретки — чтобы кнопки и списки показывали реальное состояние. */
   const refreshFormat = useCallback(() => {
@@ -827,6 +844,37 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
         <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-ws-warning">
           <AlertTriangle size={12} />
           {error}
+        </div>
+      )}
+
+      {tab.extension === 'doc' && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[11px] text-ws-warning">
+          <AlertTriangle size={11} />
+          <span className="flex-1">
+            Формат .doc: текст извлечён без оформления. Сохранение создаст .docx рядом — исходный
+            .doc останется без изменений.
+          </span>
+        </div>
+      )}
+
+      {aiSnapshot !== null && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-blue-500/40 bg-blue-500/10 px-3 py-1.5 text-[11px] text-ws">
+          <Sparkles size={11} className="text-blue-400" />
+          <span className="flex-1">Документ переписан ассистентом</span>
+          <button
+            onClick={restoreAiSnapshot}
+            className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+          >
+            <Undo2 size={10} />
+            Вернуть прежний текст
+          </button>
+          <button
+            onClick={() => setAiSnapshot(null)}
+            title="Скрыть уведомление"
+            className="rounded px-1 py-0.5 text-[10px] text-ws-faint hover:bg-ws-hover hover:text-ws"
+          >
+            Скрыть
+          </button>
         </div>
       )}
 

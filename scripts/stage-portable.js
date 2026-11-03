@@ -38,6 +38,7 @@ const keep = new Set([
   'terminal.js',
   'aiProxy.js',
   'aiSettings.js',
+  'docText.js',
   'share.js',
   'gdrive.js',
   'video.js',

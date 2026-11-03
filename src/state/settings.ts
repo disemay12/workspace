@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AISettings,
   AIProvider,
@@ -118,6 +118,39 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
     'Ты — профессиональный ассистент и оператор рабочего пространства WorkSpace. Ты можешь отвечать на вопросы, писать код, анализировать логи и формулы Excel, а также НАПРЯМУЮ УПРАВЛЯТЬ приложением (создавать таблицы и файлы через блок workspace-action). Отвечай структурированно и по существу.',
   activePresetId: 'general',
 };
+
+const PRESET_URLS = new Set(
+  Object.values(PROVIDER_PRESETS).map((preset) => preset.baseUrl.replace(/\/+$/, ''))
+);
+
+/**
+ * Приводит настройки в согласованный вид: адрес и модель должны принадлежать
+ * выбранному провайдеру.
+ *
+ * Классическая поломка «перестало подключаться»: провайдер Starimg, а baseUrl
+ * остался от OpenAI (403/401 на каждом запросе). Чужой адрес из списка
+ * пресетов заменяется адресом провайдера, вместе с ним — модель по умолчанию.
+ * Произвольные адреса (свой endpoint) не трогаем.
+ */
+export function normalizeSettings(input: AISettings): AISettings {
+  // Свой endpoint и локальная Ollama — адрес задаёт пользователь.
+  if (input.provider === 'custom' || input.provider === 'ollama') return input;
+  const preset = PROVIDER_PRESETS[input.provider];
+  if (!preset) return input;
+
+  const presetUrl = preset.baseUrl.replace(/\/+$/, '');
+  const currentUrl = (input.baseUrl || '').trim().replace(/\/+$/, '');
+  const foreignPreset = Boolean(currentUrl) && currentUrl !== presetUrl && PRESET_URLS.has(currentUrl);
+
+  if (!currentUrl) return { ...input, baseUrl: preset.baseUrl };
+  if (!foreignPreset) return input;
+
+  return {
+    ...input,
+    baseUrl: preset.baseUrl,
+    model: preset.models[0] || input.model,
+  };
+}
 
 /* ============================================================
    Системные промты (пресеты ролей)
@@ -288,7 +321,9 @@ export const keyVault = {
 function loadSettings(): AISettings {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...DEFAULT_AI_SETTINGS, ...(JSON.parse(raw) as Partial<AISettings>) };
+    if (raw) {
+      return normalizeSettings({ ...DEFAULT_AI_SETTINGS, ...(JSON.parse(raw) as Partial<AISettings>) });
+    }
   } catch {
     // повреждённые настройки — используем значения по умолчанию
   }
@@ -312,10 +347,15 @@ async function persistPersistent(settings: AISettings, apiKey?: string): Promise
 
 export function useAISettings() {
   const [settings, setSettingsState] = useState<AISettings>(loadSettings);
+  /** Актуальные настройки для колбэков, вызываемых сразу после смены провайдера. */
+  const settingsRef = useRef<AISettings>(settings);
+  settingsRef.current = settings;
   const [keyLoaded, setKeyLoaded] = useState(false);
 
   // Ключ активного провайдера подгружается из защищённого хранилища
   const [providerKey, setProviderKey] = useState('');
+  /** Сообщение о нечитаемом ключе — показывается один раз при старте. */
+  const [keyProblem, setKeyProblem] = useState('');
 
   const persist = useCallback((next: AISettings) => {
     setSettingsState(next);
@@ -447,22 +487,18 @@ export function useAISettings() {
 
   /** Сохранение ключа: в профиль пользователя и в локальный кэш. */
   const saveApiKey = useCallback(
-    async (apiKey: string) => {
-      let snapshot: AISettings | null = null;
-      setSettingsState((prev) => {
-        const provider = prev.provider;
-        void keyVault.set(provider, apiKey);
-        setProviderKey(apiKey);
-        snapshot = { ...prev, apiKey };
-        return snapshot;
-      });
-      if (snapshot !== null) {
-        const snap: AISettings = snapshot;
-        await persistPersistent(snap, apiKey);
-        // При сохранении ключа сразу автоматически опрашиваем API на список моделей
-        if (apiKey.trim()) {
-          void fetchModels({ ...snap, apiKey });
-        }
+    async (apiKey: string, patch?: Partial<AISettings>) => {
+      setKeyProblem('');
+      // Патч нужен при импорте из файла секретов: провайдер и адрес меняются
+      // в том же обработчике, до перерисовки состояния.
+      const snapshot = normalizeSettings({ ...settingsRef.current, ...patch, apiKey });
+      void keyVault.set(snapshot.provider, apiKey);
+      setProviderKey(apiKey);
+      setSettingsState(snapshot);
+      await persistPersistent(snapshot, apiKey);
+      // При сохранении ключа сразу автоматически опрашиваем API на список моделей
+      if (apiKey.trim()) {
+        void fetchModels({ ...snapshot, apiKey });
       }
     },
     [fetchModels]
@@ -485,14 +521,46 @@ export function useAISettings() {
       }
       const provider = (saved.provider as AIProvider) || settings.provider;
       let key = stored.keys?.[provider] ?? '';
+      let problem = '';
+
+      // Ключ хранится в зашифрованном виде и привязан к профилю Windows.
+      // После переноса portable-папки на другой компьютер он не читается —
+      // восстанавливаем ключ из secrets.local.ps1, если файл есть рядом.
+      const unreadable = (stored.keyErrors ?? []).includes(provider);
+      if (!key && unreadable && window.electronAPI?.importSecretsKey) {
+        const imported = await window.electronAPI.importSecretsKey().catch(() => null);
+        if (imported?.success && imported.apiKey) {
+          key = imported.apiKey;
+          const restored = normalizeSettings({
+            ...DEFAULT_AI_SETTINGS,
+            ...saved,
+            provider: imported.baseUrl?.includes('starimg') ? 'starimg' : provider,
+            baseUrl: imported.baseUrl || saved.baseUrl || PROVIDER_PRESETS[provider]?.baseUrl || DEFAULT_AI_SETTINGS.baseUrl,
+            model: imported.model || saved.model || PROVIDER_PRESETS[provider]?.models[0] || DEFAULT_AI_SETTINGS.model,
+            apiKey: key,
+          });
+          await persistPersistent(restored, key);
+          if (!cancelled) {
+            setProviderKey(key);
+            setSettingsState((prev) => ({ ...prev, ...restored }));
+            setKeyLoaded(true);
+          }
+          return;
+        }
+        problem =
+          'Ключ API сохранён на другом компьютере и не читается здесь. ' +
+          'Откройте Настройки → AI и вставьте ключ заново.';
+      }
+
       // Ключ из старого хранилища переносим в постоянное один раз.
       if (!key) {
         key = await keyVault.get(provider);
         if (key) persistPersistent({ ...DEFAULT_AI_SETTINGS, ...saved, provider, apiKey: key }, key);
       }
       if (cancelled) return;
+      if (problem) setKeyProblem(problem);
       setProviderKey(key);
-      setSettingsState((prev) => ({ ...prev, ...saved, provider, apiKey: key }));
+      setSettingsState((prev) => normalizeSettings({ ...prev, ...saved, provider, apiKey: key }));
       setKeyLoaded(true);
     }).catch(() => {
       if (!cancelled) void loadKeyFor(settings.provider);
@@ -523,6 +591,7 @@ export function useAISettings() {
     persist,
     isConfigured,
     hasStoredKey: Boolean(providerKey),
+    keyProblem,
   };
 }
 

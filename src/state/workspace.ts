@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FileItem, OpenTab, FileType } from '../types';
 import { fileSystemService, getFileType } from '../services/fileSystemService';
 import { extName, baseName, joinPath, uid } from '../lib/utils';
+import { generateDocxBase64, generateExcelBase64 } from '../services/aiActions';
+import { htmlToDocxBase64 } from '../lib/docx';
+import { docxPathFor, extractLegacyDocText, plainTextToHtml } from '../lib/legacyDoc';
 
 /** Типы файлов, содержимое которых читается как base64 (бинарные офисные форматы). */
 const BINARY_TYPES: FileType[] = ['word', 'powerpoint', 'image'];
@@ -127,6 +130,14 @@ export function useWorkspace() {
   /** Определяет способ чтения файла и нормализует содержимое вкладки. */
   const readTabContent = useCallback(
     async (filePath: string, type: FileType, ext: string) => {
+      // .doc — это OLE2-контейнер, а редактор умеет только .docx.
+      // Текст извлекается в главном процессе и упаковывается в OOXML.
+      if (type === 'word' && ext === 'doc') {
+        const legacy = await fileSystemService.readFile(filePath, 'base64');
+        const text = await extractLegacyDocText(legacy.content);
+        const content = await htmlToDocxBase64(plainTextToHtml(text));
+        return { content, encoding: 'base64' as const, isBinary: true };
+      }
       const isBinary = BINARY_TYPES.includes(type) || isBinaryExcel(ext);
       if (isBinary) {
         const res = await fileSystemService.readFile(filePath, 'base64');
@@ -293,6 +304,29 @@ export function useWorkspace() {
         return false;
       }
       try {
+        // .doc перезаписать нельзя: внутри OLE2, а мы держим OOXML.
+        // Сохраняем рядом .docx и переключаем вкладку на него.
+        if (tab.extension === 'doc') {
+          const target = docxPathFor(tab.path);
+          await fileSystemService.writeFile(target, tab.content, 'base64');
+          setTabs((prev) =>
+            prev.map((t) =>
+              t.id === tabId
+                ? {
+                    ...t,
+                    path: target,
+                    name: baseName(target),
+                    extension: 'docx',
+                    isDirty: false,
+                    initialContent: t.content,
+                  }
+                : t
+            )
+          );
+          await refreshTree();
+          flash(`Сохранено как ${baseName(target)} — исходный .doc не изменён`);
+          return true;
+        }
         await fileSystemService.writeFile(tab.path, tab.content, tab.encoding);
         setTabs((prev) =>
           prev.map((t) => (t.id === tabId ? { ...t, isDirty: false, initialContent: t.content } : t))
@@ -304,7 +338,7 @@ export function useWorkspace() {
         return false;
       }
     },
-    [flash]
+    [flash, refreshTree]
   );
 
   /** Сохранение файла под новым именем/расширением (Экспорт как…). */
@@ -357,14 +391,51 @@ export function useWorkspace() {
       const targetDir = parentDir || rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
       const target = joinPath(targetDir, name);
       try {
-        await fileSystemService.createFile(target, content, encoding);
+        // Пустой .docx/.xlsx — недействительный ZIP: Word и Excel такие файлы
+        // не открывают, а встроенные редакторы падают на разборе пакета.
+        // Сразу пишем корректный минимальный пакет.
+        const ext = extName(name).toLowerCase();
+        let payload = content;
+        let payloadEncoding = encoding;
+        if (!content) {
+          if (ext === 'docx') {
+            payload = await generateDocxBase64('');
+            payloadEncoding = 'base64';
+          } else if (ext === 'xlsx' || ext === 'xlsm') {
+            payload = generateExcelBase64([], [], 'Лист 1');
+            payloadEncoding = 'base64';
+          }
+        }
+
+        // Антивирус или git могут на мгновение блокировать каталог — повторяем
+        // запись, иначе пользователь видит EPERM при полностью свободной папке.
+        let created = false;
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < 4 && !created; attempt++) {
+          try {
+            await fileSystemService.createFile(target, payload, payloadEncoding);
+            created = true;
+          } catch (err) {
+            lastError = err;
+            const message = (err as Error).message || '';
+            if (!/EPERM|EBUSY|EACCES/i.test(message)) throw err;
+            await new Promise((resolve) => setTimeout(resolve, 120 + attempt * 180));
+          }
+        }
+        if (!created) throw lastError ?? new Error('не удалось создать файл');
         if (tree[targetDir]) await loadDirectory(targetDir);
         else await refreshTree();
-        await openFile(target);
+        const tabId = await openFile(target);
+        if (!tabId) return null;
         flash(`Создан файл: ${name}`);
         return target;
       } catch (err) {
-        flash(`Не удалось создать файл: ${(err as Error).message}`);
+        const message = (err as Error).message || '';
+        flash(
+          /EPERM|EACCES/i.test(message)
+            ? `Нет прав на запись в «${targetDir.split(/[\\/]/).pop() || targetDir}». Выберите другую папку`
+            : `Не удалось создать файл: ${message}`
+        );
         return null;
       }
     },

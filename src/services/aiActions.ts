@@ -968,9 +968,13 @@ export function sanitizeFileName(name: string, defaultExt = '.xlsx'): string {
  * Создаёт бинарный base64-буфер файла Word (.docx) из текста или Markdown.
  */
 export async function generateDocxBase64(content = '', title?: string): Promise<string> {
-  const fullContent = title && !content.startsWith('#')
-    ? `# ${title}\n\n${content}`
-    : (content || '<p></p>');
-  const html = markdownToDocumentHtml(fullContent);
-  return await htmlToDocxBase64(html);
+  const text = content.trim();
+  // Пустой текст нельзя прогонять через Markdown: он превратится в абзац
+  // с литералами "<p></p>" внутри документа.
+  if (!text) {
+    const heading = (title ?? '').replace(/[&<>]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[char] ?? char));
+    return await htmlToDocxBase64(heading ? `<h1>${heading}</h1>` : '<p></p>');
+  }
+  const fullContent = title && !text.startsWith('#') ? `# ${title}\n\n${text}` : text;
+  return await htmlToDocxBase64(markdownToDocumentHtml(fullContent));
 }

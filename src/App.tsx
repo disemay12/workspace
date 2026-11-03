@@ -18,6 +18,8 @@ import { useAISettings, useChatSessions } from './state/settings';
 import { useTheme } from './hooks/useTheme';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { cn, baseName, extName, joinPath, uid } from './lib/utils';
+import { docxText, tabToDocumentText } from './lib/documentText';
+import { extractLegacyDocText } from './lib/legacyDoc';
 
 import { TitleBar } from './components/workspace/TitleBar';
 import { FileTree } from './components/workspace/FileTree';
@@ -56,8 +58,17 @@ const App: React.FC = () => {
   const chat = useChatSessions();
   const { isDark, toggleTheme } = useTheme();
 
+  // Нечитаемый ключ (перенос профиля/portable на другой компьютер) — сказать
+  // об этом прямо, иначе приложение выглядит «сломанным».
+  useEffect(() => {
+    if (ai.keyProblem) ws.flash(ai.keyProblem);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ai.keyProblem]);
+
   const [sidebarOpen, setSidebarOpen] = useLocalStorage('ws_sidebar_open', true);
   const [aiPanelOpen, setAiPanelOpen] = useLocalStorage('ws_ai_panel_open', true);
+  /** Права ассистента на запись в открытый документ: по умолчанию выданы. */
+  const [aiDocWrite, setAiDocWrite] = useLocalStorage('ws_ai_doc_write', true);
   const [terminalOpen, setTerminalOpen] = useLocalStorage('ws_terminal_open', false);
   const [terminalHeight, setTerminalHeight] = useLocalStorage('ws_terminal_height', 240);
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
@@ -1026,11 +1037,30 @@ const App: React.FC = () => {
             truncated: text.length > 40000,
           };
         }
+        if (ext === 'md' || ext === 'markdown') {
+          const res = await fileSystemService.readFile(filePath, 'utf-8');
+          return {
+            name: baseName(filePath),
+            path: filePath,
+            content: res.content.slice(0, 40000),
+            truncated: res.content.length > 40000,
+          };
+        }
+        if (ext === 'docx' || ext === 'doc') {
+          const res = await fileSystemService.readFile(filePath, 'base64');
+          const text =
+            ext === 'doc' ? await extractLegacyDocText(res.content) : await docxText(res.content);
+          if (!text.trim()) return null;
+          return {
+            name: baseName(filePath),
+            path: filePath,
+            content: text.slice(0, 40000),
+            truncated: text.length > 40000,
+          };
+        }
         if (
           ext === 'csv' ||
           ext === 'tsv' ||
-          ext === 'md' ||
-          ext === 'markdown' ||
           ext === 'txt' ||
           ext === 'log' ||
           ext === 'json' ||
@@ -1104,6 +1134,23 @@ const App: React.FC = () => {
     [ws.rootPath, ws.allFiles, readAttachmentByPath]
   );
 
+  /**
+   * Текст активного документа для автоматического прикрепления к запросу.
+   * Word-вкладка хранит base64 .docx — модели нужен разобранный текст.
+   */
+  const resolveActiveDocument = useCallback(async (): Promise<ChatAttachment | null> => {
+    const tab = ws.activeTab;
+    if (!tab) return null;
+    const text = (await tabToDocumentText(tab)).trim();
+    if (!text) return null;
+    return {
+      name: tab.name,
+      path: tab.path,
+      content: text.slice(0, 40000),
+      truncated: text.length > 40000,
+    };
+  }, [ws.activeTab]);
+
   /** Снимок состояния приложения для системного промта AI. */
   const aiAppContext = useMemo(() => {
     const lines: string[] = [
@@ -1135,14 +1182,34 @@ const App: React.FC = () => {
     isDark,
   ]);
 
+  /** Папка для диалога создания: по файлу берём его каталог. */
+  const sanitizeParentDir = useCallback(
+    (dir: string): string => dir || ws.rootPath || '',
+    [ws.rootPath]
+  );
+
   const handleFileAction = useCallback(async (action: string, item: FileItem, serviceId?: string, selection?: FileItem[]) => {
     if (action === 'open') {
       if (item.isDirectory) void ws.toggleDirectory(item.path);
       else void ws.openFile(item.path);
     } else if (action === 'new-file') {
-      setNewFileDialog({ open: true, parentDir: item.path, kind: 'file', name: '' });
+      setNewFileDialog({
+        open: true,
+        parentDir: sanitizeParentDir(
+          item.isDirectory ? item.path : item.path.replace(/[\\/][^\\/]+$/, '')
+        ),
+        kind: 'file',
+        name: '',
+      });
     } else if (action === 'new-folder') {
-      setNewFileDialog({ open: true, parentDir: item.path, kind: 'folder', name: '' });
+      setNewFileDialog({
+        open: true,
+        parentDir: sanitizeParentDir(
+          item.isDirectory ? item.path : item.path.replace(/[\\/][^\\/]+$/, '')
+        ),
+        kind: 'folder',
+        name: '',
+      });
     } else if (action === 'favorite') {
       await ws.toggleFavorite(item.path);
     } else if (action === 'open-secondary') {
@@ -1249,7 +1316,7 @@ const App: React.FC = () => {
         ws.flash('Ссылка скопирована: ' + result.url);
       } else ws.flash('Экспорт не выполнен: ' + (result.error || 'ошибка'));
     }
-  }, [ws]);
+  }, [ws, sanitizeParentDir]);
 
   /* ============================================================
      Рендер редактора по типу файла
@@ -1407,10 +1474,20 @@ const App: React.FC = () => {
                 onOpenFile={(p) => void ws.openFile(p)}
                 onRefresh={() => void ws.refreshTree()}
                 onNewFile={(parentDir) =>
-                  setNewFileDialog({ open: true, parentDir, kind: 'file', name: '' })
+                  setNewFileDialog({
+                    open: true,
+                    parentDir: sanitizeParentDir(parentDir),
+                    kind: 'file',
+                    name: '',
+                  })
                 }
                 onNewFolder={(parentDir) =>
-                  setNewFileDialog({ open: true, parentDir, kind: 'folder', name: '' })
+                  setNewFileDialog({
+                    open: true,
+                    parentDir: sanitizeParentDir(parentDir),
+                    kind: 'folder',
+                    name: '',
+                  })
                 }
                 onOpenFolder={() => void ws.chooseWorkspaceFolder()}
                 favorites={ws.favorites}
@@ -1563,6 +1640,9 @@ const App: React.FC = () => {
               appContext={aiAppContext}
               onResolveAttachment={resolveChatAttachment}
               onReadDroppedFiles={readDroppedChatFiles}
+              onResolveActiveDocument={resolveActiveDocument}
+              docWriteAccess={aiDocWrite}
+              onToggleDocWriteAccess={setAiDocWrite}
             />
           </div>
         )}
@@ -1624,12 +1704,13 @@ const App: React.FC = () => {
               disabled={!newFileDialog.name.trim()}
               onClick={async () => {
                 const { parentDir, kind, name } = newFileDialog;
-                setNewFileDialog((d) => ({ ...d, open: false }));
-                if (kind === 'file') {
-                  await ws.createFile(parentDir, name.trim(), '');
-                } else {
-                  await ws.createFolder(parentDir, name.trim());
-                }
+                const created =
+                  kind === 'file'
+                    ? await ws.createFile(parentDir, name.trim(), '')
+                    : await ws.createFolder(parentDir, name.trim());
+                // Диалог закрываем только при успехе: иначе пользователь видит
+                // тост с причиной и может исправить имя.
+                if (created) setNewFileDialog((d) => ({ ...d, open: false }));
               }}
             >
               Создать
@@ -1648,9 +1729,13 @@ const App: React.FC = () => {
             onKeyDown={(e) => {
               if (e.key === 'Enter' && newFileDialog.name.trim()) {
                 const { parentDir, kind, name } = newFileDialog;
-                setNewFileDialog((d) => ({ ...d, open: false }));
-                if (kind === 'file') void ws.createFile(parentDir, name.trim(), '');
-                else void ws.createFolder(parentDir, name.trim());
+                void (async () => {
+                  const created =
+                    kind === 'file'
+                      ? await ws.createFile(parentDir, name.trim(), '')
+                      : await ws.createFolder(parentDir, name.trim());
+                  if (created) setNewFileDialog((d) => ({ ...d, open: false }));
+                })();
               }
             }}
             placeholder={

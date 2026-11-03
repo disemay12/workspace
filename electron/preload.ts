@@ -124,6 +124,12 @@ const electronAPI = {
     maxBytes?: number
   ): Promise<{ success: boolean; base64?: string; size?: number; error?: string }> =>
     ipcRenderer.invoke('fs:readPreview', filePath, maxBytes),
+  /** Текст устаревшего .doc: разбор OLE2 в главном процессе. */
+  extractDocText: (payload: { path?: string; base64?: string }): Promise<{
+    success: boolean;
+    text?: string;
+    error?: string;
+  }> => ipcRenderer.invoke('doc:extractText', payload),
   openPath: (filePath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('system:openPath', filePath),
   /** Реальный путь файла, перетащенного из Проводника. */

@@ -33,7 +33,7 @@ interface Props {
   settings: AISettings;
   onChangeProvider: (provider: AIProvider) => void | Promise<void>;
   onUpdateSettings: (patch: Partial<AISettings>) => void;
-  onSaveApiKey: (key: string) => void | Promise<void>;
+  onSaveApiKey: (key: string, patch?: Partial<AISettings>) => void | Promise<void>;
   availableModels?: string[];
   onFetchModels?: (override?: Partial<AISettings>) => Promise<{ success: boolean; models: string[]; error?: string }>;
   modelsCache?: Record<string, string[]>;
@@ -133,7 +133,11 @@ export const SettingsModal: React.FC<Props> = ({
       if (res.baseUrl) onUpdateSettings({ baseUrl: res.baseUrl });
       if (res.model) onUpdateSettings({ model: res.model });
       setKeyDraft(res.apiKey);
-      await onSaveApiKey(res.apiKey);
+      await onSaveApiKey(res.apiKey, {
+        provider: targetProvider,
+        baseUrl: res.baseUrl || settings.baseUrl,
+        model: res.model || settings.model,
+      });
 
       const list = await keyVault.listConfigured();
       setConfiguredProviders(list);
