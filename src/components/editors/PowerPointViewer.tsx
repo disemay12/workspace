@@ -37,6 +37,8 @@ interface SlideText {
   /** Размер шрифта в pt, если удалось определить. */
   fontSize?: number;
   bold?: boolean;
+  /** Цвет текста из OOXML (иначе тёмный по умолчанию). */
+  color?: string;
   /** Является ли блок заголовком (по эвристике размера/позиции). */
   isTitle: boolean;
 }
@@ -55,6 +57,8 @@ interface ParsedSlide {
   texts: SlideText[];
   shapes: SlideShape[];
   notes: string;
+  /** Фон слайда из p:bg; белый, если не задан. */
+  background: string;
 }
 
 /** Стандартный размер слайда PowerPoint 16:9 в EMU. */
@@ -62,6 +66,33 @@ const SLIDE_W = 12192000;
 const SLIDE_H = 6858000;
 
 const pct = (value: number, total: number) => (value / total) * 100;
+
+/** Цвет из <a:solidFill> (srgbClr или schemeClr темы). */
+function fillToHex(node: Element, theme: Map<string, string>): string | undefined {
+  const fill = node.getElementsByTagName('a:solidFill')[0];
+  if (!fill) return undefined;
+  const srgb = fill.getElementsByTagName('a:srgbClr')[0]?.getAttribute('val');
+  if (srgb) return `#${srgb}`;
+  const scheme = fill.getElementsByTagName('a:schemeClr')[0]?.getAttribute('val');
+  if (scheme) return theme.get(scheme.toLowerCase());
+  return undefined;
+}
+
+/** Тёмный фон требует светлого текста и наоборот. */
+function isDarkColor(hex: string): boolean {
+  const value = hex.replace('#', '');
+  if (value.length !== 6) return false;
+  const r = parseInt(value.slice(0, 2), 16);
+  const g = parseInt(value.slice(2, 4), 16);
+  const b = parseInt(value.slice(4, 6), 16);
+  if ([r, g, b].some((channel) => Number.isNaN(channel))) return false;
+  return 0.299 * r + 0.587 * g + 0.114 * b < 140;
+}
+
+/** Цвет текста: из OOXML, иначе контрастный к фону слайда. */
+function textColorFor(slide: ParsedSlide, text: SlideText): string {
+  return text.color ?? (isDarkColor(slide.background) ? '#E8EEF7' : '#0f172a');
+}
 
 export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
   const [slides, setSlides] = useState<ParsedSlide[]>([]);
@@ -105,6 +136,34 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
         }
         if (cancelled) return;
         setSlideSize(size);
+
+        /* --- Цвета темы: schemeClr → hex --- */
+        const themeColors = new Map<string, string>();
+        const themeFile = zip.file('ppt/theme/theme1.xml');
+        if (themeFile) {
+          const themeXml = parser.parseFromString(await themeFile.async('text'), 'text/xml');
+          const scheme = themeXml.getElementsByTagName('a:clrScheme')[0];
+          if (scheme) {
+            for (const child of [...scheme.children]) {
+              const name = child.localName.toLowerCase();
+              const srgb = child.getElementsByTagName('a:srgbClr')[0]?.getAttribute('val');
+              const sys = child.getElementsByTagName('a:sysClr')[0]?.getAttribute('lastClr');
+              const value = srgb ?? sys;
+              if (value) themeColors.set(name, `#${value}`);
+            }
+          }
+          // Псевдонимы PowerPoint: tx1/bg1 ссылаются на dk1/lt1.
+          const aliases: [string, string][] = [
+            ['tx1', 'dk1'],
+            ['bg1', 'lt1'],
+            ['tx2', 'dk2'],
+            ['bg2', 'lt2'],
+          ];
+          for (const [alias, base] of aliases) {
+            const color = themeColors.get(base);
+            if (color) themeColors.set(alias, color);
+          }
+        }
 
         /* --- Собираем карту изображений rId → dataURL --- */
         const imageMap = new Map<string, string>();
@@ -165,12 +224,18 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
           const shapes: SlideShape[] = [];
           const spNodes = xml.getElementsByTagName('p:sp');
 
+          // Фон слайда: тёмная тема с белым текстом иначе рисуется белым листом.
+          const bgNode = xml.getElementsByTagName('p:bg')[0];
+          const background = (bgNode ? fillToHex(bgNode, themeColors) : undefined) ?? '#ffffff';
+
           for (let s = 0; s < spNodes.length; s++) {
             const sp = spNodes[s];
 
-            // Геометрия блока
-            const off = sp.getElementsByTagName('a:off')[0];
-            const ext = sp.getElementsByTagName('a:ext')[0];
+            // Геометрия блока: берём xfrm из spPr, а не первый a:ext —
+            // в cNvPr часто лежит служебный <a:ext> из extLst с нулевыми cx/cy.
+            const xfrm = sp.getElementsByTagName('a:xfrm')[0] ?? null;
+            const off = xfrm ? xfrm.getElementsByTagName('a:off')[0] : null;
+            const ext = xfrm ? xfrm.getElementsByTagName('a:ext')[0] : null;
             const x = off ? pct(parseInt(off.getAttribute('x') ?? '0', 10), size.w) : 6;
             const y = off ? pct(parseInt(off.getAttribute('y') ?? '0', 10), size.h) : 6;
             const w = ext ? pct(parseInt(ext.getAttribute('cx') ?? '0', 10), size.w) : 88;
@@ -203,7 +268,10 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
             const text = lines.join('\n');
             if (text) {
               maxFontSize = Math.max(maxFontSize, fontSize ?? 0);
-              texts.push({ text, x, y, w, h, fontSize, bold, isTitle: false });
+              const runProps =
+                sp.getElementsByTagName('a:rPr')[0] ?? sp.getElementsByTagName('a:defRPr')[0];
+              const color = runProps ? fillToHex(runProps, themeColors) : undefined;
+              texts.push({ text, x, y, w, h, fontSize, bold, color, isTitle: false });
             }
 
             // Встроенные изображения
@@ -225,8 +293,9 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
           const picNodes = xml.getElementsByTagName('p:pic');
           for (let p = 0; p < picNodes.length; p++) {
             const pic = picNodes[p];
-            const off = pic.getElementsByTagName('a:off')[0];
-            const ext = pic.getElementsByTagName('a:ext')[0];
+            const xfrm = pic.getElementsByTagName('a:xfrm')[0] ?? null;
+            const off = xfrm ? xfrm.getElementsByTagName('a:off')[0] : null;
+            const ext = xfrm ? xfrm.getElementsByTagName('a:ext')[0] : null;
             const blip = pic.getElementsByTagName('a:blip')[0];
             if (!blip) continue;
             const target = rels.get(blip.getAttribute('r:embed') ?? '');
@@ -260,7 +329,7 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
             notes = buf.join(' ');
           }
 
-          parsed.push({ index: i + 1, texts, shapes, notes });
+          parsed.push({ index: i + 1, texts, shapes, notes, background });
         }
 
         // Определяем заголовок: самый крупный шрифт в верхней части слайда
@@ -287,6 +356,7 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
             ],
             shapes: [],
             notes: '',
+            background: '#ffffff',
           });
         }
 
@@ -388,7 +458,7 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
               style={{ aspectRatio: `${slideSize.w} / ${slideSize.h}` }}
               onClick={(e) => e.stopPropagation()}
             >
-              <SlideCanvas slide={activeSlide} fullscreen />
+              <SlideCanvas slide={activeSlide} fullscreen slideWidthPt={slideSize.w / 12700} />
             </div>
           )}
         </div>
@@ -540,8 +610,11 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
                 </div>
                 {/* Мини-превью слайда */}
                 <div
-                  className="relative bg-white"
-                  style={{ aspectRatio: `${slideSize.w} / ${slideSize.h}` }}
+                  className="relative"
+                  style={{
+                    aspectRatio: `${slideSize.w} / ${slideSize.h}`,
+                    background: slide.background,
+                  }}
                 >
                   {slide.shapes
                     .filter((s) => s.type === 'image')
@@ -563,13 +636,14 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
                   {slide.texts.slice(0, 3).map((t, ti) => (
                     <div
                       key={ti}
-                      className="absolute overflow-hidden text-[5px] leading-[1.15] text-slate-900"
+                      className="absolute overflow-hidden text-[5px] leading-[1.15]"
                       style={{
                         left: `${t.x}%`,
                         top: `${t.y}%`,
                         width: `${t.w}%`,
                         height: `${t.h}%`,
                         fontWeight: t.isTitle ? 700 : 400,
+                        color: textColorFor(slide, t),
                       }}
                     >
                       {t.text}
@@ -600,8 +674,11 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
                     )}
                   >
                     <div
-                      className="relative bg-white"
-                      style={{ aspectRatio: `${slideSize.w} / ${slideSize.h}` }}
+                      className="relative"
+                      style={{
+                        aspectRatio: `${slideSize.w} / ${slideSize.h}`,
+                        background: slide.background,
+                      }}
                     >
                       {slide.shapes
                         .filter((s) => s.type === 'image')
@@ -623,13 +700,14 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
                       {slide.texts.slice(0, 6).map((t, ti) => (
                         <div
                           key={ti}
-                          className="absolute overflow-hidden text-[7px] leading-[1.2] text-slate-900"
+                          className="absolute overflow-hidden text-[7px] leading-[1.2]"
                           style={{
                             left: `${t.x}%`,
                             top: `${t.y}%`,
                             width: `${t.w}%`,
                             height: `${t.h}%`,
                             fontWeight: t.isTitle ? 700 : 400,
+                            color: textColorFor(slide, t),
                           }}
                         >
                           {t.text}
@@ -653,7 +731,7 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
                     className="w-full max-w-5xl overflow-hidden rounded-lg border border-ws shadow-ws"
                     style={{ aspectRatio: `${slideSize.w} / ${slideSize.h}` }}
                   >
-                    <SlideCanvas slide={activeSlide} />
+                    <SlideCanvas slide={activeSlide} slideWidthPt={slideSize.w / 12700} />
                   </div>
                 )}
               </div>
@@ -696,11 +774,15 @@ export const PowerPointViewer: React.FC<Props> = ({ tab, onAskAI }) => {
    Рендер слайда с реальным позиционированием элементов
    ============================================================ */
 
-const SlideCanvas: React.FC<{ slide: ParsedSlide; fullscreen?: boolean }> = ({
+const SlideCanvas: React.FC<{ slide: ParsedSlide; fullscreen?: boolean; slideWidthPt: number }> = ({
   slide,
   fullscreen,
+  slideWidthPt,
 }) => (
-  <div className="relative h-full w-full bg-white">
+  <div
+    className="relative h-full w-full"
+    style={{ background: slide.background, containerType: 'size' }}
+  >
     {/* Изображения под текстом */}
     {slide.shapes.map((shape, idx) =>
       shape.type === 'image' && shape.src ? (
@@ -723,18 +805,15 @@ const SlideCanvas: React.FC<{ slide: ParsedSlide; fullscreen?: boolean }> = ({
     {slide.texts.map((t, idx) => (
       <div
         key={idx}
-        className={cn(
-          'absolute overflow-hidden text-slate-900',
-          fullscreen ? 'leading-snug' : 'leading-[1.3]'
-        )}
+        className={cn('absolute', fullscreen ? 'leading-snug' : 'leading-[1.3]')}
         style={{
           left: `${t.x}%`,
           top: `${t.y}%`,
           width: `${t.w}%`,
-          height: `${t.h}%`,
-          // Масштабируем размер шрифта от размера слайда
+          color: textColorFor(slide, t),
+          // Масштабируем размер шрифта от ширины слайда: pt → доля ширины (cqw)
           fontSize: t.fontSize
-            ? `calc(${t.fontSize}pt * var(--slide-scale, 1))`
+            ? `${(t.fontSize / slideWidthPt) * 100}cqw`
             : t.isTitle
               ? fullscreen
                 ? '3.2vw'
@@ -745,7 +824,7 @@ const SlideCanvas: React.FC<{ slide: ParsedSlide; fullscreen?: boolean }> = ({
           fontWeight: t.isTitle ? 700 : t.bold ? 600 : 400,
           display: 'flex',
           flexDirection: 'column',
-          justifyContent: 'center',
+          justifyContent: 'flex-start',
         }}
       >
         {t.text.split('\n').map((line, li) => (
