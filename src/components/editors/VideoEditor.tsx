@@ -3,6 +3,7 @@ import { Clapperboard, Gauge, Scissors, Upload, VolumeX } from 'lucide-react';
 import { OpenTab } from '../../types';
 import { Button, Field, Input, Select, Textarea } from '../ui';
 import { gdriveStatus } from '../../services/shareService';
+import { fileSystemService } from '../../services/fileSystemService';
 
 interface Props {
   tab: OpenTab;
@@ -47,10 +48,19 @@ function sizeLabel(bytes: number): string {
 
 export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) => {
   const src = useMemo(() => 'media://local/?path=' + encodeURIComponent(tab.path), [tab.path]);
+  const videoRef = React.useRef<HTMLVideoElement>(null);
   const [probe, setProbe] = useState<Probe | null>(null);
   const [ffmpeg, setFfmpeg] = useState<string | null>(null);
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(0);
+  const [speed, setSpeed] = useState(1);
+  const [previewRate, setPreviewRate] = useState(1);
+  const [speedStart, setSpeedStart] = useState(0);
+  const [speedEnd, setSpeedEnd] = useState(0);
+  const [speedValue, setSpeedValue] = useState(2);
+  const [speedSegments, setSpeedSegments] = useState<
+    { start: number; end: number; speed: number }[]
+  >([]);
   const [stripAudio, setStripAudio] = useState(false);
   const [compress, setCompress] = useState(false);
   const [busy, setBusy] = useState('');
@@ -90,11 +100,53 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
         size: info.size || 0,
       });
       setEnd(info.duration || 0);
+      setSpeedEnd(info.duration || 0);
     });
     return () => { stop = true; };
   }, [tab.path]);
 
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = previewRate;
+  }, [previewRate]);
+
+  const addSpeedSegment = () => {
+    const duration = probe?.duration || 0;
+    const from = Math.max(0, Math.min(duration, speedStart));
+    const to = Math.max(0, Math.min(duration, speedEnd));
+    if (to <= from) {
+      onNotify('Конец фрагмента должен быть позже начала');
+      return;
+    }
+    if (speedSegments.some((segment) => from < segment.end && to > segment.start)) {
+      onNotify('Фрагмент пересекается с уже добавленным');
+      return;
+    }
+    setSpeedSegments((prev) =>
+      [...prev, { start: from, end: to, speed: speedValue }].sort((a, b) => a.start - b.start)
+    );
+    onNotify(`Фрагмент ${clock(from)}–${clock(to)}: ${speedValue}×`);
+  };
+
   const apply = async () => {
+    const baseName = tab.name.replace(/\.[^.]+$/, '');
+    const suffix =
+      speed !== 1 || speedSegments.length > 0
+        ? '.speed'
+        : compress
+          ? '.compressed'
+          : stripAudio
+            ? '.muted'
+            : '.copy';
+    const selected = await fileSystemService.saveFileDialog(`${baseName}${suffix}.mp4`, [
+      { name: 'Видео MP4', extensions: ['mp4'] },
+    ]);
+    if (!selected) return;
+    const outputPath = /\.mp4$/i.test(selected) ? selected : `${selected}.mp4`;
+    if (outputPath.toLowerCase() === tab.path.toLowerCase()) {
+      onNotify('Выберите другое имя: нельзя сохранить копию поверх исходного видео');
+      return;
+    }
+
     setBusy('ffmpeg');
     try {
       const result = await window.electronAPI!.videoEdit({
@@ -103,6 +155,11 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
         end: end > start ? end : undefined,
         stripAudio,
         compress,
+        speed,
+        speedSegments,
+        duration: probe?.duration || 0,
+        hasAudio: probe?.hasAudio ?? true,
+        outputPath,
       });
       if (!result.success || !result.outputPath) throw new Error(result.error || 'Не удалось обработать видео');
       onNotify('Готово: ' + result.outputPath);
@@ -158,7 +215,7 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
   return (
     <div className="flex h-full min-h-0 flex-col bg-black text-ws">
       <div className="min-h-0 flex-1 bg-black">
-        <video src={src} controls className="h-full w-full bg-black" />
+        <video ref={videoRef} src={src} controls className="h-full w-full bg-black" />
       </div>
       <div className="max-h-[46%] space-y-3 overflow-auto border-t border-ws bg-ws-surface p-3">
         <div className="flex flex-wrap items-center gap-3 text-[11px] text-ws-muted">
@@ -167,6 +224,18 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
           {probe && <span>{clock(probe.duration)}</span>}
           {probe && <span>{sizeLabel(probe.size)}</span>}
           {probe && <span>{probe.videoCodec}{probe.hasAudio ? ' + ' + probe.audioCodec : ' без звука'}</span>}
+          <label className="ml-auto flex items-center gap-1">
+            Просмотр:
+            <select
+              value={previewRate}
+              onChange={(e) => setPreviewRate(Number(e.target.value))}
+              className="rounded border border-ws bg-ws-editor px-1 py-0.5 text-[11px] text-ws"
+            >
+              {[0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4].map((rate) => (
+                <option key={rate} value={rate}>{rate}×</option>
+              ))}
+            </select>
+          </label>
           {!ffmpeg && <span className="text-ws-warning">ffmpeg не найден — просмотр есть, правка недоступна</span>}
         </div>
 
@@ -177,6 +246,97 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
           <Field label={'Конец: ' + clock(end)}>
             <input type="range" min={0} max={probe?.duration || 0} step={0.1} value={end} onChange={(e) => setEnd(Number(e.target.value))} className="w-full accent-[var(--ws-accent)]" />
           </Field>
+        </div>
+
+        {/* Скорость: всё видео или отдельные фрагменты */}
+        <div className="space-y-2 rounded-lg border border-ws bg-ws-elevated p-3">
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-ws">
+            <Gauge size={13} className="text-ws-accent" />
+            <span className="font-medium">Скорость всего видео:</span>
+            <select
+              value={speed}
+              onChange={(e) => setSpeed(Number(e.target.value))}
+              className="rounded border border-ws bg-ws-editor px-1.5 py-0.5 text-[11px] text-ws"
+            >
+              {[0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4].map((rate) => (
+                <option key={rate} value={rate}>{rate}×</option>
+              ))}
+            </select>
+            <span className="text-ws-faint">(1× — без изменений)</span>
+          </div>
+
+          <div className="flex flex-wrap items-end gap-2">
+            <Field label="Фрагмент: с (сек)">
+              <Input
+                type="number"
+                min={0}
+                max={probe?.duration || 0}
+                step={0.1}
+                value={speedStart}
+                onChange={(e) => setSpeedStart(Number(e.target.value))}
+              />
+            </Field>
+            <Field label="по (сек)">
+              <Input
+                type="number"
+                min={0}
+                max={probe?.duration || 0}
+                step={0.1}
+                value={speedEnd}
+                onChange={(e) => setSpeedEnd(Number(e.target.value))}
+              />
+            </Field>
+            <Field label="скорость">
+              <select
+                value={speedValue}
+                onChange={(e) => setSpeedValue(Number(e.target.value))}
+                className="rounded border border-ws bg-ws-editor px-1.5 py-1 text-xs text-ws"
+              >
+                {[0.5, 0.75, 1.25, 1.5, 2, 3, 4].map((rate) => (
+                  <option key={rate} value={rate}>{rate}×</option>
+                ))}
+              </select>
+            </Field>
+            <Button variant="secondary" onClick={addSpeedSegment} className="gap-1">
+              <Scissors size={12} />
+              Добавить фрагмент
+            </Button>
+          </div>
+
+          {speedSegments.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {speedSegments.map((segment, index) => (
+                <span
+                  key={`${segment.start}_${segment.end}_${index}`}
+                  className="flex items-center gap-1 rounded border border-ws-accent/40 bg-ws-accent-soft px-1.5 py-0.5 text-[10px] text-ws-accent"
+                >
+                  {clock(segment.start)}–{clock(segment.end)} · {segment.speed}×
+                  <button
+                    type="button"
+                    title="Убрать фрагмент"
+                    onClick={() =>
+                      setSpeedSegments((prev) => prev.filter((_, item) => item !== index))
+                    }
+                    className="rounded px-0.5 hover:bg-ws-hover"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          {(speed !== 1 || speedSegments.length > 0) && (
+            <p className="text-[10px] text-ws-muted">
+              Итог: {clock(
+                Math.max(
+                  0,
+                  (end > start ? end - start : probe?.duration || 0) /
+                    speed
+                )
+              )}{' '}
+              (без учёта ускоренных фрагментов)
+            </p>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">

@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 export interface FileItem {
   name: string;
@@ -24,6 +24,47 @@ const electronAPI = {
   minimizeWindow: (): Promise<void> => ipcRenderer.invoke('window:minimize'),
   maximizeWindow: (): Promise<boolean> => ipcRenderer.invoke('window:maximize'),
   isWindowMaximized: (): Promise<boolean> => ipcRenderer.invoke('window:isMaximized'),
+  /** Закрепить/открепить окно поверх остальных приложений. */
+  setAlwaysOnTop: (value: boolean): Promise<{ success: boolean; alwaysOnTop: boolean }> =>
+    ipcRenderer.invoke('window:setAlwaysOnTop', value),
+  getAlwaysOnTop: (): Promise<boolean> => ipcRenderer.invoke('window:getAlwaysOnTop'),
+  /** Открыть таблицу в настоящем Excel (точные формулы, сводные, диаграммы, VBA). */
+  openInExcel: (filePath: string): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('excel:openFile', filePath),
+  /** Выполнить VBA-макрос в Excel и сохранить книгу. */
+  runExcelMacro: (
+    filePath: string,
+    macroName: string
+  ): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('excel:runMacro', filePath, macroName),
+  /** Перенести диаграммы WorkSpace в xlsx как нативные объекты Excel. */
+  excelExportCharts: (
+    filePath: string,
+    charts: {
+      sheet: string;
+      type: 'bar' | 'line' | 'pie';
+      range: string;
+      title: string;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    }[]
+  ): Promise<{ success: boolean; count?: number; error?: string }> =>
+    ipcRenderer.invoke('excel:exportCharts', filePath, charts),
+  /** Создать настоящую обновляемую сводную таблицу Excel. */
+  excelCreatePivot: (
+    filePath: string,
+    spec: {
+      sourceSheet: string;
+      range: string;
+      rowField: string;
+      valueField: string;
+      aggregation: 'sum' | 'count' | 'average' | 'min' | 'max';
+      targetSheet: string;
+    }
+  ): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('excel:createPivot', filePath, spec),
   closeWindow: (): Promise<void> => ipcRenderer.invoke('window:close'),
 
   /**
@@ -78,6 +119,15 @@ const electronAPI = {
     encoding = 'utf-8'
   ): Promise<{ success: boolean; content?: string; isBinary?: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:readFile', filePath, encoding),
+  readPreview: (
+    filePath: string,
+    maxBytes?: number
+  ): Promise<{ success: boolean; base64?: string; size?: number; error?: string }> =>
+    ipcRenderer.invoke('fs:readPreview', filePath, maxBytes),
+  openPath: (filePath: string): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('system:openPath', filePath),
+  /** Реальный путь файла, перетащенного из Проводника. */
+  getPathForFile: (file: File): string => webUtils.getPathForFile(file),
   writeFile: (
     filePath: string,
     content: string,
@@ -260,6 +310,10 @@ const electronAPI = {
     stripAudio?: boolean;
     compress?: boolean;
     outputPath?: string;
+    speed?: number;
+    speedSegments?: { start: number; end: number; speed: number }[];
+    duration?: number;
+    hasAudio?: boolean;
   }): Promise<{ success: boolean; outputPath?: string; error?: string }> =>
     ipcRenderer.invoke('video:edit', req),
   youtubeCategories: (): Promise<{ success: boolean; categories: { id: string; title: string }[]; error?: string }> =>
@@ -364,6 +418,10 @@ const electronAPI = {
     ipcRenderer.invoke('system:installContextMenu'),
   removeContextMenu: (): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('system:removeContextMenu'),
+  createDesktopShortcut: (): Promise<{ success: boolean; shortcutPath?: string; error?: string }> =>
+    ipcRenderer.invoke('system:createDesktopShortcut'),
+  getDesktopShortcutStatus: (): Promise<{ installed: boolean; shortcutPath: string }> =>
+    ipcRenderer.invoke('system:getDesktopShortcutStatus'),
   getInitialExternalPath: (): Promise<{ path: string; isDirectory: boolean } | null> =>
     ipcRenderer.invoke('system:getInitialExternalPath'),
   onOpenExternalPath: (

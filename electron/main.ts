@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell, dialog, clipboard, protocol } from 'electron';
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as iconv from 'iconv-lite';
@@ -139,6 +139,8 @@ function createWindow() {
   allowClose = false;
   closeRequestPending = false;
 
+  const appIcon = path.join(__dirname, '..', 'dist', 'icon.png');
+
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -146,6 +148,7 @@ function createWindow() {
     minHeight: 640,
     title: 'WorkSpace',
     backgroundColor: '#0b0f17',
+    icon: fs.existsSync(appIcon) ? appIcon : undefined,
     frame: false,
     titleBarStyle: 'hidden',
     show: false,
@@ -160,6 +163,9 @@ function createWindow() {
 
   // Показываем окно только после готовности отрисовки — убирает белую вспышку
   mainWindow.once('ready-to-show', () => mainWindow?.show());
+
+  // Восстанавливаем закрепление окна поверх остальных
+  if (readSession().alwaysOnTop) mainWindow.setAlwaysOnTop(true);
 
   if (isDev) {
     mainWindow.loadURL(devServerUrl);
@@ -259,6 +265,187 @@ ipcMain.handle('window:maximize', () => {
 
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
 
+/** Закрепление окна поверх остальных — настройка сохраняется между запусками. */
+ipcMain.handle('window:setAlwaysOnTop', (_event, value: boolean) => {
+  const alwaysOnTop = Boolean(value);
+  mainWindow?.setAlwaysOnTop(alwaysOnTop);
+  writeSession({ alwaysOnTop });
+  return { success: true, alwaysOnTop };
+});
+
+ipcMain.handle('window:getAlwaysOnTop', () => readSession().alwaysOnTop ?? false);
+
+/* ============================================================
+   Мост в настоящий Excel: точные формулы, сводные, диаграммы и VBA.
+   Собственный движок WorkSpace не может гарантировать 100% совместимость,
+   поэтому тяжёлые операции делегируются установленному Excel через COM.
+   ============================================================ */
+
+function runPowerShell(script: string): Promise<{ ok: boolean; output?: string; error?: string }> {
+  return new Promise((resolve) => {
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    execFile(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+      { windowsHide: true, timeout: 180000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          resolve({ ok: false, error: (stderr || error.message).trim().slice(0, 1200) });
+          return;
+        }
+        resolve({ ok: true, output: String(stdout).trim() });
+      }
+    );
+  });
+}
+
+/** Открывает файл в приложении, связанном с .xlsx/.xlsm (обычно Excel). */
+ipcMain.handle('excel:openFile', async (_event, filePath: string) => {
+  if (!filePath) return { success: false, error: 'Не указан путь к файлу' };
+  if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+  const error = await shell.openPath(filePath);
+  return error ? { success: false, error } : { success: true };
+});
+
+/** Выполняет VBA-макрос в настоящем Excel и сохраняет книгу. */
+ipcMain.handle('excel:runMacro', async (_event, filePath: string, macroName: string) => {
+  if (!filePath || !macroName?.trim()) {
+    return { success: false, error: 'Укажите файл и имя макроса' };
+  }
+  if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+
+  const safePath = filePath.replace(/'/g, "''");
+  const safeMacro = macroName.trim().replace(/'/g, "''");
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$excel = New-Object -ComObject Excel.Application",
+    '$excel.Visible = $false',
+    '$excel.DisplayAlerts = $false',
+    'try {',
+    `  $workbook = $excel.Workbooks.Open('${safePath}')`,
+    `  $excel.Run('${safeMacro}')`,
+    '  $workbook.Save()',
+    '  $workbook.Close($false)',
+    '} finally {',
+    '  $excel.Quit()',
+    '  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null',
+    '}',
+  ].join('\r\n');
+
+  const result = await runPowerShell(script);
+  return result.ok
+    ? { success: true }
+    : { success: false, error: result.error || 'Excel не выполнил макрос' };
+});
+
+interface ExcelChartSpec {
+  sheet: string;
+  type: 'bar' | 'line' | 'pie';
+  range: string;
+  title: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Переносит диаграммы WorkSpace в книгу как нативные объекты Excel. */
+ipcMain.handle('excel:exportCharts', async (_event, filePath: string, charts: ExcelChartSpec[]) => {
+  if (!filePath || !Array.isArray(charts) || charts.length === 0) {
+    return { success: false, error: 'Нет диаграмм для экспорта' };
+  }
+  if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+
+  const payload = Buffer.from(JSON.stringify(charts), 'utf8').toString('base64');
+  const safePath = filePath.replace(/'/g, "''");
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}'))`,
+    '$charts = $json | ConvertFrom-Json',
+    '$excel = New-Object -ComObject Excel.Application',
+    '$excel.Visible = $false',
+    '$excel.DisplayAlerts = $false',
+    'try {',
+    `  $workbook = $excel.Workbooks.Open('${safePath}')`,
+    '  foreach ($chartSpec in $charts) {',
+    '    $sheet = $workbook.Worksheets.Item($chartSpec.sheet)',
+    '    $shape = $sheet.ChartObjects().Add(',
+    '      [double]$chartSpec.x * 0.75, [double]$chartSpec.y * 0.75,',
+    '      [double]$chartSpec.width * 0.75, [double]$chartSpec.height * 0.75)',
+    '    $chart = $shape.Chart',
+    '    $chart.SetSourceData($sheet.Range($chartSpec.range))',
+    '    switch ($chartSpec.type) {',
+    "      'bar' { $chart.ChartType = 51 }",
+    "      'line' { $chart.ChartType = 4 }",
+    "      'pie' { $chart.ChartType = 5 }",
+    '    }',
+    '    $chart.HasTitle = $true',
+    '    $chart.ChartTitle.Text = $chartSpec.title',
+    '  }',
+    '  $workbook.Save()',
+    '  $workbook.Close($false)',
+    '} finally {',
+    '  $excel.Quit()',
+    '  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null',
+    '}',
+  ].join('\r\n');
+
+  const result = await runPowerShell(script);
+  return result.ok
+    ? { success: true, count: charts.length }
+    : { success: false, error: result.error || 'Excel не создал диаграммы' };
+});
+
+interface ExcelPivotSpec {
+  sourceSheet: string;
+  range: string;
+  rowField: string;
+  valueField: string;
+  aggregation: 'sum' | 'count' | 'average' | 'min' | 'max';
+  targetSheet: string;
+}
+
+/** Создаёт в книге настоящую обновляемую сводную таблицу Excel. */
+ipcMain.handle('excel:createPivot', async (_event, filePath: string, spec: ExcelPivotSpec) => {
+  if (!filePath || !spec?.sourceSheet || !spec?.range) {
+    return { success: false, error: 'Не указан источник сводной' };
+  }
+  if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+
+  const payload = Buffer.from(JSON.stringify(spec), 'utf8').toString('base64');
+  const safePath = filePath.replace(/'/g, "''");
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}'))`,
+    '$spec = $json | ConvertFrom-Json',
+    '$functions = @{ sum = -4157; count = -4112; average = -4106; min = -4139; max = -4136 }',
+    '$excel = New-Object -ComObject Excel.Application',
+    '$excel.Visible = $false',
+    '$excel.DisplayAlerts = $false',
+    'try {',
+    `  $workbook = $excel.Workbooks.Open('${safePath}')`,
+    '  $source = $workbook.Worksheets.Item($spec.sourceSheet)',
+    '  $cache = $workbook.PivotCaches().Create(1, $source.Range($spec.range))',
+    '  $target = $workbook.Worksheets.Add()',
+    '  $target.Name = $spec.targetSheet',
+    '  $pivot = $cache.CreatePivotTable($target.Range("A1"), "WorkSpacePivot_" + (Get-Date -Format "HHmmssfff"))',
+    '  $pivot.PivotFields($spec.rowField).Orientation = 1',
+    '  $caption = "$($spec.aggregation) — $($spec.valueField)"',
+    '  $pivot.AddDataField($pivot.PivotFields($spec.valueField), $caption, $functions[$spec.aggregation]) | Out-Null',
+    '  $workbook.Save()',
+    '  $workbook.Close($false)',
+    '} finally {',
+    '  $excel.Quit()',
+    '  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null',
+    '}',
+  ].join('\r\n');
+
+  const result = await runPowerShell(script);
+  return result.ok
+    ? { success: true }
+    : { success: false, error: result.error || 'Excel не создал сводную таблицу' };
+});
+
 ipcMain.handle('window:close', () => {
   // Запрос на закрытие от кнопки в заголовке — идёт через тот же диалог,
   // что и системная кнопка окна, чтобы не терять несохранённые изменения.
@@ -332,6 +519,8 @@ function sessionPath(): string {
 interface WorkspaceSession {
   lastPath?: string;
   favorites?: { path: string; name: string }[];
+  /** Окно закреплено поверх остальных приложений. */
+  alwaysOnTop?: boolean;
 }
 
 function readSession(): WorkspaceSession {
@@ -426,8 +615,27 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle('fs:showInExplorer', (_event, filePath: string) => {
+ipcMain.handle('fs:showInExplorer', async (_event, filePath: string) => {
   try {
+    const stat = await fs.promises.stat(filePath);
+    // Окно WorkSpace может быть закреплено поверх всех: Explorer откроется,
+    // но останется за ним. Снимаем закрепление до возврата фокуса.
+    const wasAlwaysOnTop = mainWindow?.isAlwaysOnTop() ?? false;
+    if (wasAlwaysOnTop) mainWindow?.setAlwaysOnTop(false);
+    if (wasAlwaysOnTop && mainWindow) {
+      const restore = () => {
+        mainWindow?.setAlwaysOnTop(true);
+        mainWindow?.removeListener('focus', restore);
+      };
+      mainWindow.once('focus', restore);
+    }
+
+    if (stat.isDirectory()) {
+      const error = await shell.openPath(filePath);
+      return error ? { success: false, error } : { success: true };
+    }
+
+    // Штатный API Electron: открывает папку и выделяет файл.
     shell.showItemInFolder(filePath);
     return { success: true };
   } catch (err) {
@@ -482,8 +690,7 @@ ipcMain.handle('fs:listDirectory', async (_event, dirPath: string) => {
   }
 });
 
-ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8') => {
-  try {
+ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8') => {  try {
     const buffer = await fs.promises.readFile(filePath);
     if (encoding === 'base64') {
       return { success: true, content: buffer.toString('base64'), isBinary: true };
@@ -508,30 +715,111 @@ ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8
   }
 });
 
+/**
+ * Читает первые байты файла для бинарного просмотрщика.
+ * Полный файл не загружается: EXE и архивы могут быть сотнями мегабайт.
+ */
+ipcMain.handle(
+  'fs:readPreview',
+  async (_event, filePath: string, maxBytes = 65536) => {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      const size = Math.min(Math.max(1024, maxBytes), stat.size);
+      const handle = await fs.promises.open(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(size);
+        const { bytesRead } = await handle.read(buffer, 0, size, 0);
+        return {
+          success: true,
+          base64: buffer.subarray(0, bytesRead).toString('base64'),
+          size: stat.size,
+        };
+      } finally {
+        await handle.close();
+      }
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  }
+);
+
+/** Открывает любой файл средствами Windows (EXE запускается, PDF открывается в просмотрщике). */
+ipcMain.handle('system:openPath', async (_event, filePath: string) => {
+  if (!filePath) return { success: false, error: 'Не указан путь к файлу' };
+  if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+  const error = await shell.openPath(filePath);
+  return error ? { success: false, error } : { success: true };
+});
+
 ipcMain.handle(
   'fs:writeFile',
   async (_event, filePath: string, content: string, encoding = 'utf-8') => {
     try {
-      // Запись через временный файл — защита от повреждения при сбое
-      const tmpPath = `${filePath}.ws-tmp`;
-      if (encoding === 'base64') {
-        await fs.promises.writeFile(tmpPath, Buffer.from(content, 'base64'));
-      } else if (encoding && encoding.toLowerCase() !== 'utf-8' && iconv.encodingExists(encoding)) {
-        await fs.promises.writeFile(tmpPath, iconv.encode(content, encoding));
-      } else {
-        await fs.promises.writeFile(tmpPath, content, 'utf-8');
+      const payload =
+        encoding === 'base64'
+          ? Buffer.from(content, 'base64')
+          : encoding && encoding.toLowerCase() !== 'utf-8' && iconv.encodingExists(encoding)
+            ? iconv.encode(content, encoding)
+            : content;
+
+      const writeWithRetry = async (target: string): Promise<void> => {
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            await fs.promises.writeFile(target, payload);
+            return;
+          } catch (err) {
+            lastError = err;
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw err;
+            await new Promise((resolve) => setTimeout(resolve, 200 + attempt * 200));
+          }
+        }
+        throw lastError;
+      };
+
+      // Бинарные офисные файлы нельзя писать поверх открытого файла:
+      // Excel/Word видят недописанный ZIP и сообщают «недопустимый формат».
+      const binaryFile = /\.(xlsx|xlsm|xlsb|docx|doc|pptx|ppt|zip|7z|pdf|png|jpe?g)$/i.test(
+        filePath
+      );
+      const lockedError = () =>
+        new Error(
+          'Файл открыт в другой программе (Excel/Word). Закройте его и повторите сохранение.'
+        );
+
+      // Уникальное имя: два параллельных сохранения не должны открывать
+      // один и тот же .ws-tmp (иначе Windows возвращает EPERM).
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.ws-tmp`;
+      try {
+        await fs.promises.writeFile(tmpPath, payload);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
+          // Временный файл создать нельзя (антивирус/блокировка).
+          if (binaryFile) throw lockedError();
+          await writeWithRetry(filePath);
+          return { success: true };
+        }
+        throw err;
       }
-      // Пока документ открыт в редакторе, Windows не даёт переименовать
-      // временный файл поверх него (EPERM). Копирование заменяет содержимое
-      // открытого файла, поэтому Ctrl+S действительно записывает правки.
+
       try {
         await fs.promises.rename(tmpPath, filePath);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY') throw err;
-        await fs.promises.copyFile(tmpPath, filePath);
-        await fs.promises.unlink(tmpPath).catch(() => undefined);
-      }
+        try {
+          await fs.promises.copyFile(tmpPath, filePath);
+        } catch (copyErr) {
+          const copyCode = (copyErr as NodeJS.ErrnoException).code;
+          if (copyCode !== 'EPERM' && copyCode !== 'EBUSY' && copyCode !== 'EACCES') {
+            throw copyErr;
+          }
+          if (binaryFile) throw lockedError();
+          await writeWithRetry(filePath);
+        }
+        await fs.promises.unlink(tmpPath).catch(() => undefined);      }
       return { success: true };
     } catch (err) {
       return { success: false, error: (err as Error).message };
@@ -550,12 +838,22 @@ ipcMain.handle(
           /\.(xlsx|xls|docx|doc|pptx|png|jpg|ico)$/i.test(filePath) &&
           /^[A-Za-z0-9+/=\r\n]+$/.test(initialContent));
 
-      if (isBase64) {
-        await fs.promises.writeFile(filePath, Buffer.from(initialContent.replace(/\s+/g, ''), 'base64'), {
-          flag: 'wx',
-        });
-      } else {
-        await fs.promises.writeFile(filePath, initialContent, { flag: 'wx' });
+      const payload = isBase64
+        ? Buffer.from(initialContent.replace(/\s+/g, ''), 'base64')
+        : initialContent;
+
+      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+      try {
+        await fs.promises.writeFile(filePath, payload, { flag: 'wx' });
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        // Некоторые антивирусы/ФС возвращают EPERM на эксклюзивное создание,
+        // хотя обычная запись в эту папку разрешена.
+        if (e.code === 'EPERM') {
+          await fs.promises.writeFile(filePath, payload);
+        } else {
+          throw err;
+        }
       }
       return { success: true };
     } catch (err) {

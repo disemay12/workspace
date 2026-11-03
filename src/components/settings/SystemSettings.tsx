@@ -11,6 +11,7 @@ import {
   Trash2,
   FileCode2,
   ExternalLink,
+  Pin,
 } from 'lucide-react';
 import { Button } from '../ui';
 
@@ -24,6 +25,13 @@ export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  const [alwaysBusy, setAlwaysBusy] = useState(false);
+  /** Настройка доступна только в настольной версии Electron. */
+  const alwaysSupported = Boolean(window.electronAPI?.setAlwaysOnTop);
+  const [shortcutInstalled, setShortcutInstalled] = useState(false);
+  const [shortcutPath, setShortcutPath] = useState('');
+  const [shortcutBusy, setShortcutBusy] = useState(false);
 
   const refreshStatus = async () => {
     if (!window.electronAPI?.getContextMenuStatus) {
@@ -45,6 +53,62 @@ export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
   useEffect(() => {
     void refreshStatus();
   }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.getAlwaysOnTop) return;
+    void window.electronAPI
+      .getAlwaysOnTop()
+      .then(setAlwaysOnTop)
+      .catch(() => setAlwaysOnTop(false));
+  }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.getDesktopShortcutStatus) return;
+    void window.electronAPI
+      .getDesktopShortcutStatus()
+      .then((res) => {
+        setShortcutInstalled(res.installed);
+        setShortcutPath(res.shortcutPath);
+      })
+      .catch(() => setShortcutInstalled(false));
+  }, []);
+
+  const createShortcut = async () => {
+    if (!window.electronAPI?.createDesktopShortcut) return;
+    setShortcutBusy(true);
+    try {
+      const res = await window.electronAPI.createDesktopShortcut();
+      if (res.success) {
+        setShortcutInstalled(true);
+        if (res.shortcutPath) setShortcutPath(res.shortcutPath);
+        onNotify?.('Ярлык WorkSpace создан на рабочем столе');
+      } else {
+        throw new Error(res.error || 'Не удалось создать ярлык');
+      }
+    } catch (e) {
+      onNotify?.(`Ошибка: ${(e as Error).message}`);
+    } finally {
+      setShortcutBusy(false);
+    }
+  };
+
+  const toggleAlwaysOnTop = async () => {
+    if (!window.electronAPI?.setAlwaysOnTop) return;
+    setAlwaysBusy(true);
+    try {
+      const res = await window.electronAPI.setAlwaysOnTop(!alwaysOnTop);
+      setAlwaysOnTop(res.alwaysOnTop);
+      onNotify?.(
+        res.alwaysOnTop
+          ? 'Окно закреплено поверх остальных приложений'
+          : 'Закрепление окна отключено'
+      );
+    } catch (e) {
+      onNotify?.(`Ошибка: ${(e as Error).message}`);
+    } finally {
+      setAlwaysBusy(false);
+    }
+  };
 
   const handleInstall = async () => {
     if (!window.electronAPI?.installContextMenu) return;
@@ -100,6 +164,75 @@ export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
 
   return (
     <div className="space-y-4">
+      {/* Поверх всех окон */}
+      <div className="flex items-start justify-between gap-3 rounded-lg border border-ws bg-ws-elevated p-3.5">
+        <div className="flex items-start gap-2.5">
+          <Pin size={16} className="mt-0.5 shrink-0 text-ws-accent" />
+          <div className="space-y-1">
+            <div className="text-xs font-semibold text-ws">Поверх всех окон</div>
+            <p className="text-[11px] leading-relaxed text-ws-muted">
+              Окно WorkSpace остаётся видимым над другими приложениями. Настройка
+              сохраняется и применяется при следующем запуске.
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          <span
+            className={`text-[11px] font-medium ${
+              alwaysOnTop ? 'text-emerald-500' : 'text-ws-muted'
+            }`}
+          >
+            {alwaysOnTop ? 'Включено' : 'Выключено'}
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={alwaysOnTop}
+            aria-label="Поверх всех окон"
+            disabled={!alwaysSupported || alwaysBusy}
+            onClick={() => void toggleAlwaysOnTop()}
+            className={`relative h-6 w-11 rounded-full transition-colors disabled:opacity-50 ${
+              alwaysOnTop ? 'bg-emerald-500' : 'bg-slate-400'
+            }`}
+          >
+            <span
+              className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                alwaysOnTop ? 'translate-x-[24px]' : 'translate-x-[4px]'
+              }`}
+            />
+          </button>
+          {!alwaysSupported && (
+            <span className="text-[10px] text-ws-danger">Недоступно</span>
+          )}
+        </div>
+      </div>
+
+      {/* Ярлык на рабочем столе */}
+      <div className="flex items-start justify-between gap-3 rounded-lg border border-ws bg-ws-elevated p-3.5">
+        <div className="flex items-start gap-2.5">
+          <Monitor size={16} className="mt-0.5 shrink-0 text-ws-accent" />
+          <div className="space-y-1">
+            <div className="text-xs font-semibold text-ws">Ярлык на рабочем столе</div>
+            <p className="text-[11px] leading-relaxed text-ws-muted">
+              Создаёт ярлык WorkSpace с иконкой приложения. Ярлык можно
+              пересоздать после перемещения папки с программой.
+            </p>
+            {shortcutInstalled && shortcutPath && (
+              <p className="break-all font-mono text-[10px] text-ws-faint">{shortcutPath}</p>
+            )}
+          </div>
+        </div>
+        <Button
+          variant={shortcutInstalled ? 'secondary' : 'primary'}
+          disabled={shortcutBusy || !window.electronAPI?.createDesktopShortcut}
+          onClick={() => void createShortcut()}
+          className="shrink-0 gap-1.5"
+        >
+          {shortcutBusy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+          {shortcutInstalled ? 'Обновить ярлык' : 'Создать ярлык'}
+        </Button>
+      </div>
+
       {/* Информационный баннер */}
       <div className="flex items-start gap-2.5 rounded-lg border border-ws bg-ws-elevated p-3 text-xs leading-relaxed text-ws-muted">
         <Monitor size={16} className="mt-0.5 shrink-0 text-ws-accent" />

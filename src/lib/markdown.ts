@@ -128,7 +128,24 @@ markedInstance.use({
       </div>`;
     },
     table({ header, rows }) {
-      return `<div class="my-3 overflow-x-auto"><table class="w-full border-collapse border border-ws text-xs">${header}${rows}</table></div>`;
+      // marked v18 передаёт ячейки объектами { text, align, tokens }.
+      // Прямая вставка массива в шаблон давала «[object Object]» в каждой ячейке.
+      const renderCell = (cell: { text: string; align?: string | null }, tag: 'th' | 'td') => {
+        const align =
+          cell.align === 'center'
+            ? 'text-center'
+            : cell.align === 'right'
+              ? 'text-right'
+              : 'text-left';
+        return `<${tag} class="border border-ws px-2 py-1 ${align}">${markedInstance.parseInline(
+          cell.text ?? ''
+        )}</${tag}>`;
+      };
+      const head = header.map((cell) => renderCell(cell, 'th')).join('');
+      const body = rows
+        .map((row) => `<tr>${row.map((cell) => renderCell(cell, 'td')).join('')}</tr>`)
+        .join('');
+      return `<div class="my-3 overflow-x-auto"><table class="w-full border-collapse border border-ws text-xs"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     },
     blockquote({ text }) {
       return `<blockquote class="border-l-4 border-ws-accent bg-ws-accent-soft/30 px-3 py-1.5 my-2 text-xs italic text-ws-muted rounded-r">${text}</blockquote>`;

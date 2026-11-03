@@ -12,6 +12,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
+const XLSX = require('xlsx');
 const { registerCommonCheckIpc } = require('./common-ipc');
 
 
@@ -84,7 +85,7 @@ function startMockServer(): any {
           systemPromptPresent: Array.isArray(parsed?.messages) && parsed.messages[0]?.role === 'system',
           systemPromptSnippet: parsed?.messages?.[0]?.content?.slice(0, 60) ?? null,
           messageCount: parsed?.messages?.length ?? 0,
-          lastUserContent: parsed?.messages?.[parsed.messages.length - 1]?.content?.slice(0, 200) ?? null,
+          lastUserContent: parsed?.messages?.[parsed.messages.length - 1]?.content?.slice(0, 1000) ?? null,
         });
 
         // Проверка авторизации: без ключа возвращаем 401
@@ -100,8 +101,35 @@ function startMockServer(): any {
           Connection: 'keep-alive',
         });
 
-        // Стримим ответ по частям, как настоящий API
-        const chunks = ['Привет', ', ', 'это ', '**тестовый** ', 'ответ.\n\n', '```js\n', 'const x = 42;\n', '```\n'];
+        // Стримим ответ по частям, как настоящий API.
+        // Второй сценарий возвращает блок действия, чтобы проверить,
+        // что чат действительно управляет приложением, а не только рисует текст.
+        const lastUser = String(
+          parsed?.messages?.[(parsed?.messages?.length ?? 1) - 1]?.content ?? ''
+        );
+        const wantsAction = lastUser.includes('Проверка действий');
+        const wantsTransfer = lastUser.includes('Перенеси');
+        const wantsImport = lastUser.includes('Импортируй');
+        const chunks = wantsImport
+          ? [
+              'Импортирую таблицу из файла.\n\n<workspace-action>\n',
+              '{"type":"import_table","source":"import-source.md","target":"import-table.xlsx","sheet":"Импорт"}\n',
+            ]
+          : wantsTransfer
+          ? [
+              'Переношу данные из отчёта в таблицу.\n\n',
+              '```workspace-action\n',
+              '{"action":"write_excel","file":"report-table.xlsx","sheet":"Sheet1","start_cell":"A1","values":[["Показатель","Значение"],["Всего","42"],["Ошибок","3"]]}\n',
+              '```\n',
+            ]
+          : wantsAction
+          ? [
+              'Создаю папку для проверки.\n\n',
+              '```workspace-action\n',
+              '{"action":"create_folder","path":"ai-action-folder"}\n',
+              '```\n',
+            ]
+          : ['Привет', ', ', 'это ', '**тестовый** ', 'ответ.\n\n', '```js\n', 'const x = 42;\n', '```\n'];
         let i = 0;
         const timer = setInterval(() => {
           if (i >= chunks.length) {
@@ -148,6 +176,7 @@ function registerHandlers(): any {
   });
 
   ipcMain.handle('fs:getCurrentWorkspace', () => SANDBOX);
+  ipcMain.handle('system:getInitialExternalPath', () => null);
   ipcMain.handle('fs:setWorkspaceRoot', () => ({ success: true }));
   ipcMain.handle('window:isMaximized', () => false);
   ipcMain.handle('window:minimize', () => undefined);
@@ -211,7 +240,14 @@ function registerHandlers(): any {
       return { success: false, error: err.message };
     }
   });
-  ipcMain.handle('fs:createDirectory', async () => ({ success: true }));
+  ipcMain.handle('fs:createDirectory', async (_e, dirPath) => {
+    try {
+      await fs.promises.mkdir(dirPath, { recursive: true });
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
   ipcMain.handle('fs:deletePath', async () => ({ success: true }));
   ipcMain.handle('fs:renamePath', async () => ({ success: true }));
   ipcMain.handle('fs:searchWorkspace', async () => ({ success: true, results: [] }));
@@ -343,6 +379,205 @@ app.whenReady().then(async () => {
       first: out.requests[0] ?? null,
     });
 
+    /* ============ 2b. Чат управляет приложением (workspace-action) ============ */
+    const actionSent = await js(`
+      const ta = document.querySelector('textarea[placeholder*="Спросите"]');
+      if (!ta) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(ta, 'Проверка действий AI');
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise(r => setTimeout(r, 200));
+      const sendBtn = [...document.querySelectorAll('button')].find(b => /Отправить/.test(b.textContent || ''));
+      if (sendBtn) sendBtn.click();
+      return !!sendBtn;
+    `);
+
+    // Ждём, пока безопасное действие выполнится автоматически
+    const actionFolder = path.join(SANDBOX, 'ai-action-folder');
+    for (let i = 0; i < 25 && !fs.existsSync(actionFolder); i++) {
+      await sleep(200);
+    }
+    // Статус карточки обновляется отдельным рендером после ответа IPC
+    await waitForText(win, 'Создана папка: ai-action-folder', 5000);
+
+    const actionUi = await js(`
+      const t = document.body.innerText;
+      return {
+        cardShown: t.includes('Создать папку'),
+        doneShown: t.includes('Создана папка: ai-action-folder'),
+      };
+    `);
+
+    step('aiActionExecuted', {
+      requestSent: actionSent,
+      folderCreated: fs.existsSync(actionFolder),
+      ...actionUi,
+    });
+
+    /* ============ 2c. Файл из сообщения и edit_table ============ */
+    fs.writeFileSync(
+      path.join(SANDBOX, 'report.md'),
+      '# Отчёт\n\nСодержимое отчёта: всего 42, ошибок 3.\n',
+      'utf-8'
+    );
+    await js(`
+      const ta = document.querySelector('textarea[placeholder*="Спросите"]');
+      if (!ta) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(ta, 'Перенеси данные из report.md в нашу таблицу');
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise(r => setTimeout(r, 200));
+      const sendBtn = [...document.querySelectorAll('button')].find(b => /Отправить/.test(b.textContent || ''));
+      if (sendBtn) sendBtn.click();
+      return !!sendBtn;
+    `);
+    await sleep(4500);
+
+    const transferRequest = [...out.requests]
+      .reverse()
+      .find((item) => String(item.lastUserContent || '').includes('Перенеси'));
+    step('chatFileAttachment', {
+      fileAttached: Boolean(
+        transferRequest &&
+          String(transferRequest.lastUserContent).includes('[Файл: report.md]')
+      ),
+      contentAttached: Boolean(
+        transferRequest &&
+          String(transferRequest.lastUserContent).includes('Содержимое отчёта')
+      ),
+    });
+
+    const tablePath = path.join(SANDBOX, 'report-table.xlsx');
+    for (let i = 0; i < 20 && !fs.existsSync(tablePath); i++) await sleep(200);
+    let tableText = '';
+    try {
+      const tableBook = XLSX.readFile(tablePath);
+      tableText = XLSX.utils.sheet_to_csv(tableBook.Sheets[tableBook.SheetNames[0]]);
+    } catch {
+      tableText = '';
+    }
+    step('chatEditTable', {
+      fileCreated: fs.existsSync(tablePath),
+      dataWritten: tableText.includes('Показатель') && tableText.includes('42'),
+    });
+
+    /* ============ 2d. Перетаскивание файла из Проводника в чат ============ */
+    fs.writeFileSync(
+      path.join(SANDBOX, 'drop-test.md'),
+      '# Drop test\n\nСодержимое перетащенного файла 777\n',
+      'utf-8'
+    );
+    const dropChip = await js(`
+      const ta = document.querySelector('textarea[placeholder*="Спросите"]');
+      if (!ta) return false;
+      const dt = new DataTransfer();
+      const file = new File(
+        ['# Drop test\\n\\nСодержимое перетащенного файла 777\\n'],
+        'drop-test.md',
+        { type: 'text/markdown' }
+      );
+      Object.defineProperty(file, 'path', { value: ${JSON.stringify(path.join(SANDBOX, 'drop-test.md'))} });
+      dt.items.add(file);
+      ta.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      await new Promise((r) => setTimeout(r, 900));
+      const chip = document.body.innerText.includes('drop-test.md');
+      const send = [...document.querySelectorAll('button')].find((b) => /Отправить/.test(b.textContent || ''));
+      if (send) send.click();
+      return chip;
+    `);
+    await sleep(3500);
+    const dropRequest = [...out.requests]
+      .reverse()
+      .find((item) => String(item.lastUserContent || '').includes('Проанализируй приложенные файлы'));
+    step('chatDragDrop', {
+      chipShown: dropChip,
+      fileAttached: Boolean(
+        dropRequest && String(dropRequest.lastUserContent).includes('[Файл: drop-test.md]')
+      ),
+      contentAttached: Boolean(
+        dropRequest && String(dropRequest.lastUserContent).includes('777')
+      ),
+    });
+
+    /* ============ 2e. Перетаскивание из дерева файлов приложения ============ */
+    await js(`
+      const refreshBtn = [...document.querySelectorAll('button')].find(
+        (b) => (b.title || '').includes('Обновить дерево')
+      );
+      if (refreshBtn) refreshBtn.click();
+      await new Promise((r) => setTimeout(r, 1200));
+      const node = [...document.querySelectorAll('div')].find(
+        (d) => d.textContent?.trim() === 'report.md' && d.className.includes('cursor-pointer')
+      );
+      const ta = document.querySelector('textarea[placeholder*="Спросите"]');
+      if (!node || !ta) return false;
+      const dt = new DataTransfer();
+      dt.setData('application/x-workspace-path', ${JSON.stringify(path.join(SANDBOX, 'report.md'))});
+      node.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      ta.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      await new Promise((r) => setTimeout(r, 900));
+      const chip = document.body.innerText.includes('report.md');
+      const send = [...document.querySelectorAll('button')].find((b) => /Отправить/.test(b.textContent || ''));
+      if (send) send.click();
+      return chip;
+    `);
+    await sleep(3500);
+    const internalDropRequest = [...out.requests]
+      .reverse()
+      .find((item) => String(item.lastUserContent || '').includes('Проанализируй приложенные файлы'));
+    step('chatInternalDrag', {
+      chipShown: Boolean(internalDropRequest),
+      fileAttached: Boolean(
+        internalDropRequest &&
+          String(internalDropRequest.lastUserContent).includes('[Файл: report.md]')
+      ),
+      contentAttached: Boolean(
+        internalDropRequest &&
+          String(internalDropRequest.lastUserContent).includes('Содержимое отчёта')
+      ),
+    });
+
+    /* ============ 2f. Импорт таблицы из файла (оборванный тег) ============ */
+    fs.writeFileSync(
+      path.join(SANDBOX, 'import-source.md'),
+      '# Отчёт\n\n| Товар | Цена |\n| --- | --- |\n| A | 1 000 |\n| B | 2 000 |\n| C | 3 000 |\n',
+      'utf-8'
+    );
+    await js(`
+      const ta = document.querySelector('textarea[placeholder*="Спросите"]');
+      if (!ta) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(ta, 'Импортируй import-source.md в таблицу');
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 200));
+      const send = [...document.querySelectorAll('button')].find((b) => /Отправить/.test(b.textContent || ''));
+      if (send) send.click();
+      return !!send;
+    `);
+    await sleep(4500);
+    const importPath = path.join(SANDBOX, 'import-table.xlsx');
+    for (let i = 0; i < 20 && !fs.existsSync(importPath); i++) await sleep(200);
+    let importText = '';
+    let numericCell = false;
+    let lastValue = 0;
+    try {
+      const importBook = XLSX.readFile(importPath);
+      const importSheet = importBook.Sheets['Импорт'];
+      importText = XLSX.utils.sheet_to_csv(importSheet);
+      numericCell = importSheet?.B2?.t === 'n';
+      lastValue = Number(importSheet?.B4?.v ?? 0);
+    } catch {
+      importText = '';
+    }
+    step('chatImportTable', {
+      fileCreated: fs.existsSync(importPath),
+      rowsImported:
+        importText.includes('Товар') &&
+        importText.includes('A') &&
+        importText.includes('3000'),
+      numbersStored: numericCell && lastValue === 3000,
+    });
+
     /* ============ 3. Проверка ошибки API (401) ============ */
     // Постоянное хранилище приоритетнее localStorage, поэтому фаза 401 должна
     // обновить и его — иначе останется рабочий URL и запрос уйдёт на реальный API.
@@ -447,6 +682,16 @@ app.whenReady().then(async () => {
       return !!node;
     `);
     await sleep(2000);
+
+    // Markdown открывается в режиме предпросмотра — для проверки вставки
+    // кода переключаемся в разделённый режим (код + предпросмотр).
+    await js(`
+      const btn = [...document.querySelectorAll('button')]
+        .find(b => (b.title || '').indexOf('Разделённый режим') !== -1);
+      if (btn) btn.click();
+      return Boolean(btn);
+    `);
+    await sleep(600);
 
     step('fileOpenedForInline', await js(`
       const t = document.body.innerText;

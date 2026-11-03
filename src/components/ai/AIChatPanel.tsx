@@ -20,6 +20,16 @@ import {
   FolderOpen,
   Play,
   ExternalLink,
+  Settings,
+  PanelLeft,
+  PanelBottom,
+  FolderPlus,
+  Pencil,
+  Save,
+  Terminal,
+  Bell,
+  MousePointerClick,
+  FolderInput,
 } from 'lucide-react';
 import { AISettings, ChatMessage, ChatSession, OpenTab } from '../../types';
 import { aiService } from '../../services/aiService';
@@ -28,9 +38,12 @@ import { cn, extractCodeBlocks, uid } from '../../lib/utils';
 import { renderRichMarkdown, renderMermaidBlocks } from '../../lib/markdown';
 import {
   AIActionPayload,
+  AppActionKind,
+  AppActionResult,
   ParsedMarkdownTable,
   parseAIActions,
   detectMarkdownTables,
+  requiresConfirmation,
   stripActionBlocks,
 } from '../../services/aiActions';
 import { AIBadge, Button, IconButton, Spinner, Textarea } from '../ui';
@@ -59,15 +72,18 @@ interface Props {
    * предложить применить сгенерированную формулу.
    */
   onAnswerComplete?: (answer: string) => void;
-  onCreateTable?: (
-    name: string,
-    columns: string[],
-    rows: (string | number | boolean | null)[][],
-    sheetName?: string,
-    format?: 'xlsx' | 'csv'
-  ) => Promise<string | null>;
-  onCreateFile?: (name: string, content: string) => Promise<string | null>;
-  onOpenFile?: (path: string) => Promise<void>;
+  /** Единая точка выполнения действий AI — полное управление приложением. */
+  onRunAction: (action: AIActionPayload) => Promise<AppActionResult>;
+  /** Актуальное состояние приложения для системного промта. */
+  appContext?: string;
+  /** Читает файл, упомянутый в сообщении, чтобы модель увидела его содержимое. */
+  onResolveAttachment?: (
+    name: string
+  ) => Promise<{ name: string; path: string; content: string } | null>;
+  /** Читает файлы, перетащенные из Проводника. */
+  onReadDroppedFiles?: (
+    paths: string[]
+  ) => Promise<{ name: string; path: string; content: string; truncated?: boolean }[]>;
 }
 
 export const AIChatPanel: React.FC<Props> = ({
@@ -89,9 +105,10 @@ export const AIChatPanel: React.FC<Props> = ({
   pendingPrompt,
   onPendingPromptConsumed,
   onAnswerComplete,
-  onCreateTable,
-  onCreateFile,
-  onOpenFile,
+  onRunAction,
+  appContext,
+  onResolveAttachment,
+  onReadDroppedFiles,
 }) => {
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
@@ -100,12 +117,24 @@ export const AIChatPanel: React.FC<Props> = ({
   const [selectionText, setSelectionText] = useState('');
   const [copiedId, setCopiedId] = useState('');
   const [showHistory, setShowHistory] = useState(false);
+  /** Файлы, перетащенные из Проводника в поле чата. */
+  const [droppedFiles, setDroppedFiles] = useState<
+    { name: string; path: string; content: string; truncated?: boolean }[]
+  >([]);
+  const [dragActive, setDragActive] = useState(false);
 
   // Состояние выполнения действий AI (создание таблиц, файлов и т.п.)
   const [actionStates, setActionStates] = useState<
-    Record<string, { status: 'idle' | 'running' | 'done' | 'error'; result?: string; error?: string }>
+    Record<
+      string,
+      { status: 'idle' | 'running' | 'done' | 'error'; result?: string; error?: string; path?: string }
+    >
   >({});
   const executedActionsRef = useRef<Set<string>>(new Set());
+  /** Действия из истории до открытия панели повторно не выполняются. */
+  const mountedAtRef = useRef(Date.now());
+  const autoRunBusyRef = useRef(false);
+  const [actionTick, setActionTick] = useState(0);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -136,7 +165,11 @@ export const AIChatPanel: React.FC<Props> = ({
   /* ---------- Отправка сообщения ---------- */
 
   const submit = useCallback(
-    async (rawText: string, attached?: ChatMessage['attachedFile']) => {
+    async (
+      rawText: string,
+      attached?: ChatMessage['attachedFile'],
+      dropped?: ChatMessage['attachedFiles']
+    ) => {
       const text = rawText.trim();
       if (!text || isStreaming) return;
 
@@ -154,6 +187,7 @@ export const AIChatPanel: React.FC<Props> = ({
         content: text,
         timestamp: Date.now(),
         attachedFile: attached,
+        attachedFiles: dropped && dropped.length > 0 ? dropped : undefined,
       };
       const assistantId = uid('msg');
       const assistantMessage: ChatMessage = {
@@ -170,6 +204,53 @@ export const AIChatPanel: React.FC<Props> = ({
       onUpdateMessages(sessionId, nextMessages);
       setInput('');
       setIsStreaming(true);
+
+      // Если в сообщении назван файл — читаем его и прикладываем к запросу,
+      // чтобы модель работала с реальным содержимым, а не просила его вставить.
+      let apiContent = text;
+      if (onResolveAttachment) {
+        const matches = Array.from(
+          new Set(
+            (text.match(/[A-Za-zА-Яа-я0-9_@()\-./\\]+\.(?:md|markdown|xlsx|xlsm|csv|tsv|txt|log|json|xml|yaml|yml|ini|cfg|docx?|pptx?|pdf)/gi) ?? [])
+              .map((value) => value.replace(/[),.;:!?]+$/, ''))
+              .filter(Boolean)
+          )
+        ).slice(0, 3);
+        const files: { name: string; path: string; content: string }[] = [];
+        for (const name of matches) {
+          const file = await onResolveAttachment(name);
+          if (file) files.push(file);
+        }
+        if (files.length > 0) {
+          let budget = 60000;
+          const blocks: string[] = [];
+          for (const file of files) {
+            if (budget <= 0) break;
+            const content = file.content.slice(0, budget);
+            budget -= content.length;
+            blocks.push(`[Файл: ${file.name}]\n${content}`);
+          }
+          apiContent += '\n\n' + blocks.join('\n\n');
+          apiContent =
+            '[Инструкция WorkSpace: содержимое файлов уже вложено ниже. Используй его. Если просят перенести данные в таблицу — верни import_table с source и target, не переписывай строки вручную. Не отвечай, что у тебя нет доступа к файлам.]\n\n' +
+            apiContent;
+        }
+      }
+      if (dropped && dropped.length > 0) {
+        let budget = 60000;
+        const blocks: string[] = [];
+        for (const file of dropped) {
+          if (budget <= 0) break;
+          const content = file.content.slice(0, budget);
+          budget -= content.length;
+          blocks.push(`[Файл: ${file.name}]\n${content}`);
+        }
+        apiContent += '\n\n' + blocks.join('\n\n');
+        apiContent =
+          '[Инструкция WorkSpace: пользователь перетащил файлы в чат, их содержимое ниже. Если просят перенести данные в таблицу — верни import_table с source и target, не переписывай строки вручную. Не отвечай, что нет доступа к файлам.]\n\n' +
+          apiContent;
+      }
+      const apiUserMessage: ChatMessage = { ...userMessage, content: apiContent };
 
       const controller = new AbortController();
       abortRef.current = controller;
@@ -191,7 +272,7 @@ export const AIChatPanel: React.FC<Props> = ({
 
       try {
         await aiService.streamChat(
-          [...base, userMessage],
+          [...base, apiUserMessage],
           settings,
           {
             onChunk: (partial) => {
@@ -206,7 +287,8 @@ export const AIChatPanel: React.FC<Props> = ({
               throw error;
             },
           },
-          controller.signal
+          controller.signal,
+          appContext
         );
 
         onUpdateMessages(
@@ -249,58 +331,30 @@ export const AIChatPanel: React.FC<Props> = ({
       onUpdateMessages,
       onOpenSettings,
       onAnswerComplete,
+      appContext,
+      onResolveAttachment,
     ]
   );
 
   /* ---------- Выполнение действий управления программой ---------- */
 
   const executeAction = useCallback(
-    async (action: AIActionPayload, actionKey: string) => {
+    async (action: AIActionPayload, actionKey: string): Promise<void> => {
       setActionStates((prev) => ({
         ...prev,
         [actionKey]: { status: 'running' },
       }));
 
       try {
-        let resultPath: string | null = null;
-        if (action.action === 'create_table') {
-          if (onCreateTable) {
-            resultPath = await onCreateTable(
-              action.name || 'Таблица.xlsx',
-              action.columns || [],
-              action.rows || [],
-              action.sheetName,
-              action.format
-            );
-          }
-        } else if (action.action === 'create_document' || action.action === 'create_word') {
-          if (onCreateFile) {
-            const fileName = action.name || (action.title ? `${action.title}.docx` : 'Документ.docx');
-            resultPath = await onCreateFile(fileName, action.content || '');
-          }
-        } else if (action.action === 'create_file') {
-          if (onCreateFile) {
-            resultPath = await onCreateFile(
-              action.name || action.path || 'файл.txt',
-              action.content || ''
-            );
-          }
-        } else if (action.action === 'open_file') {
-          if (onOpenFile) {
-            await onOpenFile(action.path);
-            resultPath = action.path;
-          }
-        } else if (action.action === 'insert_into_editor') {
-          onInsertIntoEditor(action.text);
-          resultPath = 'Вставлено в редактор';
-        } else if (action.action === 'replace_document') {
-          onApplyToDocument(action.text);
-          resultPath = 'Документ заменён';
-        }
-
+        const result = await onRunAction(action);
         setActionStates((prev) => ({
           ...prev,
-          [actionKey]: { status: 'done', result: resultPath || undefined },
+          [actionKey]: {
+            status: result.ok ? 'done' : 'error',
+            result: result.message,
+            path: result.path,
+            error: result.ok ? undefined : result.message,
+          },
         }));
       } catch (err) {
         setActionStates((prev) => ({
@@ -309,31 +363,54 @@ export const AIChatPanel: React.FC<Props> = ({
         }));
       }
     },
-    [onCreateTable, onCreateFile, onOpenFile, onInsertIntoEditor, onApplyToDocument]
+    [onRunAction]
   );
 
-  // Автоматическое выполнение действий из готовых ответов модели
+  // Автоматическое выполнение безопасных действий из новых ответов модели.
+  // Действия из истории и разрушительные операции ждут явного клика.
   useEffect(() => {
-    messages.forEach((msg) => {
-      if (msg.role !== 'assistant' || msg.streaming) return;
-      const acts = parseAIActions(msg.content);
-      acts.forEach((act, idx) => {
-        const actionKey = `${msg.id}_${idx}`;
-        if (!executedActionsRef.current.has(actionKey)) {
-          executedActionsRef.current.add(actionKey);
-          void executeAction(act, actionKey);
-        }
+    if (autoRunBusyRef.current) return;
+
+    const pending: { action: AIActionPayload; key: string }[] = [];
+    for (const msg of messages) {
+      if (msg.role !== 'assistant' || msg.streaming) continue;
+      if (msg.timestamp < mountedAtRef.current) continue;
+      parseAIActions(msg.content).forEach((act, idx) => {
+        const key = `${msg.id}_${idx}`;
+        if (executedActionsRef.current.has(key)) return;
+        if (requiresConfirmation(act)) return;
+        pending.push({ action: act, key });
       });
+    }
+
+    if (pending.length === 0) return;
+
+    autoRunBusyRef.current = true;
+    void (async () => {
+      for (const item of pending) {
+        if (executedActionsRef.current.has(item.key)) continue;
+        executedActionsRef.current.add(item.key);
+        await executeAction(item.action, item.key);
+      }
+    })().finally(() => {
+      autoRunBusyRef.current = false;
+      setActionTick((v) => v + 1);
     });
-  }, [messages, executeAction]);
+  }, [messages, executeAction, actionTick]);
 
   const handleCreateTableFromMarkdown = useCallback(
     async (table: ParsedMarkdownTable, format: 'xlsx' | 'csv' = 'xlsx') => {
-      if (!onCreateTable) return;
       const name = format === 'csv' ? 'Таблица_данных.csv' : 'Таблица_данных.xlsx';
-      await onCreateTable(name, table.columns, table.rows, 'Лист 1', format);
+      await onRunAction({
+        action: 'create_table',
+        name,
+        columns: table.columns,
+        rows: table.rows,
+        sheetName: 'Лист 1',
+        format,
+      });
     },
-    [onCreateTable]
+    [onRunAction]
   );
 
   const stopStreaming = () => {
@@ -383,7 +460,54 @@ export const AIChatPanel: React.FC<Props> = ({
   };
 
   const handleSend = () => {
-    void submit(input.trim(), buildAttachment());
+    const text = input.trim() || (droppedFiles.length > 0 ? 'Проанализируй приложенные файлы' : '');
+    if (!text) return;
+    void submit(text, buildAttachment(), droppedFiles.length > 0 ? droppedFiles : undefined);
+    setDroppedFiles([]);
+  };
+
+  /* ---------- Перетаскивание файлов из Проводника ---------- */
+  const handleDragOver = (event: React.DragEvent) => {
+    const types = Array.from(event.dataTransfer.types);
+    if (types.includes('Files') || types.includes('application/x-workspace-path')) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = 'copy';
+      setDragActive(true);
+    }
+  };
+
+  const handleDragLeave = (event: React.DragEvent) => {
+    if (event.currentTarget === event.target) setDragActive(false);
+  };
+
+  const handleDrop = async (event: React.DragEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragActive(false);
+    if (!onReadDroppedFiles) return;
+    const files = Array.from(event.dataTransfer.files || []);
+    const internalPath = event.dataTransfer.getData('application/x-workspace-path');
+    const paths = [
+      ...(internalPath ? [internalPath] : []),
+      ...files
+        .map((file) => {
+          let fromElectron = '';
+          try {
+            fromElectron = window.electronAPI?.getPathForFile?.(file) || '';
+          } catch {
+            fromElectron = '';
+          }
+          return fromElectron || (file as File & { path?: string }).path || '';
+        })
+        .filter(Boolean),
+    ];
+    const uniquePaths = [...new Set(paths)];
+    if (uniquePaths.length === 0) return;
+    const attachments = await onReadDroppedFiles(uniquePaths);
+    if (attachments.length > 0) {
+      setDroppedFiles((prev) => [...prev, ...attachments].slice(0, 5));
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -406,7 +530,18 @@ export const AIChatPanel: React.FC<Props> = ({
   const providerLabel = PROVIDER_PRESETS[settings.provider]?.label ?? settings.provider;
 
   return (
-    <div className="flex h-full w-full flex-col border-l border-ws bg-ws-panel">
+    <div
+      className="relative flex h-full w-full flex-col border-l border-ws bg-ws-panel"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={(event) => void handleDrop(event)}
+    >
+      {dragActive && (
+        <div className="pointer-events-none absolute inset-0 z-50 flex flex-col items-center justify-center gap-2 rounded border-2 border-dashed border-ws-accent bg-ws-panel/90 text-xs text-ws-accent">
+          <Paperclip size={22} />
+          Отпустите файлы — они прикрепятся к сообщению
+        </div>
+      )}
       {/* Заголовок панели */}
       <div className="flex items-center justify-between border-b border-ws px-3 py-2">
         <div className="flex items-center gap-2">
@@ -567,7 +702,9 @@ export const AIChatPanel: React.FC<Props> = ({
             hasActiveTab={Boolean(activeTab)}
             actionStates={actionStates}
             onExecuteAction={executeAction}
-            onOpenFile={onOpenFile}
+            onOpenFile={(path) => {
+              void onRunAction({ action: 'open_file', path });
+            }}
             onCreateTableFromMarkdown={handleCreateTableFromMarkdown}
           />
         ))}
@@ -611,6 +748,31 @@ export const AIChatPanel: React.FC<Props> = ({
         )}
 
         <div className="relative rounded-lg border border-ws bg-ws-elevated focus-within:border-ws-accent">
+          {droppedFiles.length > 0 && (
+            <div className="flex flex-wrap gap-1 border-b border-ws/60 px-2 pt-2 pb-1">
+              {droppedFiles.map((file, index) => (
+                <span
+                  key={`${file.path}_${index}`}
+                  className="flex items-center gap-1 rounded border border-ws-accent/40 bg-ws-accent-soft px-1.5 py-0.5 text-[10px] text-ws-accent"
+                  title={file.path}
+                >
+                  <Paperclip size={9} />
+                  <span className="max-w-[180px] truncate">{file.name}</span>
+                  {file.truncated && <span className="text-ws-warning">…</span>}
+                  <button
+                    type="button"
+                    title="Убрать файл"
+                    onClick={() =>
+                      setDroppedFiles((prev) => prev.filter((_, item) => item !== index))
+                    }
+                    className="rounded p-0.5 hover:bg-ws-hover"
+                  >
+                    <X size={9} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <Textarea
             ref={textareaRef}
             value={input}
@@ -635,7 +797,7 @@ export const AIChatPanel: React.FC<Props> = ({
               <Button
                 variant="primary"
                 onClick={handleSend}
-                disabled={!input.trim()}
+                disabled={!input.trim() && droppedFiles.length === 0}
                 className="gap-1"
               >
                 <Send size={11} />
@@ -656,6 +818,174 @@ export const AIChatPanel: React.FC<Props> = ({
 /* ============================================================
    Карточка действия AI (создание таблицы, файла и т.п.)
    ============================================================ */
+
+const ACTION_META: Record<
+  AppActionKind,
+  { label: string; icon: React.ReactNode; box: string; iconBox: string }
+> = {
+  create_table: {
+    label: 'Создать таблицу',
+    icon: <FileSpreadsheet size={15} />,
+    box: 'border-emerald-500/30 bg-emerald-500/10',
+    iconBox: 'bg-emerald-500/20 text-emerald-400',
+  },
+  import_table: {
+    label: 'Импортировать таблицу из файла',
+    icon: <FileSpreadsheet size={15} />,
+    box: 'border-emerald-500/30 bg-emerald-500/10',
+    iconBox: 'bg-emerald-500/20 text-emerald-400',
+  },
+  edit_table: {
+    label: 'Изменить таблицу',
+    icon: <FileSpreadsheet size={15} />,
+    box: 'border-emerald-500/30 bg-emerald-500/10',
+    iconBox: 'bg-emerald-500/20 text-emerald-400',
+  },
+  create_document: {    label: 'Создать документ Word',
+    icon: <FileText size={15} />,
+    box: 'border-blue-500/30 bg-blue-500/10',
+    iconBox: 'bg-blue-500/20 text-blue-400',
+  },
+  create_file: {
+    label: 'Создать файл',
+    icon: <FilePlus size={15} />,
+    box: 'border-blue-500/30 bg-blue-500/10',
+    iconBox: 'bg-blue-500/20 text-blue-400',
+  },
+  open_file: {
+    label: 'Открыть файл',
+    icon: <FolderOpen size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-amber-500/15 text-amber-400',
+  },
+  open_folder: {
+    label: 'Открыть рабочую папку',
+    icon: <FolderInput size={15} />,
+    box: 'border-amber-500/30 bg-amber-500/10',
+    iconBox: 'bg-amber-500/20 text-amber-400',
+  },
+  create_folder: {
+    label: 'Создать папку',
+    icon: <FolderPlus size={15} />,
+    box: 'border-amber-500/30 bg-amber-500/10',
+    iconBox: 'bg-amber-500/20 text-amber-400',
+  },
+  rename_path: {
+    label: 'Переименовать',
+    icon: <Pencil size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-sky-500/15 text-sky-400',
+  },
+  delete_path: {
+    label: 'Удалить',
+    icon: <Trash2 size={15} />,
+    box: 'border-red-500/30 bg-red-500/10',
+    iconBox: 'bg-red-500/20 text-red-400',
+  },
+  insert_into_editor: {
+    label: 'Вставить в документ',
+    icon: <CornerDownLeft size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  replace_document: {
+    label: 'Заменить документ',
+    icon: <FileText size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  open_settings: {
+    label: 'Открыть настройки',
+    icon: <Settings size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  toggle_panel: {
+    label: 'Переключить панель',
+    icon: <PanelLeft size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  select_tab: {
+    label: 'Переключить вкладку',
+    icon: <MousePointerClick size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  close_tab: {
+    label: 'Закрыть вкладку',
+    icon: <X size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  save: {
+    label: 'Сохранить',
+    icon: <Save size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-emerald-500/15 text-emerald-400',
+  },
+  notify: {
+    label: 'Уведомление',
+    icon: <Bell size={15} />,
+    box: 'border-ws bg-ws-surface',
+    iconBox: 'bg-ws-accent-soft text-ws-accent',
+  },
+  run_command: {
+    label: 'Выполнить в терминале',
+    icon: <Terminal size={15} />,
+    box: 'border-amber-500/30 bg-amber-500/10',
+    iconBox: 'bg-amber-500/20 text-amber-400',
+  },
+};
+
+function describeAction(action: AIActionPayload): string {
+  switch (action.action) {
+    case 'create_table': {
+      const cols = action.columns?.length || 0;
+      const rows = action.rows?.length || 0;
+      return `${action.name || 'Таблица.xlsx'}${cols || rows ? ` · ${cols} × ${rows}` : ''}`;
+    }
+    case 'create_document':
+      return action.name || 'Документ.docx';
+    case 'edit_table':
+      return `${action.name || action.path || 'Активная таблица'} · ${
+        action.mode === 'append' ? 'добавить' : 'заменить'
+      }${action.rows?.length ? ` · ${action.rows.length} строк` : ''}`;
+    case 'import_table':
+      return `${action.source} → ${action.target || 'новая таблица'}`;
+    case 'create_file':
+      return [action.path, action.name].filter(Boolean).join('/') || 'Новый файл';
+    case 'open_file':
+      return action.path || 'Файл';
+    case 'open_folder':
+      return action.path || 'Выбор папки в диалоге';
+    case 'create_folder':
+      return action.path || action.name || 'Новая папка';
+    case 'rename_path':
+      return `${action.path} → ${action.newName || action.newPath}`;
+    case 'delete_path':
+      return action.path;
+    case 'insert_into_editor':
+    case 'replace_document':
+      return `${action.text.length} символов`;
+    case 'open_settings':
+      return `Вкладка: ${action.tab || 'provider'}`;
+    case 'toggle_panel':
+      return `${action.panel} · ${action.state || 'toggle'}`;
+    case 'select_tab':
+      return action.path || action.name || `Вкладка #${(action.index ?? 0) + 1}`;
+    case 'close_tab':
+      return action.path || action.name || 'Текущая вкладка';
+    case 'save':
+      return action.all ? 'Все изменённые файлы' : 'Текущий файл';
+    case 'notify':
+      return action.message;
+    case 'run_command':
+      return action.command;
+    default:
+      return '';
+  }
+}
 
 const AIActionCard: React.FC<{
   action: AIActionPayload;
@@ -743,7 +1073,6 @@ const AIActionCard: React.FC<{
 
   if (
     action.action === 'create_document' ||
-    action.action === 'create_word' ||
     (action.action === 'create_file' && /\.docx?$/i.test(action.name || action.path || ''))
   ) {
     const rawName =
@@ -897,7 +1226,90 @@ const AIActionCard: React.FC<{
     );
   }
 
-  return null;
+  const meta = ACTION_META[action.action] ?? ACTION_META.notify;
+  const target = describeAction(action);
+  const needsConfirm = requiresConfirmation(action);
+  const buttonLabel = needsConfirm
+    ? action.action === 'delete_path'
+      ? 'Удалить'
+      : 'Выполнить'
+    : action.action === 'create_folder'
+      ? 'Создать'
+      : 'Выполнить';
+
+  return (
+    <div className={cn('mt-2 rounded-lg border p-2.5 text-xs', meta.box)}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex min-w-0 items-start gap-2">
+          <div className={cn('mt-0.5 shrink-0 rounded p-1', meta.iconBox)}>{meta.icon}</div>
+          <div className="min-w-0">
+            <div className="truncate font-semibold text-ws">{meta.label}</div>
+            {target && (
+              <div className="mt-0.5 truncate font-mono text-[11px] text-ws-muted" title={target}>
+                {target}
+              </div>
+            )}
+            {status === 'done' && result && (
+              <div className="mt-0.5 line-clamp-2 text-[10px] text-emerald-400">{result}</div>
+            )}
+            {status === 'error' && (
+              <div className="mt-0.5 text-[10px] text-ws-danger" title={error}>
+                {error || 'Не удалось выполнить'}
+              </div>
+            )}
+            {status === 'idle' && needsConfirm && (
+              <div className="mt-0.5 text-[10px] text-ws-warning">
+                Требуется подтверждение — проверьте действие перед запуском.
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="shrink-0">
+          {status === 'running' ? (
+            <span className="flex items-center gap-1.5 text-[11px] text-ws-accent">
+              <Spinner size={12} />
+              Выполнение…
+            </span>
+          ) : status === 'done' ? (
+            <div className="flex items-center gap-1.5">
+              <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                <Check size={12} />
+                Готово
+              </span>
+              {onOpen && (
+                <button
+                  onClick={onOpen}
+                  className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws transition-colors hover:bg-ws-hover"
+                >
+                  <ExternalLink size={10} />
+                  Открыть
+                </button>
+              )}
+            </div>
+          ) : status === 'error' ? (
+            <button
+              onClick={onExecute}
+              className="rounded border border-ws bg-ws-surface px-2 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+            >
+              Повторить
+            </button>
+          ) : (
+            <button
+              onClick={onExecute}
+              className={cn(
+                'flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-white shadow-sm transition-all',
+                needsConfirm ? 'bg-red-600 hover:bg-red-500' : 'bg-emerald-600 hover:bg-emerald-500'
+              )}
+            >
+              <Play size={10} />
+              {buttonLabel}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 };
 
 /* ============================================================
@@ -911,7 +1323,10 @@ const MessageBubble: React.FC<{
   onInsert: (text: string) => void;
   onReplace: (text: string) => void;
   hasActiveTab: boolean;
-  actionStates: Record<string, { status: 'idle' | 'running' | 'done' | 'error'; result?: string; error?: string }>;
+  actionStates: Record<
+    string,
+    { status: 'idle' | 'running' | 'done' | 'error'; result?: string; error?: string; path?: string }
+  >;
   onExecuteAction: (action: AIActionPayload, actionKey: string) => void;
   onOpenFile?: (path: string) => void;
   onCreateTableFromMarkdown?: (table: ParsedMarkdownTable, format: 'xlsx' | 'csv') => void;
@@ -962,6 +1377,16 @@ const MessageBubble: React.FC<{
               <span className="truncate">{message.attachedFile.name}</span>
             </div>
           )}
+          {message.attachedFiles?.map((file, index) => (
+            <div
+              key={`${file.path}_${index}`}
+              className="mb-1 flex items-center gap-1 rounded bg-white/15 px-1.5 py-0.5 text-[10px]"
+            >
+              <Paperclip size={9} />
+              <span className="truncate">{file.name}</span>
+              {file.truncated && <span className="opacity-80">(обрезано)</span>}
+            </div>
+          ))}
           <p className="leading-relaxed whitespace-pre-wrap select-text">{message.content}</p>
         </div>
       </div>
@@ -990,11 +1415,11 @@ const MessageBubble: React.FC<{
             const actionKey = `${message.id}_${idx}`;
             const state = actionStates[actionKey] || { status: 'idle' };
             const targetPath =
-              state.result ||
+              state.path ||
               (act.action === 'create_table'
                 ? act.name
-                : act.action === 'create_document' || act.action === 'create_word'
-                  ? act.name || ('title' in act && act.title ? `${act.title}.docx` : 'Документ.docx')
+                : act.action === 'create_document'
+                  ? act.name || (act.title ? `${act.title}.docx` : 'Документ.docx')
                   : act.action === 'create_file'
                     ? act.name || act.path
                     : act.action === 'open_file'

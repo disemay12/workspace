@@ -55,3 +55,17 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---------- Локальные артефакты отладки ----------
+.codebase-memory/
+ws-console.out
+ws-console.log
+ws-fresh/
+ws-probe/
+ws-probe2/
+ws-procmon.etl
+ws-screen.png
+ws-userdata/
+ws-ver.err
+ws-ver.txt
+ws-*.log

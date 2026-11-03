@@ -12,7 +12,7 @@ const electronDist = path.join(rootDir, 'node_modules', 'electron', 'dist');
 
 console.log('=== Сборка портативного приложения WorkSpace ===\n');
 
-// 1. Сборка Vite и Electron процесса
+// 1. Сборка Vite/Electron (иконка генерируется prebuild-хуком npm)
 console.log('[1/5] Компиляция фронтенда и главного процесса (npm run build)...');
 execSync('npm run build', { cwd: rootDir, stdio: 'inherit' });
 
@@ -98,7 +98,9 @@ if (!csc) {
 
 const launcherSrc = path.join(rootDir, 'scripts', 'launcher', 'Launcher.cs');
 const launcherOut = path.join(outDir, 'WorkSpace.exe');
-execFileSync(csc, ['/nologo', '/target:winexe', '/optimize+', `/out:${launcherOut}`, launcherSrc], {
+const iconPath = path.join(rootDir, 'build', 'icon.ico');
+const iconArgs = fs.existsSync(iconPath) ? [`/win32icon:${iconPath}`] : [];
+execFileSync(csc, ['/nologo', '/target:winexe', '/optimize+', ...iconArgs, `/out:${launcherOut}`, launcherSrc], {
   stdio: 'inherit',
 });
 

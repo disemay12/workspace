@@ -36,6 +36,8 @@ interface Props {
   onAskAI?: (prompt: string, contextText: string) => void;
   /** Вызов инлайн-копилота (Ctrl+K) — правка выделения прямо в документе. */
   onRequestInlineEdit?: () => void;
+  /** Сохранение выбранного режима просмотра в состоянии вкладки. */
+  onViewModeChange?: (mode: 'source' | 'split' | 'visual') => void;
 }
 
 type ViewMode = 'source' | 'split' | 'visual';
@@ -63,13 +65,29 @@ export const RichTextEditor: React.FC<Props> = ({
   onSave,
   onAskAI,
   onRequestInlineEdit,
+  onViewModeChange,
 }) => {
-  const [viewMode, setViewMode] = useState<ViewMode>('split');
+  const [viewMode, setViewMode] = useState<ViewMode>(tab.viewMode || 'split');
   const [showSlash, setShowSlash] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashAnchor, setSlashAnchor] = useState<{ top: number; left: number } | null>(null);
   const [scrollSync, setScrollSync] = useState(true);
+
+  const changeViewMode = useCallback(
+    (mode: ViewMode) => {
+      setViewMode(mode);
+      onViewModeChange?.(mode);
+    },
+    [onViewModeChange]
+  );
+
+  // Компонент переиспользуется между вкладками — режим берём из новой вкладки,
+  // чтобы Markdown всегда открывался в предпросмотре.
+  useEffect(() => {
+    setViewMode(tab.viewMode || 'split');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
@@ -453,7 +471,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
           {/* Режим просмотра */}
           <div className="flex items-center rounded border border-ws bg-ws-elevated p-0.5">
             <button
-              onClick={() => setViewMode('source')}
+              onClick={() => changeViewMode('source')}
               title="Только исходный код Markdown"
               className={cn(
                 'rounded p-1 transition-colors',
@@ -463,7 +481,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
               <FileEdit size={12} />
             </button>
             <button
-              onClick={() => setViewMode('split')}
+              onClick={() => changeViewMode('split')}
               title="Разделённый режим (код + предпросмотр)"
               className={cn(
                 'rounded p-1 transition-colors',
@@ -473,7 +491,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
               <Columns size={12} />
             </button>
             <button
-              onClick={() => setViewMode('visual')}
+              onClick={() => changeViewMode('visual')}
               title="Только предпросмотр"
               className={cn(
                 'rounded p-1 transition-colors',

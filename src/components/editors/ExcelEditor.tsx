@@ -14,11 +14,41 @@ import {
   Check,
   X,
   Wand2,
+  Bold,
+  Italic,
+  Underline,
+  Strikethrough,
+  AlignLeft,
+  AlignCenter,
+  AlignRight,
+  WrapText,
+  PaintBucket,
+  Merge,
+  SplitSquareHorizontal,
+  ArrowUpAZ,
+  ArrowDownAZ,
+  Pin,
+  PinOff,
+  Search,
+  Replace,
+  Palette,
+  BarChart3,
+  MessageSquare,
+  ListChecks,
+  SlidersHorizontal,
+  Table2,
+  ExternalLink,
+  RefreshCw,
+  Play,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { ClipboardPaste, Undo2, Redo2 } from 'lucide-react';
 import { parseClipboardTable } from '../../lib/clipboardTable';
+import * as SheetFmt from '../../lib/sheetFormatting';
 import { Button, Spinner } from '../ui';
+import { SheetChart, ChartSeries } from './SheetChart';
+import { injectChartsIntoXlsx } from '../../lib/xlsxCharts';
+import { detectMarkdownTables, normalizeTableValue } from '../../services/aiActions';
 import {
   columnName,
   computeCellDisplay,
@@ -42,7 +72,7 @@ import {
 interface Props {
   tab: OpenTab;
   onChange: (newContent: string) => void;
-  onSave: () => void;
+  onSave: () => void | Promise<unknown>;
   onAskAI?: (prompt: string, contextText: string) => void;
   /** Применяет действие AI к таблице (вставка формулы, заполнение и т.п.). */
   onAIApply?: (action: AIAction, result: string) => void;
@@ -63,6 +93,85 @@ export interface AIAction {
 
 const MIN_ROWS = 60;
 const MIN_COLS = 16;
+
+/** Извлекает табличные данные из ответа AI: Markdown, JSON values/rows или TSV. */
+function extractTableRows(text: string): string[][] {
+  const table = detectMarkdownTables(text)[0];
+  if (table?.columns?.length) {
+    return [table.columns, ...table.rows];
+  }
+
+  const start = text.indexOf('{');
+  if (start !== -1) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index++) {
+      const ch = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(text.slice(start, index + 1)) as Record<string, unknown>;
+            const raw = parsed.values ?? parsed.rows ?? parsed.data;
+            if (Array.isArray(raw)) {
+              return raw.map((row) =>
+                Array.isArray(row) ? row.map((cell) => String(cell ?? '')) : [String(row ?? '')]
+              );
+            }
+          } catch {
+            // не JSON — пробуем восстановить строки ниже
+          }
+          break;
+        }
+      }
+    }
+    // Оборванный JSON: собираем все полностью сформированные массивы-строки
+    const recovered: string[][] = [];
+    for (const match of text.matchAll(/\[[^\[\]]*\]/g)) {
+      try {
+        const row = JSON.parse(match[0]);
+        if (Array.isArray(row)) recovered.push(row.map((cell) => String(cell ?? '')));
+      } catch {
+        // пропускаем незавершённую строку
+      }
+    }
+    if (recovered.length > 0) return recovered;
+  }
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.some((line) => line.includes('\t'))) {
+    return lines.map((line) => line.split('\t'));
+  }
+  if (lines.some((line) => line.includes('|'))) {
+    return lines.map((line) =>
+      line
+        .split('|')
+        .map((cell) => cell.trim())
+        .filter((cell, index, list) => !(index === 0 && cell === '') && !(index === list.length - 1 && cell === ''))
+    );
+  }
+  // Обычный текст (в том числе JSON без строк) не вставляем в таблицу:
+  // иначе весь ответ оказывается в одном столбце.
+  return [];
+}
+
+/** Снимок книги для отмены/возврата: значения + форматирование. */
+interface WorkbookSnapshot {
+  sheets: Workbook;
+  meta: SheetFmt.WorkbookMeta;
+}
 
 /** Ссылки на аргументы функций для подсказки. */
 const FUNCTION_HINTS: Record<string, string> = {
@@ -88,6 +197,7 @@ const FUNCTION_HINTS: Record<string, string> = {
 
 export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, onAIApply }) => {
   const [sheets, setSheets] = useState<Workbook>({});
+  const [meta, setMeta] = useState<SheetFmt.WorkbookMeta>({});
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [activeSheet, setActiveSheet] = useState('');
   const [selected, setSelected] = useState<CellCoord>({ row: 0, col: 0 });
@@ -102,8 +212,85 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   const [editorValue, setEditorValue] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [history, setHistory] = useState<Workbook[]>([]);
-  const [future, setFuture] = useState<Workbook[]>([]);
+  const [history, setHistory] = useState<WorkbookSnapshot[]>([]);
+  const [future, setFuture] = useState<WorkbookSnapshot[]>([]);
+  /** Перечитывание файла после правок в настоящем Excel. */
+  const [reloadToken, setReloadToken] = useState(0);
+  /** VBA-проект из .xlsm: сохраняется при записи книги. */
+  const vbaRawRef = useRef<ArrayBuffer | Uint8Array | null>(null);
+  const [excelBusy, setExcelBusy] = useState(false);
+  /** Защита от перезаписи более новой версией при асинхронном экспорте диаграмм. */
+  const syncSeqRef = useRef(0);
+
+  /** Актуальные книга и метаданные для асинхронных колбэков. */
+  const sheetsRef = useRef(sheets);
+  sheetsRef.current = sheets;
+  const metaRef = useRef(meta);
+  metaRef.current = meta;
+  const sheetNamesRef = useRef(sheetNames);
+  sheetNamesRef.current = sheetNames;
+
+  /* ---- Поиск и замена ---- */
+  const [findOpen, setFindOpen] = useState(false);
+  const [findText, setFindText] = useState('');
+  const [replaceText, setReplaceText] = useState('');
+  const [findMessage, setFindMessage] = useState('');
+
+  /** Автофильтр активного листа: скрывает строки с невыбранными значениями. */
+  const [filters, setFilters] = useState<
+    Record<
+      string,
+      { col: number; headerRow: number; allValues: string[]; values: string[] } | null
+    >
+  >({});
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+
+  /* ---- Диаграммы, проверка данных, условное форматирование, сводные ---- */
+  const [chartDialogOpen, setChartDialogOpen] = useState(false);
+  const [chartType, setChartType] = useState<SheetFmt.ChartType>('bar');
+  const [chartTitle, setChartTitle] = useState('Диаграмма');
+  const [validationPanelOpen, setValidationPanelOpen] = useState(false);
+  const [validationText, setValidationText] = useState('');
+  const [conditionalPanelOpen, setConditionalPanelOpen] = useState(false);
+  const [ruleOperator, setRuleOperator] = useState<SheetFmt.ConditionalOperator>('greater');
+  const [ruleValue, setRuleValue] = useState('');
+  const [ruleValue2, setRuleValue2] = useState('');
+  const [ruleFill, setRuleFill] = useState('#fde68a');
+  const [ruleColor, setRuleColor] = useState('#111827');
+  const [ruleBold, setRuleBold] = useState(false);
+  const [pivotOpen, setPivotOpen] = useState(false);
+  const [pivotRowCol, setPivotRowCol] = useState(0);
+  const [pivotValueCol, setPivotValueCol] = useState(1);
+  const [pivotAgg, setPivotAgg] = useState<'sum' | 'count' | 'average' | 'min' | 'max'>('sum');
+
+  /** Перетаскивание/изменение размера диаграммы. */
+  const chartDragRef = useRef<{
+    id: string;
+    mode: 'move' | 'resize';
+    startX: number;
+    startY: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
+
+  /** Уведомление в панели инструментов (сортировка, объединение и т.п.). */
+  const [notice, setNotice] = useState('');
+  const noticeTimerRef = useRef<number | null>(null);
+  const showNotice = useCallback((message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = window.setTimeout(() => setNotice(''), 2600);
+  }, []);
+
+  /** Текущий жест изменения ширины столбца / высоты строки. */
+  const resizeRef = useRef<{
+    type: 'col' | 'row';
+    index: number;
+    start: number;
+    size: number;
+  } | null>(null);
 
   /* ---- AI-формула ---- */
   const [showFormulaAI, setShowFormulaAI] = useState(false);
@@ -138,7 +325,12 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           })()
         : isCsv
           ? XLSX.read(tab.content, { type: 'string' })
-          : XLSX.read(tab.content, { type: 'base64' });
+          : XLSX.read(tab.content, {
+              type: 'base64',
+              bookVBA: tab.extension === 'xlsm',
+            });
+
+      vbaRawRef.current = (workbook as { vbaraw?: ArrayBuffer | Uint8Array }).vbaraw ?? null;
 
       const parsed: Workbook = {};
       workbook.SheetNames.forEach((name) => {
@@ -183,9 +375,48 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         setActiveSheet(workbook.SheetNames[0]);
       }
 
+      // Форматирование: ширины, высоты и объединения читаются из самого xlsx,
+      // стили и закрепление — из пользовательского свойства документа.
+      let savedMeta: SheetFmt.WorkbookMeta = {};
+      try {
+        const rawStyles = (workbook.Custprops as Record<string, unknown> | undefined)
+          ?.WorkSpaceStyles;
+        savedMeta = SheetFmt.decodeWorkbookMeta(rawStyles);
+      } catch {
+        savedMeta = {};
+      }
+
+      workbook.SheetNames.forEach((name) => {
+        const source = workbook.Sheets[name];
+        const sheetMeta = savedMeta[name] ?? SheetFmt.emptySheetMeta();
+        source?.['!cols']?.forEach((col, index) => {
+          const width = col?.wpx ?? (col?.wch ? col.wch * 7.5 : undefined);
+          if (typeof width === 'number' && width > 0) sheetMeta.colWidths[index] = width;
+        });
+        source?.['!rows']?.forEach((row, index) => {
+          const height = row?.hpx ?? (row?.hpt ? row.hpt * 1.333 : undefined);
+          if (typeof height === 'number' && height > 0) sheetMeta.rowHeights[index] = height;
+        });
+        const nativeMerges = source?.['!merges'];
+        if (nativeMerges?.length) {
+          for (const merge of nativeMerges) {
+            const address = SheetFmt.rangeToAddress({
+              startRow: merge.s.r,
+              endRow: merge.e.r,
+              startCol: merge.s.c,
+              endCol: merge.e.c,
+            });
+            if (!sheetMeta.merges.includes(address)) sheetMeta.merges.push(address);
+          }
+        }
+        savedMeta[name] = sheetMeta;
+      });
+
+      metaRef.current = savedMeta;
+      setMeta(savedMeta);
+
       setSheets(parsed);
       setHistory([]);
-      setFuture([]);
       setFuture([]);
     } catch (err) {
       setError(`Не удалось открыть таблицу: ${(err as Error).message}`);
@@ -193,9 +424,28 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.id]);
+  }, [tab.id, tab.reloadKey, reloadToken]);
 
   const grid = sheets[activeSheet] ?? [];
+  const activeMeta = useMemo(
+    () => meta[activeSheet] ?? SheetFmt.emptySheetMeta(),
+    [meta, activeSheet]
+  );
+  const mergeInfo = useMemo(
+    () => SheetFmt.buildMergeInfo(activeMeta.merges),
+    [activeMeta.merges]
+  );
+  const activeFilter = filters[activeSheet] ?? null;
+  const columnCount = grid[0]?.length ?? 0;
+  const colOffsets = useMemo(() => {
+    const offsets = new Array<number>(columnCount + 1);
+    offsets[0] = 0;
+    for (let col = 0; col < columnCount; col++) {
+      offsets[col + 1] =
+        offsets[col] + (activeMeta.colWidths[col] ?? SheetFmt.DEFAULT_COL_WIDTH);
+    }
+    return offsets;
+  }, [activeMeta.colWidths, columnCount]);
 
   /* ---- Виртуализация строк для больших таблиц (60 FPS при 10000+ строк) ---- */
   const [scrollTop, setScrollTop] = useState(0);
@@ -213,21 +463,27 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     return () => ro.disconnect();
   }, []);
 
-  const ROW_HEIGHT = 28;
   const OVERSCAN = 30;
   const totalRows = grid.length;
-  const isVirtual = totalRows > 80;
+  const rowOffsets = useMemo(
+    () => SheetFmt.buildRowOffsets(activeMeta.rowHeights, totalRows),
+    [activeMeta.rowHeights, totalRows]
+  );
+  // Объединённые ячейки нельзя рисовать частями: при слияниях показываем лист целиком.
+  const isVirtual =
+    totalRows > 80 && mergeInfo.anchors.size === 0 && activeMeta.freezeRows === 0 && !activeFilter;
 
-  const startRow = isVirtual ? Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN) : 0;
+  const firstVisible = SheetFmt.findRowAtOffset(rowOffsets, scrollTop);
+  const startRow = isVirtual ? Math.max(0, firstVisible - OVERSCAN) : 0;
   const endRow = isVirtual
     ? Math.min(
         totalRows,
-        Math.floor(scrollTop / ROW_HEIGHT) + Math.ceil(containerHeight / ROW_HEIGHT) + OVERSCAN
+        SheetFmt.findRowAtOffset(rowOffsets, scrollTop + containerHeight) + OVERSCAN + 1
       )
     : totalRows;
 
-  const topSpacerHeight = isVirtual ? startRow * ROW_HEIGHT : 0;
-  const bottomSpacerHeight = isVirtual ? Math.max(0, (totalRows - endRow) * ROW_HEIGHT) : 0;
+  const topSpacerHeight = isVirtual ? rowOffsets[startRow] : 0;
+  const bottomSpacerHeight = isVirtual ? Math.max(0, rowOffsets[totalRows] - rowOffsets[endRow]) : 0;
 
   const visibleRows = useMemo(() => {
     if (!isVirtual) {
@@ -242,7 +498,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   /* ---------------- Синхронизация с содержимым вкладки ---------------- */
 
   const syncWorkbook = useCallback(
-    (nextSheets: Workbook, names: string[]) => {
+    async (nextSheets: Workbook, names: string[]) => {
+      const seq = ++syncSeqRef.current;
       try {
         const wb = XLSX.utils.book_new();
         names.forEach((name) => {
@@ -288,24 +545,84 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
               };
               if (existing?.z) next.z = existing.z;
               if (existing?.s) next.s = existing.s;
+              const cellStyle = metaRef.current[name]?.cells[address];
+              const formatCode = SheetFmt.numberFormatCode(cellStyle?.numberFormat);
+              if (formatCode && isNumeric) next.z = formatCode;
 
               sheet[address] = next as unknown as XLSX.CellObject;
+            }
+          }
+
+          // Ширины, высоты и объединения пишутся нативными средствами SheetJS
+          const sheetMeta = metaRef.current[name];
+          if (sheetMeta) {
+            const colIndexes = Object.keys(sheetMeta.colWidths).map(Number);
+            if (colIndexes.length > 0) {
+              const maxCol = Math.max(...colIndexes);
+              sheet['!cols'] = Array.from({ length: maxCol + 1 }, (_, index) => ({
+                wpx: sheetMeta.colWidths[index] ?? SheetFmt.DEFAULT_COL_WIDTH,
+              }));
+            }
+            const rowIndexes = Object.keys(sheetMeta.rowHeights).map(Number);
+            if (rowIndexes.length > 0) {
+              const maxRow = Math.max(...rowIndexes);
+              sheet['!rows'] = Array.from({ length: maxRow + 1 }, (_, index) => ({
+                hpx: sheetMeta.rowHeights[index] ?? SheetFmt.DEFAULT_ROW_HEIGHT,
+              }));
+            }
+            if (sheetMeta.merges.length > 0) {
+              sheet['!merges'] = [...new Set(sheetMeta.merges)]
+                .map((item) => SheetFmt.parseRange(item))
+                .filter((range): range is SheetFmt.GridRange => Boolean(range))
+                .map((range) => ({
+                  s: { r: range.startRow, c: range.startCol },
+                  e: { r: range.endRow, c: range.endCol },
+                }));
             }
           }
 
           XLSX.utils.book_append_sheet(wb, sheet, name);
         });
 
+        wb.Custprops = {
+          ...(wb.Custprops ?? {}),
+          WorkSpaceStyles: SheetFmt.encodeWorkbookMeta(metaRef.current),
+        };
+
+        let content: string;
         if (isCsv) {
-          onChange(XLSX.utils.sheet_to_csv(wb.Sheets[activeSheet] ?? wb.Sheets[names[0]]));
+          content = XLSX.utils.sheet_to_csv(wb.Sheets[activeSheet] ?? wb.Sheets[names[0]]);
+        } else if (tab.extension === 'xlsm') {
+          // Макросы .xlsm нельзя терять: переносим VBA-проект в новую книгу
+          (wb as { vbaraw?: unknown }).vbaraw = vbaRawRef.current ?? undefined;
+          content = XLSX.write(wb, { bookType: 'xlsm', type: 'base64', bookVBA: true });
         } else {
-          onChange(XLSX.write(wb, { bookType: 'xlsx', type: 'base64' }));
+          content = XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
         }
+
+        // Нативные диаграммы Excel (OOXML) — без установленного Excel
+        if (!isCsv && tab.extension !== 'xlsm') {
+          const chartEntries = names
+            .map((name) => ({
+              sheet: name,
+              charts: metaRef.current[name]?.charts ?? [],
+            }))
+            .filter((entry) => entry.charts.length > 0);
+          if (chartEntries.length > 0) {
+            try {
+              content = await injectChartsIntoXlsx(content, chartEntries);
+            } catch (err) {
+              console.error('Не удалось добавить диаграммы в xlsx', err);
+            }
+          }
+        }
+
+        if (seq === syncSeqRef.current) onChange(content);
       } catch (err) {
         console.error('Ошибка синхронизации книги', err);
       }
     },
-    [activeSheet, isCsv, onChange]
+    [activeSheet, isCsv, onChange, tab.extension]
   );
 
   /* ---------------- Вычисление формул ---------------- */
@@ -323,42 +640,98 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     [sheets, activeSheet, evalContext]
   );
 
+  /** Границы цветовых шкал для условного форматирования. */
+  const conditionalScaleBounds = useMemo(() => {
+    const bounds = new Map<string, { min: number; max: number }>();
+    const toNumber = (value: string): number | null => {
+      const normalized = value.replace(/\s/g, '').replace(',', '.');
+      if (normalized === '' || !/^-?\d+(\.\d+)?$/.test(normalized)) return null;
+      const num = Number(normalized);
+      return Number.isFinite(num) ? num : null;
+    };
+    for (const rule of activeMeta.conditional) {
+      if (rule.operator !== 'scale') continue;
+      const range = SheetFmt.parseRange(rule.range);
+      if (!range) continue;
+      let min = Number.POSITIVE_INFINITY;
+      let max = Number.NEGATIVE_INFINITY;
+      for (let row = range.startRow; row <= range.endRow; row++) {
+        for (let col = range.startCol; col <= range.endCol; col++) {
+          const num = toNumber(displayCell(row, col));
+          if (num === null) continue;
+          if (num < min) min = num;
+          if (num > max) max = num;
+        }
+      }
+      if (Number.isFinite(min) && Number.isFinite(max)) bounds.set(rule.id, { min, max });
+    }
+    return bounds;
+  }, [activeMeta.conditional, displayCell]);
+
   /* ---------------- Изменение ячеек ---------------- */
+
+  const pushHistory = useCallback(() => {
+    setHistory((h) => [
+      ...h.slice(-49),
+      { sheets: sheetsRef.current, meta: metaRef.current },
+    ]);
+    setFuture([]);
+  }, []);
+
+  /** Применяет новые метаданные форматирования и синхронизирует файл. */
+  const commitMeta = useCallback(
+    (nextMeta: SheetFmt.WorkbookMeta) => {
+      pushHistory();
+      metaRef.current = nextMeta;
+      setMeta(nextMeta);
+      syncWorkbook(sheetsRef.current, sheetNamesRef.current);
+    },
+    [pushHistory, syncWorkbook]
+  );
 
   const applyChange = useCallback(
     (row: number, col: number, value: string | number) => {
-      setSheets((prev) => {
-        const current = prev[activeSheet];
-        if (!current) return prev;
-        if (String(current[row]?.[col] ?? '') === String(value)) return prev;
-        setHistory((h) => [...h.slice(-49), prev]);
-        setFuture([]);
+      const current = sheetsRef.current[activeSheet];
+      if (!current) return;
+      if (String(current[row]?.[col] ?? '') === String(value)) return;
+      pushHistory();
 
-        const next: Workbook = { ...prev, [activeSheet]: current.map((r) => [...r]) };
-        next[activeSheet][row][col] = value;
-        syncWorkbook(next, sheetNames);
-        return next;
-      });
+      const next: Workbook = { ...sheetsRef.current, [activeSheet]: current.map((r) => [...r]) };
+      next[activeSheet][row][col] = value;
+      syncWorkbook(next, sheetNamesRef.current);
+      setSheets(next);
     },
-    [activeSheet, sheetNames, syncWorkbook]
+    [activeSheet, pushHistory, syncWorkbook]
   );
 
-  /** Применяет пачку изменений одной операцией (для действий AI). */
+  /**
+   * Применяет пачку изменений одной операцией (для действий AI и структурных
+   * операций). Вместе со значениями можно изменить метаданные форматирования.
+   */
   const applyBatch = useCallback(
-    (mutate: (draft: Workbook) => void) => {
-      setSheets((prev) => {
-        const next: Workbook = {};
-        for (const [name, sheetGrid] of Object.entries(prev)) {
-          next[name] = sheetGrid.map((r) => [...r]);
-        }
-        setHistory((h) => [...h.slice(-49), prev]);
-        setFuture([]);
-        mutate(next);
-        syncWorkbook(next, sheetNames);
-        return next;
-      });
+    (mutate: (draft: Workbook) => void, mutateMeta?: (draft: SheetFmt.WorkbookMeta) => void) => {
+      const base = sheetsRef.current;
+      const next: Workbook = {};
+      for (const [name, sheetGrid] of Object.entries(base)) {
+        next[name] = sheetGrid.map((r) => [...r]);
+      }
+      mutate(next);
+
+      let nextMeta = metaRef.current;
+      if (mutateMeta) {
+        nextMeta = SheetFmt.cloneWorkbookMeta(metaRef.current);
+        mutateMeta(nextMeta);
+      }
+
+      setHistory((h) => [...h.slice(-49), { sheets: base, meta: metaRef.current }]);
+      setFuture([]);
+
+      metaRef.current = nextMeta;
+      setMeta(nextMeta);
+      syncWorkbook(next, sheetNamesRef.current);
+      setSheets(next);
     },
-    [sheetNames, syncWorkbook]
+    [syncWorkbook]
   );
 
   /** Вставляет матрицу из буфера, начиная с выбранной ячейки. */
@@ -413,31 +786,72 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     return () => document.removeEventListener('paste', handlePaste);
   }, [insertTable, pasteTable]);
 
-  const undo = useCallback(() => {
-    setHistory((h) => {
-      if (h.length === 0) return h;
-      const previous = h[h.length - 1];
-      setSheets((current) => {
-        setFuture((f) => [current, ...f].slice(0, 50));
-        return previous;
+  /* ---------------- Вставка/замена из ответа AI ---------------- */
+  useEffect(() => {
+    const onInsert = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId: string; text: string }>).detail;
+      if (!detail || (detail.tabId && detail.tabId !== tab.id)) return;
+      const rows = extractTableRows(detail.text);
+      if (rows.length === 0) {
+        showNotice('В ответе нет табличных данных');
+        return;
+      }
+      insertTable(rows);
+      showNotice(`Вставлено строк: ${rows.length}`);
+    };
+
+    const onReplace = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId: string; text: string }>).detail;
+      if (!detail || (detail.tabId && detail.tabId !== tab.id)) return;
+      const rows = extractTableRows(detail.text);
+      if (rows.length === 0) {
+        showNotice('В ответе нет табличных данных');
+        return;
+      }
+      const cols = Math.max(MIN_COLS, ...rows.map((row) => row.length));
+      const height = Math.max(MIN_ROWS, rows.length);
+      applyBatch((draft) => {
+        draft[activeSheet] = Array.from({ length: height }, (_, row) =>
+          Array.from({ length: cols }, (_, col) => rows[row]?.[col] ?? '')
+        );
       });
-      syncWorkbook(previous, sheetNames);
-      return h.slice(0, -1);
-    });
-  }, [sheetNames, syncWorkbook]);
+      selectSingle({ row: 0, col: 0 });
+      showNotice(`Таблица заменена: ${rows.length} строк`);
+    };
+
+    window.addEventListener('workspace:excel-insert-text', onInsert);
+    window.addEventListener('workspace:excel-replace-document', onReplace);
+    return () => {
+      window.removeEventListener('workspace:excel-insert-text', onInsert);
+      window.removeEventListener('workspace:excel-replace-document', onReplace);
+    };
+  }, [tab.id, insertTable, applyBatch, activeSheet, showNotice]);
+
+  const restoreSnapshot = useCallback(
+    (snapshot: WorkbookSnapshot) => {
+      metaRef.current = snapshot.meta;
+      setMeta(snapshot.meta);
+      setSheets(snapshot.sheets);
+      syncWorkbook(snapshot.sheets, sheetNamesRef.current);
+    },
+    [syncWorkbook]
+  );
+
+  const undo = useCallback(() => {
+    if (history.length === 0) return;
+    const previous = history[history.length - 1];
+    setFuture((f) => [{ sheets: sheetsRef.current, meta: metaRef.current }, ...f].slice(0, 50));
+    setHistory((h) => h.slice(0, -1));
+    restoreSnapshot(previous);
+  }, [history, restoreSnapshot]);
 
   const redo = useCallback(() => {
-    setFuture((f) => {
-      if (f.length === 0) return f;
-      const [next, ...rest] = f;
-      setSheets((current) => {
-        setHistory((h) => [...h, current].slice(-50));
-        return next;
-      });
-      syncWorkbook(next, sheetNames);
-      return rest;
-    });
-  }, [sheetNames, syncWorkbook]);
+    if (future.length === 0) return;
+    const [next, ...rest] = future;
+    setHistory((h) => [...h, { sheets: sheetsRef.current, meta: metaRef.current }].slice(-50));
+    setFuture(rest);
+    restoreSnapshot(next);
+  }, [future, restoreSnapshot]);
 
   /* ---------------- Отмена и возврат ---------------- */
 
@@ -459,6 +873,10 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         e.preventDefault();
         e.stopPropagation();
         redo();
+      } else if ((key === 'f' || key === 'а' || code === 'KeyF') && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        setFindOpen(true);
       }
     };
     window.addEventListener('keydown', handler);
@@ -584,11 +1002,21 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     const indexes = new Set<number>();
     for (let row = selectionRange.start.row; row <= selectionRange.end.row; row++) indexes.add(row);
     extraCells.forEach((cell) => indexes.add(cell.row));
-    applyBatch((draft) => {
-      const current = draft[activeSheet];
-      if (!current || current.length - indexes.size < 1) return;
-      draft[activeSheet] = current.filter((_, index) => !indexes.has(index));
-    });
+    applyBatch(
+      (draft) => {
+        const current = draft[activeSheet];
+        if (!current || current.length - indexes.size < 1) return;
+        draft[activeSheet] = current.filter((_, index) => !indexes.has(index));
+      },
+      (draftMeta) => {
+        [...indexes]
+          .sort((a, b) => b - a)
+          .forEach((index) => {
+            const next = SheetFmt.removeRowFromMeta(draftMeta, activeSheet, index);
+            draftMeta[activeSheet] = next[activeSheet];
+          });
+      }
+    );
     selectSingle({ row: Math.min(selectionRange.start.row, grid.length - 2), col: selectionRange.start.col });
   };
 
@@ -596,11 +1024,21 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     const indexes = new Set<number>();
     for (let col = selectionRange.start.col; col <= selectionRange.end.col; col++) indexes.add(col);
     extraCells.forEach((cell) => indexes.add(cell.col));
-    applyBatch((draft) => {
-      const current = draft[activeSheet];
-      if (!current || (current[0]?.length ?? 0) - indexes.size < 1) return;
-      draft[activeSheet] = current.map((line) => line.filter((_, index) => !indexes.has(index)));
-    });
+    applyBatch(
+      (draft) => {
+        const current = draft[activeSheet];
+        if (!current || (current[0]?.length ?? 0) - indexes.size < 1) return;
+        draft[activeSheet] = current.map((line) => line.filter((_, index) => !indexes.has(index)));
+      },
+      (draftMeta) => {
+        [...indexes]
+          .sort((a, b) => b - a)
+          .forEach((index) => {
+            const next = SheetFmt.removeColumnFromMeta(draftMeta, activeSheet, index);
+            draftMeta[activeSheet] = next[activeSheet];
+          });
+      }
+    );
     selectSingle({ row: selectionRange.start.row, col: Math.max(0, selectionRange.start.col - (indexes.size > 1 ? 0 : 0)) });
   };
 
@@ -623,6 +1061,824 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     else await navigator.clipboard.writeText(text);
   };
 
+  /* ---------------- Мост в настоящий Excel ---------------- */
+
+  const reloadFromDisk = useCallback(async (): Promise<boolean> => {
+    if (!window.electronAPI?.readFile) return false;
+    const res = await window.electronAPI.readFile(tab.path, isCsv ? 'utf-8' : 'base64');
+    if (!res.success || typeof res.content !== 'string') {
+      showNotice('Не удалось перечитать файл');
+      return false;
+    }
+    onChange(res.content);
+    setReloadToken((value) => value + 1);
+    showNotice('Файл перечитан из Excel');
+    return true;
+  }, [tab.path, isCsv, onChange, showNotice]);
+
+  const openInExcel = async () => {
+    if (!window.electronAPI?.openInExcel) return;
+    setExcelBusy(true);
+    try {
+      await onSave();
+      const res = await window.electronAPI.openInExcel(tab.path);
+      showNotice(res.success ? 'Открыто в настоящем Excel' : `Excel: ${res.error || 'ошибка'}`);
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
+  const runExcelMacro = async () => {
+    if (!window.electronAPI?.runExcelMacro) return;
+    const macroName = window.prompt(
+      'Имя VBA-макроса (например, Module1.Report).\nМакрос выполнит настоящий Excel.',
+      ''
+    );
+    if (!macroName?.trim()) return;
+    setExcelBusy(true);
+    try {
+      await onSave();
+      const res = await window.electronAPI.runExcelMacro(tab.path, macroName.trim());
+      if (res.success) {
+        await reloadFromDisk();
+        showNotice(`Макрос выполнен: ${macroName.trim()}`);
+      } else {
+        showNotice(`Макрос не выполнен: ${res.error || 'ошибка Excel'}`);
+      }
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
+  /** Экспорт диаграмм WorkSpace в книгу как нативных объектов Excel. */
+  const exportChartsToExcel = async () => {
+    if (!window.electronAPI?.excelExportCharts || activeMeta.charts.length === 0) return;
+    setExcelBusy(true);
+    try {
+      await onSave();
+      const res = await window.electronAPI.excelExportCharts(
+        tab.path,
+        activeMeta.charts.map((chart) => ({
+          sheet: activeSheet,
+          type: chart.type,
+          range: chart.range,
+          title: chart.title,
+          x: chart.x,
+          y: chart.y,
+          width: chart.width,
+          height: chart.height,
+        }))
+      );
+      if (res.success) {
+        await reloadFromDisk();
+        showNotice(`Диаграммы перенесены в Excel: ${res.count ?? activeMeta.charts.length}`);
+      } else {
+        showNotice(`Экспорт диаграмм: ${res.error || 'ошибка Excel'}`);
+      }
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
+  /** Настоящая обновляемая сводная таблица Excel по текущему диапазону. */
+  const createExcelPivot = async () => {
+    if (!window.electronAPI?.excelCreatePivot) return;
+    const range = SheetFmt.detectUsedRange(grid, selected.row, selected.col);
+    const rowField = displayCell(range.startRow, pivotRowCol).trim();
+    const valueField = displayCell(range.startRow, pivotValueCol).trim();
+    if (!rowField || !valueField) {
+      showNotice('Для сводной Excel нужны заголовки столбцов');
+      return;
+    }
+    let index = 1;
+    while (sheetNamesRef.current.includes(`Сводная Excel ${index}`)) index++;
+    setExcelBusy(true);
+    try {
+      await onSave();
+      const res = await window.electronAPI.excelCreatePivot(tab.path, {
+        sourceSheet: activeSheet,
+        range: SheetFmt.rangeToAddress(range),
+        rowField,
+        valueField,
+        aggregation: pivotAgg,
+        targetSheet: `Сводная Excel ${index}`,
+      });
+      if (res.success) {
+        await reloadFromDisk();
+        setPivotOpen(false);
+        showNotice(`Сводная Excel создана: Сводная Excel ${index}`);
+      } else {
+        showNotice(`Сводная Excel: ${res.error || 'ошибка Excel'}`);
+      }
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
+  /* ---------------- Форматирование ячеек ---------------- */
+
+  const selectedStyle = SheetFmt.styleAt(activeMeta, selected.row, selected.col) ?? {};
+
+  const selectionAsRange = (): SheetFmt.GridRange => ({
+    startRow: selectionRange.start.row,
+    endRow: selectionRange.end.row,
+    startCol: selectionRange.start.col,
+    endCol: selectionRange.end.col,
+  });
+
+  const applyStyle = (patch: Partial<SheetFmt.CellStyle>) => {
+    commitMeta(
+      SheetFmt.applyStyleToRange(metaRef.current, activeSheet, selectionAsRange(), patch)
+    );
+  };
+
+  const toggleStyle = (key: 'bold' | 'italic' | 'underline' | 'strike' | 'wrap') => {
+    applyStyle({ [key]: !selectedStyle[key] } as Partial<SheetFmt.CellStyle>);
+  };
+
+  const applyBorders = (mode: 'all' | 'outer' | 'none') => {
+    commitMeta(
+      SheetFmt.applyBordersToRange(metaRef.current, activeSheet, selectionAsRange(), mode)
+    );
+  };
+
+  const mergeSelection = () => {
+    const range = selectionAsRange();
+    if (range.startRow === range.endRow && range.startCol === range.endCol) {
+      showNotice('Выделите несколько ячеек для объединения');
+      return;
+    }
+    commitMeta(SheetFmt.addMerge(metaRef.current, activeSheet, range));
+    showNotice('Ячейки объединены');
+  };
+
+  const unmergeSelection = () => {
+    commitMeta(
+      SheetFmt.removeMergesInRange(metaRef.current, activeSheet, selectionAsRange())
+    );
+    showNotice('Объединение снято');
+  };
+
+  const freezePanes = () => {
+    commitMeta(SheetFmt.setFreeze(metaRef.current, activeSheet, selected.row, selected.col));
+    showNotice(
+      `Закреплено: строк ${selected.row}, столбцов ${selected.col} (выше и левее выделения)`
+    );
+  };
+
+  const unfreezePanes = () => {
+    commitMeta(SheetFmt.setFreeze(metaRef.current, activeSheet, 0, 0));
+    showNotice('Закрепление снято');
+  };
+
+  const clearFormatting = () => {
+    commitMeta(SheetFmt.clearStyleRange(metaRef.current, activeSheet, selectionAsRange()));
+    showNotice('Форматирование снято');
+  };
+
+  /** Преобразует текстовые числа всего листа в числа Excel (для SUM и формул). */
+  const convertTextToNumbers = () => {
+    let converted = 0;
+    applyBatch((draft) => {
+      const sheet = draft[activeSheet];
+      if (!sheet) return;
+      for (let row = 0; row < sheet.length; row++) {
+        for (let col = 0; col < (sheet[row]?.length ?? 0); col++) {
+          const value = sheet[row][col];
+          if (typeof value !== 'string') continue;
+          const normalized = normalizeTableValue(value);
+          if (typeof normalized === 'number') {
+            sheet[row][col] = normalized;
+            converted++;
+          }
+        }
+      }
+    });
+    showNotice(
+      converted > 0
+        ? `Преобразовано чисел: ${converted}`
+        : 'Текстовых чисел на листе не найдено'
+    );
+  };
+
+  /** Цветовая шкала по числовым значениям выделения (статическая условная заливка). */
+  const applyColorScale = () => {
+    const range = selectionAsRange();
+    const entries: { row: number; col: number; num: number }[] = [];
+    for (let row = range.startRow; row <= range.endRow; row++) {
+      for (let col = range.startCol; col <= range.endCol; col++) {
+        const raw = displayCell(row, col).replace(/\s/g, '').replace(',', '.');
+        if (raw === '' || !/^-?\d+(\.\d+)?$/.test(raw)) continue;
+        const num = Number(raw);
+        if (Number.isFinite(num)) entries.push({ row, col, num });
+      }
+    }
+    if (entries.length < 2) {
+      showNotice('Выделите минимум две ячейки с числами');
+      return;
+    }
+    const min = Math.min(...entries.map((entry) => entry.num));
+    const max = Math.max(...entries.map((entry) => entry.num));
+    const next = SheetFmt.cloneWorkbookMeta(metaRef.current);
+    const target = next[activeSheet] ?? SheetFmt.emptySheetMeta();
+    next[activeSheet] = target;
+    const stops: [number, [number, number, number]][] = [
+      [0, [254, 202, 202]],
+      [0.5, [254, 240, 138]],
+      [1, [187, 247, 208]],
+    ];
+    for (const entry of entries) {
+      const ratio = max === min ? 0.5 : (entry.num - min) / (max - min);
+      const upperIndex = ratio <= 0.5 ? 1 : 2;
+      const lower = stops[upperIndex - 1];
+      const upper = stops[upperIndex];
+      const local = (ratio - lower[0]) / Math.max(0.0001, upper[0] - lower[0]);
+      const channels = lower[1].map((value, index) =>
+        Math.round(value + (upper[1][index] - value) * local)
+      );
+      const address = SheetFmt.cellAddress(entry.row, entry.col);
+      target.cells[address] = {
+        ...target.cells[address],
+        fill: `rgb(${channels[0]}, ${channels[1]}, ${channels[2]})`,
+      };
+    }
+    commitMeta(next);
+    showNotice(`Цветовая шкала: ${min} … ${max}`);
+  };
+
+  /* ---------------- Автофильтр ---------------- */
+
+  const openFilterPanel = () => {
+    if (filters[activeSheet]) {
+      setFilterPanelOpen(true);
+      return;
+    }
+    const range = SheetFmt.detectUsedRange(grid, selected.row, selected.col);
+    if (range.endRow <= range.startRow) {
+      showNotice('Нет данных для фильтра');
+      return;
+    }
+    const values = new Set<string>();
+    for (let row = range.startRow + 1; row <= range.endRow; row++) {
+      values.add(displayCell(row, selected.col));
+    }
+    setFilters((prev) => ({
+      ...prev,
+      [activeSheet]: {
+        col: selected.col,
+        headerRow: range.startRow,
+        allValues: [...values],
+        values: [...values],
+      },
+    }));
+    setFilterPanelOpen(true);
+  };
+
+  const toggleFilterValue = (value: string) => {
+    setFilters((prev) => {
+      const filter = prev[activeSheet];
+      if (!filter) return prev;
+      const values = filter.values.includes(value)
+        ? filter.values.filter((item) => item !== value)
+        : [...filter.values, value];
+      return { ...prev, [activeSheet]: { ...filter, values } };
+    });
+  };
+
+  const clearFilter = () => {
+    setFilters((prev) => ({ ...prev, [activeSheet]: null }));
+    setFilterPanelOpen(false);
+    showNotice('Фильтр снят');
+  };
+
+  const rowMatchesFilter = (row: number): boolean => {
+    if (!activeFilter) return true;
+    if (row <= activeFilter.headerRow) return true;
+    return activeFilter.values.includes(displayCell(row, activeFilter.col));
+  };
+
+  /* ---------------- Диаграммы ---------------- */
+
+  const numericFromText = (value: string): number | null => {
+    const normalized = value.replace(/\s/g, '').replace(',', '.');
+    if (normalized === '' || !/^-?\d+(\.\d+)?$/.test(normalized)) return null;
+    const num = Number(normalized);
+    return Number.isFinite(num) ? num : null;
+  };
+
+  const buildChartData = useCallback(
+    (rangeText: string): { labels: string[]; series: ChartSeries[] } => {
+      const range = SheetFmt.parseRange(rangeText);
+      if (!range) return { labels: [], series: [] };
+      const firstValue = displayCell(range.startRow, range.startCol + 1);
+      const hasHeader =
+        firstValue.trim() !== '' && numericFromText(firstValue) === null;
+      const dataStart = hasHeader ? range.startRow + 1 : range.startRow;
+      const labels: string[] = [];
+      for (let row = dataStart; row <= range.endRow; row++) {
+        labels.push(displayCell(row, range.startCol) || `Строка ${row + 1}`);
+      }
+      const series: ChartSeries[] = [];
+      for (let col = range.startCol + 1; col <= range.endCol; col++) {
+        const values: (number | null)[] = [];
+        for (let row = dataStart; row <= range.endRow; row++) {
+          values.push(numericFromText(displayCell(row, col)));
+        }
+        series.push({
+          name: displayCell(range.startRow, col) || columnName(col),
+          values,
+        });
+      }
+      return { labels, series };
+    },
+    [displayCell]
+  );
+
+  const createChart = () => {
+    const range = selectionAsRange();
+    if (range.startRow === range.endRow || range.startCol === range.endCol) {
+      showNotice('Выделите диапазон с заголовками и данными');
+      return;
+    }
+    const spec: SheetFmt.ChartSpec = {
+      id: `chart_${Date.now()}`,
+      type: chartType,
+      range: SheetFmt.rangeToAddress(range),
+      title: chartTitle.trim() || 'Диаграмма',
+      x: 48 + activeMeta.charts.length * 24,
+      y: 48 + activeMeta.charts.length * 24,
+      width: 460,
+      height: 280,
+    };
+    commitMeta(SheetFmt.addChartSpec(metaRef.current, activeSheet, spec));
+    setChartDialogOpen(false);
+    showNotice(`Диаграмма создана по диапазону ${spec.range}`);
+  };
+
+  const startChartMove = (
+    event: React.MouseEvent,
+    chart: SheetFmt.ChartSpec,
+    mode: 'move' | 'resize'
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    pushHistory();
+    chartDragRef.current = {
+      id: chart.id,
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      x: chart.x,
+      y: chart.y,
+      width: chart.width,
+      height: chart.height,
+    };
+  };
+
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      const drag = chartDragRef.current;
+      if (!drag) return;
+      const dx = event.clientX - drag.startX;
+      const dy = event.clientY - drag.startY;
+      const patch =
+        drag.mode === 'move'
+          ? { x: Math.max(0, drag.x + dx), y: Math.max(0, drag.y + dy) }
+          : {
+              width: Math.max(260, drag.width + dx),
+              height: Math.max(180, drag.height + dy),
+            };
+      const next = SheetFmt.updateChartSpec(metaRef.current, activeSheet, drag.id, patch);
+      metaRef.current = next;
+      setMeta(next);
+    };
+    const onUp = () => {
+      if (!chartDragRef.current) return;
+      chartDragRef.current = null;
+      syncWorkbook(sheetsRef.current, sheetNamesRef.current);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [activeSheet, syncWorkbook]);
+
+  const removeChart = (id: string) => {
+    commitMeta(SheetFmt.removeChartSpec(metaRef.current, activeSheet, id));
+    showNotice('Диаграмма удалена');
+  };
+
+  /* ---------------- Проверка данных ---------------- */
+
+  const applyValidation = () => {
+    const values = validationText
+      .split(/[;\n,]/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (values.length === 0) {
+      showNotice('Введите значения списка через точку с запятой');
+      return;
+    }
+    commitMeta(
+      SheetFmt.setValidationForRange(metaRef.current, activeSheet, selectionAsRange(), values)
+    );
+    setValidationPanelOpen(false);
+    showNotice(`Проверка данных: ${values.length} значений`);
+  };
+
+  const removeValidation = () => {
+    commitMeta(
+      SheetFmt.clearValidationForRange(metaRef.current, activeSheet, selectionAsRange())
+    );
+    setValidationPanelOpen(false);
+    showNotice('Проверка данных удалена');
+  };
+
+  /* ---------------- Примечания ---------------- */
+
+  const editComment = () => {
+    const address = SheetFmt.cellAddress(selected.row, selected.col);
+    const current = activeMeta.comments[address]?.text ?? '';
+    const text = window.prompt('Примечание к ячейке ' + address, current);
+    if (text === null) return;
+    commitMeta(
+      SheetFmt.setCommentForCell(metaRef.current, activeSheet, selected.row, selected.col, text)
+    );
+    setCellMenu(null);
+    showNotice(text.trim() ? 'Примечание сохранено' : 'Примечание удалено');
+  };
+
+  const removeComment = () => {
+    commitMeta(
+      SheetFmt.setCommentForCell(metaRef.current, activeSheet, selected.row, selected.col, null)
+    );
+    setCellMenu(null);
+    showNotice('Примечание удалено');
+  };
+
+  /* ---------------- Условное форматирование ---------------- */
+
+  const createConditionalRule = () => {
+    const needsValue =
+      ruleOperator !== 'empty' && ruleOperator !== 'notEmpty' && ruleOperator !== 'scale';
+    if (needsValue && !ruleValue.trim()) {
+      showNotice('Укажите значение условия');
+      return;
+    }
+    const rule: SheetFmt.ConditionalRule = {
+      id: `rule_${Date.now()}`,
+      range: SheetFmt.rangeToAddress(selectionAsRange()),
+      operator: ruleOperator,
+      value: ruleValue,
+      value2: ruleValue2,
+      fill: ruleOperator === 'scale' ? undefined : ruleFill,
+      color: ruleOperator === 'scale' ? undefined : ruleColor,
+      bold: ruleBold,
+    };
+    commitMeta(SheetFmt.addConditionalRule(metaRef.current, activeSheet, rule));
+    showNotice('Правило условного форматирования добавлено');
+  };
+
+  const deleteConditionalRule = (id: string) => {
+    commitMeta(SheetFmt.removeConditionalRule(metaRef.current, activeSheet, id));
+  };
+
+  /* ---------------- Сводная таблица ---------------- */
+
+  const createPivot = () => {
+    const range = SheetFmt.detectUsedRange(grid, selected.row, selected.col);
+    if (range.endRow <= range.startRow) {
+      showNotice('Нет данных для сводной таблицы');
+      return;
+    }
+    const groups = new Map<string, number[]>();
+    for (let row = range.startRow + 1; row <= range.endRow; row++) {
+      const key = displayCell(row, pivotRowCol).trim() || '(пусто)';
+      const value = numericFromText(displayCell(row, pivotValueCol));
+      if (value === null) continue;
+      const list = groups.get(key) ?? [];
+      list.push(value);
+      groups.set(key, list);
+    }
+    if (groups.size === 0) {
+      showNotice('В выбранном столбце нет чисел');
+      return;
+    }
+    const aggregate = (values: number[]): number | string => {
+      switch (pivotAgg) {
+        case 'count':
+          return values.length;
+        case 'average':
+          return Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 100) / 100;
+        case 'min':
+          return Math.min(...values);
+        case 'max':
+          return Math.max(...values);
+        default:
+          return Math.round(values.reduce((sum, value) => sum + value, 0) * 100) / 100;
+      }
+    };
+    const rowHeader = displayCell(range.startRow, pivotRowCol) || columnName(pivotRowCol);
+    const valueHeader = displayCell(range.startRow, pivotValueCol) || columnName(pivotValueCol);
+    const aggLabels: Record<string, string> = {
+      sum: 'Сумма',
+      count: 'Количество',
+      average: 'Среднее',
+      min: 'Минимум',
+      max: 'Максимум',
+    };
+    const matrix: Grid = [
+      [rowHeader, `${aggLabels[pivotAgg]} — ${valueHeader}`],
+      ...[...groups.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0], 'ru'))
+        .map(([key, values]) => [key, aggregate(values)]),
+    ];
+
+    let index = 1;
+    const existing = new Set(sheetNamesRef.current);
+    while (existing.has(`Сводная ${index}`)) index++;
+    const name = `Сводная ${index}`;
+    const nextSheets = { ...sheetsRef.current, [name]: matrix };
+    const pivotSpec: SheetFmt.PivotSpec = {
+      sourceSheet: activeSheet,
+      range: SheetFmt.rangeToAddress(range),
+      rowCol: pivotRowCol,
+      valueCol: pivotValueCol,
+      aggregation: pivotAgg,
+    };
+    const nextMeta = {
+      ...metaRef.current,
+      [name]: { ...SheetFmt.emptySheetMeta(), pivotSpec },
+    };
+
+    pushHistory();
+    metaRef.current = nextMeta;
+    setMeta(nextMeta);
+    syncWorkbook(nextSheets, [...sheetNamesRef.current, name]);
+    setSheets(nextSheets);
+    setSheetNames((prev) => [...prev, name]);
+    setActiveSheet(name);
+    setSelected({ row: 0, col: 0 });
+    setPivotOpen(false);
+    showNotice(`Сводная таблица: ${name}`);
+  };
+
+  /** Пересчитывает активную сводную по её источнику. */
+  const refreshPivot = () => {
+    const spec = activeMeta.pivotSpec;
+    if (!spec) return;
+    const sourceGrid = sheetsRef.current[spec.sourceSheet];
+    const range = SheetFmt.parseRange(spec.range);
+    if (!sourceGrid || !range) {
+      showNotice('Источник сводной не найден');
+      return;
+    }
+    const context = createContext(sheetsRef.current, spec.sourceSheet);
+    const valueAt = (row: number, col: number) =>
+      computeCellDisplay(sheetsRef.current, spec.sourceSheet, row, col, context);
+    const groups = new Map<string, number[]>();
+    for (let row = range.startRow + 1; row <= range.endRow; row++) {
+      const key = valueAt(row, spec.rowCol).trim() || '(пусто)';
+      const value = numericFromText(valueAt(row, spec.valueCol));
+      if (value === null) continue;
+      const list = groups.get(key) ?? [];
+      list.push(value);
+      groups.set(key, list);
+    }
+    if (groups.size === 0) {
+      showNotice('В источнике нет чисел для сводной');
+      return;
+    }
+    const aggregate = (values: number[]): number => {
+      switch (spec.aggregation) {
+        case 'count':
+          return values.length;
+        case 'average':
+          return Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 100) / 100;
+        case 'min':
+          return Math.min(...values);
+        case 'max':
+          return Math.max(...values);
+        default:
+          return Math.round(values.reduce((sum, value) => sum + value, 0) * 100) / 100;
+      }
+    };
+    const aggLabels: Record<string, string> = {
+      sum: 'Сумма',
+      count: 'Количество',
+      average: 'Среднее',
+      min: 'Минимум',
+      max: 'Максимум',
+    };
+    const matrix: Grid = [
+      [
+        valueAt(range.startRow, spec.rowCol) || columnName(spec.rowCol),
+        `${aggLabels[spec.aggregation]} — ${
+          valueAt(range.startRow, spec.valueCol) || columnName(spec.valueCol)
+        }`,
+      ],
+      ...[...groups.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0], 'ru'))
+        .map(([key, values]) => [key, aggregate(values)]),
+    ];
+    applyBatch((draft) => {
+      draft[activeSheet] = matrix;
+    });
+    showNotice('Сводная таблица обновлена');
+  };
+
+  /* ---------------- Сортировка ---------------- */
+
+  const sortByColumn = (direction: 'asc' | 'desc') => {
+    if (!grid.length) return;
+    const range = SheetFmt.detectUsedRange(grid, selected.row, selected.col);
+    // Первая строка считается заголовком и остаётся на месте.
+    const headerRow = range.startRow;
+    const count = range.endRow - headerRow;
+    if (count < 2) {
+      showNotice('Недостаточно строк для сортировки');
+      return;
+    }
+    const numeric = (value: string): number | null => {
+      const normalized = value.replace(/\s/g, '').replace(',', '.');
+      if (normalized === '' || !/^-?\d+(\.\d+)?$/.test(normalized)) return null;
+      const num = Number(normalized);
+      return Number.isFinite(num) ? num : null;
+    };
+    const order = Array.from({ length: count }, (_, index) => index);
+    order.sort((a, b) => {
+      const av = displayCell(headerRow + 1 + a, selected.col);
+      const bv = displayCell(headerRow + 1 + b, selected.col);
+      const an = numeric(av);
+      const bn = numeric(bv);
+      const result =
+        an !== null && bn !== null
+          ? an - bn
+          : av.localeCompare(bv, 'ru', { numeric: true, sensitivity: 'base' });
+      return direction === 'asc' ? result : -result;
+    });
+
+    if (order.every((value, index) => value === index)) {
+      showNotice('Данные уже отсортированы');
+      return;
+    }
+
+    const rows = grid.slice(headerRow + 1, range.endRow + 1);
+    applyBatch(
+      (draft) => {
+        const sheet = draft[activeSheet];
+        if (!sheet) return;
+        for (let index = 0; index < order.length; index++) {
+          sheet[headerRow + 1 + index] = [...rows[order[index]]];
+        }
+      },
+      (draftMeta) => {
+        const next = SheetFmt.reorderRowsInMeta(
+          draftMeta,
+          activeSheet,
+          headerRow + 1,
+          range.endRow,
+          order
+        );
+        draftMeta[activeSheet] = next[activeSheet];
+      }
+    );
+    showNotice(
+      `Сортировка ${direction === 'asc' ? 'по возрастанию' : 'по убыванию'}: ${columnName(
+        selected.col
+      )}`
+    );
+  };
+
+  /* ---------------- Поиск и замена ---------------- */
+
+  const scrollToRow = (row: number) => {
+    const el = gridRef.current;
+    if (!el) return;
+    const top = rowOffsets[row] ?? row * SheetFmt.DEFAULT_ROW_HEIGHT;
+    if (top < el.scrollTop || top > el.scrollTop + el.clientHeight - 80) {
+      el.scrollTop = Math.max(0, top - 80);
+    }
+  };
+
+  const findNext = (forward = true) => {
+    const query = findText.trim().toLowerCase();
+    if (!query) {
+      setFindMessage('Введите текст для поиска');
+      return;
+    }
+    const rows = grid.length;
+    const cols = grid[0]?.length ?? 0;
+    const total = rows * cols;
+    if (!total) return;
+    const startIndex = selected.row * cols + selected.col;
+    for (let step = 1; step <= total; step++) {
+      const index = ((startIndex + (forward ? step : -step)) % total + total) % total;
+      const row = Math.floor(index / cols);
+      const col = index % cols;
+      if (displayCell(row, col).toLowerCase().includes(query)) {
+        selectSingle({ row, col });
+        scrollToRow(row);
+        setFindMessage(`Найдено: ${columnName(col)}${row + 1}`);
+        return;
+      }
+    }
+    setFindMessage('Совпадений нет');
+  };
+
+  const replaceCurrent = () => {
+    const raw = String(grid[selected.row]?.[selected.col] ?? '');
+    if (!findText) return;
+    if (!raw.toLowerCase().includes(findText.toLowerCase())) {
+      findNext();
+      return;
+    }
+    const regex = new RegExp(escapeRegExp(findText), 'gi');
+    applyChange(selected.row, selected.col, raw.replace(regex, replaceText));
+    setFindMessage('Заменено');
+    findNext();
+  };
+
+  const replaceAll = () => {
+    if (!findText) return;
+    const regex = new RegExp(escapeRegExp(findText), 'gi');
+    let count = 0;
+    applyBatch((draft) => {
+      const sheet = draft[activeSheet];
+      if (!sheet) return;
+      for (let row = 0; row < sheet.length; row++) {
+        for (let col = 0; col < (sheet[row]?.length ?? 0); col++) {
+          const raw = String(sheet[row][col] ?? '');
+          if (!raw || raw.startsWith('=')) continue;
+          regex.lastIndex = 0;
+          if (!regex.test(raw)) continue;
+          regex.lastIndex = 0;
+          sheet[row][col] = raw.replace(regex, replaceText);
+          count++;
+        }
+      }
+    });
+    showNotice(count > 0 ? `Заменено ячеек: ${count}` : 'Совпадений нет');
+  };
+
+  /* ---------------- Изменение ширины и высоты ---------------- */
+
+  const startColumnResize = (event: React.MouseEvent, col: number) => {
+    event.preventDefault();
+    event.stopPropagation();
+    pushHistory();
+    resizeRef.current = {
+      type: 'col',
+      index: col,
+      start: event.clientX,
+      size: activeMeta.colWidths[col] ?? SheetFmt.DEFAULT_COL_WIDTH,
+    };
+    document.body.style.cursor = 'col-resize';
+  };
+
+  const startRowResize = (event: React.MouseEvent, row: number) => {
+    event.preventDefault();
+    event.stopPropagation();
+    pushHistory();
+    resizeRef.current = {
+      type: 'row',
+      index: row,
+      start: event.clientY,
+      size: activeMeta.rowHeights[row] ?? SheetFmt.DEFAULT_ROW_HEIGHT,
+    };
+    document.body.style.cursor = 'row-resize';
+  };
+
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      const drag = resizeRef.current;
+      if (!drag) return;
+      const delta = drag.type === 'col' ? event.clientX - drag.start : event.clientY - drag.start;
+      const nextMeta =
+        drag.type === 'col'
+          ? SheetFmt.setColWidth(metaRef.current, activeSheet, drag.index, drag.size + delta)
+          : SheetFmt.setRowHeight(metaRef.current, activeSheet, drag.index, drag.size + delta);
+      metaRef.current = nextMeta;
+      setMeta(nextMeta);
+    };
+    const onUp = () => {
+      if (!resizeRef.current) return;
+      resizeRef.current = null;
+      document.body.style.cursor = '';
+      syncWorkbook(sheetsRef.current, sheetNamesRef.current);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [activeSheet, syncWorkbook]);
+
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
   /* ---------------- Навигация с клавиатуры ---------------- */
 
   const handleGridKeyDown = (e: React.KeyboardEvent) => {
@@ -634,6 +1890,27 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
       e.preventDefault();
       void copySelection();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'x' || e.key.toLowerCase() === 'ч')) {
+      e.preventDefault();
+      void copySelection();
+      clearSelection();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'b' || e.key.toLowerCase() === 'и')) {
+      e.preventDefault();
+      toggleStyle('bold');
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'i' || e.key.toLowerCase() === 'ш')) {
+      e.preventDefault();
+      toggleStyle('italic');
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'u' || e.key.toLowerCase() === 'г')) {
+      e.preventDefault();
+      toggleStyle('underline');
       return;
     }
     const move = (next: CellCoord) => {
@@ -675,7 +1952,15 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       case 'Delete':
       case 'Backspace':
         e.preventDefault();
-        applyChange(row, col, '');
+        if (
+          extraCells.length > 0 ||
+          selectionRange.start.row !== selectionRange.end.row ||
+          selectionRange.start.col !== selectionRange.end.col
+        ) {
+          clearSelection();
+        } else {
+          applyChange(row, col, '');
+        }
         // Сбрасываем состояние формулы, чтобы она не вернулась при следующем фокусе
         formula.setDraft('');
         formula.setCaret(0);
@@ -714,20 +1999,32 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   };
 
   const deleteRow = (rowIdx: number) => {
-    applyBatch((draft) => {
-      const current = draft[activeSheet];
-      if (current.length <= 1) return;
-      draft[activeSheet] = current.filter((_, i) => i !== rowIdx);
-    });
+    applyBatch(
+      (draft) => {
+        const current = draft[activeSheet];
+        if (current.length <= 1) return;
+        draft[activeSheet] = current.filter((_, i) => i !== rowIdx);
+      },
+      (draftMeta) => {
+        const next = SheetFmt.removeRowFromMeta(draftMeta, activeSheet, rowIdx);
+        draftMeta[activeSheet] = next[activeSheet];
+      }
+    );
     setSelected((s) => ({ ...s, row: Math.max(0, Math.min(s.row, grid.length - 2)) }));
   };
 
   const deleteColumn = (colIdx: number) => {
-    applyBatch((draft) => {
-      const current = draft[activeSheet];
-      if ((current[0]?.length ?? 0) <= 1) return;
-      draft[activeSheet] = current.map((r) => r.filter((_, i) => i !== colIdx));
-    });
+    applyBatch(
+      (draft) => {
+        const current = draft[activeSheet];
+        if ((current[0]?.length ?? 0) <= 1) return;
+        draft[activeSheet] = current.map((r) => r.filter((_, i) => i !== colIdx));
+      },
+      (draftMeta) => {
+        const next = SheetFmt.removeColumnFromMeta(draftMeta, activeSheet, colIdx);
+        draftMeta[activeSheet] = next[activeSheet];
+      }
+    );
     setSelected((s) => ({ ...s, col: Math.max(0, Math.min(s.col, (grid[0]?.length ?? 2) - 2)) }));
   };
 
@@ -738,11 +2035,14 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     const name = `Лист ${n}`;
     const newGrid: Grid = Array.from({ length: MIN_ROWS }, () => new Array(MIN_COLS).fill(''));
 
-    setSheets((prev) => {
-      const next = { ...prev, [name]: newGrid };
-      syncWorkbook(next, [...sheetNames, name]);
-      return next;
-    });
+    const nextSheets = { ...sheetsRef.current, [name]: newGrid };
+    const nextMeta = { ...metaRef.current, [name]: SheetFmt.emptySheetMeta() };
+    setHistory((h) => [...h.slice(-49), { sheets: sheetsRef.current, meta: metaRef.current }]);
+    setFuture([]);
+    metaRef.current = nextMeta;
+    setMeta(nextMeta);
+    syncWorkbook(nextSheets, [...sheetNames, name]);
+    setSheets(nextSheets);
     setSheetNames((prev) => [...prev, name]);
     setActiveSheet(name);
     setSelected({ row: 0, col: 0 });
@@ -751,15 +2051,43 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   const renameSheet = (oldName: string, newName: string) => {
     const trimmed = newName.trim();
     if (!trimmed || trimmed === oldName || sheetNames.includes(trimmed)) return;
-    setSheets((prev) => {
-      const next: Workbook = { ...prev, [trimmed]: prev[oldName] };
-      delete next[oldName];
-      const names = sheetNames.map((n) => (n === oldName ? trimmed : n));
-      syncWorkbook(next, names);
-      return next;
-    });
-    setSheetNames((prev) => prev.map((n) => (n === oldName ? trimmed : n)));
+    const nextSheets: Workbook = { ...sheetsRef.current, [trimmed]: sheetsRef.current[oldName] };
+    delete nextSheets[oldName];
+    const names = sheetNamesRef.current.map((name) => (name === oldName ? trimmed : name));
+    const nextMeta = { ...metaRef.current, [trimmed]: metaRef.current[oldName] ?? SheetFmt.emptySheetMeta() };
+    delete nextMeta[oldName];
+
+    pushHistory();
+    metaRef.current = nextMeta;
+    setMeta(nextMeta);
+    syncWorkbook(nextSheets, names);
+    setSheets(nextSheets);
+    setSheetNames(names);
     setActiveSheet((cur) => (cur === oldName ? trimmed : cur));
+  };
+
+  const removeSheet = (name: string) => {
+    if (sheetNamesRef.current.length <= 1) {
+      showNotice('Нельзя удалить единственный лист');
+      return;
+    }
+    const index = sheetNamesRef.current.indexOf(name);
+    const names = sheetNamesRef.current.filter((item) => item !== name);
+    const nextSheets = { ...sheetsRef.current };
+    delete nextSheets[name];
+    const nextMeta = { ...metaRef.current };
+    delete nextMeta[name];
+
+    pushHistory();
+    metaRef.current = nextMeta;
+    setMeta(nextMeta);
+    syncWorkbook(nextSheets, names);
+    setSheets(nextSheets);
+    setSheetNames(names);
+    setActiveSheet((current) =>
+      current === name ? names[Math.max(0, index - 1)] ?? names[0] : current
+    );
+    setSelected({ row: 0, col: 0 });
   };
 
   /** Формулы, которые считаются с ошибкой, по всем листам книги. */
@@ -1102,6 +2430,10 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           <button className="block w-full rounded px-3 py-1.5 text-left hover:bg-ws-hover" onClick={() => { void copySelection(); setCellMenu(null); }}>Копировать</button>
           <button className="block w-full rounded px-3 py-1.5 text-left hover:bg-ws-hover" onClick={() => { void pasteTable(); setCellMenu(null); }}>Вставить</button>
           <button className="block w-full rounded px-3 py-1.5 text-left hover:bg-ws-hover" onClick={() => { clearSelection(); setCellMenu(null); }}>Очистить содержимое</button>
+          <button className="block w-full rounded px-3 py-1.5 text-left hover:bg-ws-hover" onClick={editComment}>Примечание…</button>
+          {activeMeta.comments[SheetFmt.cellAddress(selected.row, selected.col)] && (
+            <button className="block w-full rounded px-3 py-1.5 text-left text-ws-danger hover:bg-red-500/10" onClick={removeComment}>Удалить примечание</button>
+          )}
           <div className="my-1 border-t border-ws" />
           <button className="block w-full rounded px-3 py-1.5 text-left text-ws-danger hover:bg-red-500/10" onClick={() => { deleteSelectionRows(); setCellMenu(null); }}>Удалить строки</button>
           <button className="block w-full rounded px-3 py-1.5 text-left text-ws-danger hover:bg-red-500/10" onClick={() => { deleteSelectionColumns(); setCellMenu(null); }}>Удалить столбцы</button>
@@ -1196,6 +2528,18 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           </button>
 
           <button
+            onClick={() => void reloadFromDisk()}
+            disabled={excelBusy}
+            title="Перечитать файл с диска"
+            className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-ws-muted transition-colors hover:border-ws-accent hover:text-ws-accent disabled:opacity-40"
+          >
+            <RefreshCw size={11} />
+            Обновить
+          </button>
+
+          <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+          <button
             onClick={() => setShowFormulaAI(true)}
             className="flex items-center gap-1.5 rounded border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-emerald-500 transition-colors hover:bg-emerald-500/20"
           >
@@ -1219,6 +2563,302 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           </button>
         </div>
       </div>
+
+      {/* Панель форматирования */}
+      <div className="flex shrink-0 flex-wrap items-center gap-1 overflow-x-auto border-b border-ws bg-ws-surface px-3 py-1 text-xs select-none">
+        <button onClick={() => toggleStyle('bold')} title="Полужирный (Ctrl+B)" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.bold && 'bg-ws-accent-soft text-ws-accent')}><Bold size={13} /></button>
+        <button onClick={() => toggleStyle('italic')} title="Курсив (Ctrl+I)" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.italic && 'bg-ws-accent-soft text-ws-accent')}><Italic size={13} /></button>
+        <button onClick={() => toggleStyle('underline')} title="Подчёркнутый (Ctrl+U)" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.underline && 'bg-ws-accent-soft text-ws-accent')}><Underline size={13} /></button>
+        <button onClick={() => toggleStyle('strike')} title="Зачёркнутый" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.strike && 'bg-ws-accent-soft text-ws-accent')}><Strikethrough size={13} /></button>
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <select
+          value={selectedStyle.fontSize ?? 12}
+          onChange={(e) => applyStyle({ fontSize: Number(e.target.value) })}
+          title="Размер шрифта"
+          className="rounded border border-ws bg-ws-editor px-1 py-0.5 text-[11px] text-ws"
+        >
+          {[9, 10, 11, 12, 14, 16, 18, 20, 24, 28].map((size) => (
+            <option key={size} value={size}>{size}</option>
+          ))}
+        </select>
+
+        <label title="Цвет текста" className="flex cursor-pointer items-center gap-1 rounded border border-ws px-1.5 py-0.5">
+          <Palette size={12} className="text-ws-muted" />
+          <input type="color" value={selectedStyle.color ?? '#e2e8f0'} onChange={(e) => applyStyle({ color: e.target.value })} className="h-4 w-5 cursor-pointer border-0 bg-transparent p-0" />
+        </label>
+        <label title="Цвет заливки" className="flex cursor-pointer items-center gap-1 rounded border border-ws px-1.5 py-0.5">
+          <PaintBucket size={12} className="text-ws-muted" />
+          <input type="color" value={selectedStyle.fill ?? '#ffffff'} onChange={(e) => applyStyle({ fill: e.target.value })} className="h-4 w-5 cursor-pointer border-0 bg-transparent p-0" />
+        </label>
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <button onClick={() => applyStyle({ align: 'left' })} title="По левому краю" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.align === 'left' && 'bg-ws-accent-soft text-ws-accent')}><AlignLeft size={13} /></button>
+        <button onClick={() => applyStyle({ align: 'center' })} title="По центру" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.align === 'center' && 'bg-ws-accent-soft text-ws-accent')}><AlignCenter size={13} /></button>
+        <button onClick={() => applyStyle({ align: 'right' })} title="По правому краю" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.align === 'right' && 'bg-ws-accent-soft text-ws-accent')}><AlignRight size={13} /></button>
+        <button onClick={() => toggleStyle('wrap')} title="Перенос текста" className={cn('rounded p-1 hover:bg-ws-hover', selectedStyle.wrap && 'bg-ws-accent-soft text-ws-accent')}><WrapText size={13} /></button>
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <span className="flex items-center gap-0.5 rounded border border-ws px-1 py-0.5">
+          <span className="px-0.5 text-[10px] text-ws-faint">Границы</span>
+          <button onClick={() => applyBorders('all')} title="Все границы" className="rounded px-1 hover:bg-ws-hover">Все</button>
+          <button onClick={() => applyBorders('outer')} title="Только внешние" className="rounded px-1 hover:bg-ws-hover">Внеш.</button>
+          <button onClick={() => applyBorders('none')} title="Убрать границы" className="rounded px-1 hover:bg-ws-hover">Нет</button>
+        </span>
+
+        <button onClick={mergeSelection} title="Объединить ячейки" className="flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"><Merge size={12} />Объединить</button>
+        <button onClick={unmergeSelection} title="Отменить объединение" className="rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"><SplitSquareHorizontal size={12} /></button>
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <select
+          value={selectedStyle.numberFormat ?? 'general'}
+          onChange={(e) => applyStyle({ numberFormat: e.target.value as SheetFmt.NumberFormat })}
+          title="Числовой формат"
+          className="rounded border border-ws bg-ws-editor px-1 py-0.5 text-[11px] text-ws"
+        >
+          <option value="general">Общий</option>
+          <option value="number">Число</option>
+          <option value="currency">Финансовый (₽)</option>
+          <option value="percent">Процент</option>
+          <option value="date">Дата</option>
+          <option value="text">Текст</option>
+        </select>
+
+        <button onClick={() => sortByColumn('asc')} title="Сортировка по возрастанию" className="flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"><ArrowUpAZ size={12} /></button>
+        <button onClick={() => sortByColumn('desc')} title="Сортировка по убыванию" className="flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"><ArrowDownAZ size={12} /></button>
+        <button
+          onClick={openFilterPanel}
+          title="Фильтр по значениям выбранного столбца"
+          className={cn('flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover', activeFilter && 'border-emerald-500/40 text-emerald-500')}
+        >
+          <TableIcon size={12} />
+          Фильтр
+        </button>
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <button onClick={applyColorScale} title="Цветовая шкала по числам выделения" className="rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover">Шкала</button>
+        <button onClick={clearFormatting} title="Снять форматирование выделения" className="rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover">Очистить формат</button>
+        <button onClick={convertTextToNumbers} title="Преобразовать текстовые числа в числа Excel (для SUM)" className="rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover">Числа</button>
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <button
+          onClick={() => { setChartTitle(`Диаграмма ${activeMeta.charts.length + 1}`); setChartDialogOpen(true); }}
+          title="Построить диаграмму по выделенному диапазону"
+          className="flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"
+        >
+          <BarChart3 size={12} />Диаграмма
+        </button>
+        {activeMeta.charts.length > 0 && (
+          <span className="rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-500">
+            Диаграммы сохраняются в xlsx
+          </span>
+        )}
+        <button
+          onClick={() => setValidationPanelOpen((value) => !value)}
+          title="Проверка данных: выпадающий список"
+          className={cn('flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover', validationPanelOpen && 'bg-ws-accent-soft text-ws-accent')}
+        >
+          <ListChecks size={12} />Список
+        </button>
+        <button
+          onClick={() => setConditionalPanelOpen((value) => !value)}
+          title="Условное форматирование"
+          className={cn('flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover', conditionalPanelOpen && 'bg-ws-accent-soft text-ws-accent')}
+        >
+          <SlidersHorizontal size={12} />Условное
+        </button>
+        <button
+          onClick={() => setPivotOpen(true)}
+          title="Сводная таблица по выделенному диапазону"
+          className="flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"
+        >
+          <Table2 size={12} />Сводная
+        </button>
+        {activeMeta.pivotSpec && (
+          <button
+            onClick={refreshPivot}
+            title="Пересчитать сводную по исходным данным"
+            className="flex items-center gap-1 rounded border border-emerald-500/40 px-1.5 py-0.5 text-emerald-500 hover:bg-emerald-500/10"
+          >
+            <RefreshCw size={12} />Обновить сводную
+          </button>
+        )}
+
+        <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+        <button
+          onClick={freezePanes}
+          title="Закрепить строки выше и столбцы левее выделенной ячейки"
+          className={cn('flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover', (activeMeta.freezeRows > 0 || activeMeta.freezeCols > 0) && 'border-emerald-500/40 text-emerald-500')}
+        >
+          <Pin size={12} />
+          Закрепить
+        </button>
+        {(activeMeta.freezeRows > 0 || activeMeta.freezeCols > 0) && (
+          <button onClick={unfreezePanes} title="Снять закрепление" className="rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover"><PinOff size={12} /></button>
+        )}
+
+        <button onClick={() => setFindOpen((value) => !value)} title="Найти и заменить (Ctrl+F)" className={cn('flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover', findOpen && 'bg-ws-accent-soft text-ws-accent')}><Search size={12} />Поиск</button>
+
+        {notice && <span className="ml-2 truncate text-[11px] text-emerald-500">{notice}</span>}
+      </div>
+
+      {/* Поиск и замена */}
+      {findOpen && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-ws bg-ws-elevated px-3 py-1.5 text-xs">
+          <Search size={13} className="text-ws-muted" />
+          <input
+            autoFocus
+            value={findText}
+            onChange={(e) => { setFindText(e.target.value); setFindMessage(''); }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); findNext(!e.shiftKey); }
+              if (e.key === 'Escape') setFindOpen(false);
+            }}
+            placeholder="Найти"
+            className="w-44 rounded border border-ws bg-ws-surface px-2 py-0.5 text-xs text-ws placeholder:text-ws-faint focus:border-emerald-500 focus:outline-none"
+          />
+          <Replace size={13} className="text-ws-muted" />
+          <input
+            value={replaceText}
+            onChange={(e) => setReplaceText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); replaceCurrent(); } }}
+            placeholder="Заменить на"
+            className="w-44 rounded border border-ws bg-ws-surface px-2 py-0.5 text-xs text-ws placeholder:text-ws-faint focus:border-emerald-500 focus:outline-none"
+          />
+          <button onClick={() => findNext(true)} className="rounded border border-ws px-2 py-0.5 hover:bg-ws-hover">Найти</button>
+          <button onClick={replaceCurrent} className="rounded border border-ws px-2 py-0.5 hover:bg-ws-hover">Заменить</button>
+          <button onClick={replaceAll} className="rounded border border-ws px-2 py-0.5 hover:bg-ws-hover">Заменить все</button>
+          {findMessage && <span className="text-[11px] text-ws-muted">{findMessage}</span>}
+          <button onClick={() => setFindOpen(false)} title="Закрыть" className="ml-auto rounded p-1 text-ws-faint hover:bg-ws-hover hover:text-ws"><X size={13} /></button>
+        </div>
+      )}
+
+      {/* Панель фильтра */}
+      {filterPanelOpen && activeFilter && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-ws bg-ws-elevated px-3 py-1.5 text-xs">
+          <TableIcon size={13} className="text-ws-muted" />
+          <span className="text-ws-muted">
+            Фильтр: <strong className="text-ws">{columnName(activeFilter.col)}</strong>, строка
+            заголовка {activeFilter.headerRow + 1}
+          </span>
+          <div className="flex max-h-20 flex-wrap gap-x-3 gap-y-1 overflow-auto rounded border border-ws bg-ws-surface px-2 py-1">
+            {activeFilter.allValues.map((value) => (
+              <label key={value || '__empty__'} className="flex cursor-pointer items-center gap-1 text-[11px] text-ws">
+                <input
+                  type="checkbox"
+                  checked={activeFilter.values.includes(value)}
+                  onChange={() => toggleFilterValue(value)}
+                />
+                {value || '(пустые)'}
+              </label>
+            ))}
+          </div>
+          <button onClick={clearFilter} className="rounded border border-ws px-2 py-0.5 hover:bg-ws-hover">Сбросить</button>
+          <button onClick={() => setFilterPanelOpen(false)} className="ml-auto rounded p-1 text-ws-faint hover:bg-ws-hover hover:text-ws"><X size={13} /></button>
+        </div>
+      )}
+
+      {/* Проверка данных */}
+      {validationPanelOpen && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-ws bg-ws-elevated px-3 py-1.5 text-xs">
+          <ListChecks size={13} className="text-ws-muted" />
+          <span className="text-ws-muted">
+            Проверка данных для <strong className="text-ws">{selectionLabel}</strong>
+          </span>
+          <input
+            value={validationText}
+            onChange={(e) => setValidationText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applyValidation(); } }}
+            placeholder="Значения через ; — например: Да; Нет; Не знаю"
+            className="w-80 rounded border border-ws bg-ws-surface px-2 py-0.5 text-xs text-ws placeholder:text-ws-faint focus:border-emerald-500 focus:outline-none"
+          />
+          <button onClick={applyValidation} className="rounded border border-ws px-2 py-0.5 hover:bg-ws-hover">Применить</button>
+          <button onClick={removeValidation} className="rounded border border-ws px-2 py-0.5 text-ws-danger hover:bg-red-500/10">Убрать</button>
+          <button onClick={() => setValidationPanelOpen(false)} title="Закрыть" className="ml-auto rounded p-1 text-ws-faint hover:bg-ws-hover hover:text-ws"><X size={13} /></button>
+        </div>
+      )}
+
+      {/* Условное форматирование */}
+      {conditionalPanelOpen && (
+        <div className="flex shrink-0 flex-col gap-1 border-b border-ws bg-ws-elevated px-3 py-1.5 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <SlidersHorizontal size={13} className="text-ws-muted" />
+            <span className="text-ws-muted">Условие для <strong className="text-ws">{selectionLabel}</strong></span>
+            <select
+              value={ruleOperator}
+              onChange={(e) => setRuleOperator(e.target.value as SheetFmt.ConditionalOperator)}
+              className="rounded border border-ws bg-ws-surface px-1 py-0.5 text-[11px] text-ws"
+            >
+              <option value="greater">больше</option>
+              <option value="less">меньше</option>
+              <option value="equal">равно</option>
+              <option value="notEqual">не равно</option>
+              <option value="between">между</option>
+              <option value="contains">содержит</option>
+              <option value="empty">пусто</option>
+              <option value="notEmpty">не пусто</option>
+              <option value="scale">цветовая шкала</option>
+            </select>
+            {ruleOperator !== 'empty' && ruleOperator !== 'notEmpty' && ruleOperator !== 'scale' && (
+              <input
+                value={ruleValue}
+                onChange={(e) => setRuleValue(e.target.value)}
+                placeholder="Значение"
+                className="w-28 rounded border border-ws bg-ws-surface px-2 py-0.5 text-xs text-ws placeholder:text-ws-faint focus:border-emerald-500 focus:outline-none"
+              />
+            )}
+            {ruleOperator === 'between' && (
+              <input
+                value={ruleValue2}
+                onChange={(e) => setRuleValue2(e.target.value)}
+                placeholder="И"
+                className="w-20 rounded border border-ws bg-ws-surface px-2 py-0.5 text-xs text-ws placeholder:text-ws-faint focus:border-emerald-500 focus:outline-none"
+              />
+            )}
+            {ruleOperator !== 'scale' && (
+              <>
+                <label className="flex items-center gap-1 text-[11px] text-ws-muted">
+                  Заливка
+                  <input type="color" value={ruleFill} onChange={(e) => setRuleFill(e.target.value)} className="h-4 w-5 cursor-pointer border-0 bg-transparent p-0" />
+                </label>
+                <label className="flex items-center gap-1 text-[11px] text-ws-muted">
+                  Текст
+                  <input type="color" value={ruleColor} onChange={(e) => setRuleColor(e.target.value)} className="h-4 w-5 cursor-pointer border-0 bg-transparent p-0" />
+                </label>
+                <label className="flex items-center gap-1 text-[11px] text-ws-muted">
+                  <input type="checkbox" checked={ruleBold} onChange={(e) => setRuleBold(e.target.checked)} /> Жирный
+                </label>
+              </>
+            )}
+            <button onClick={createConditionalRule} className="rounded border border-ws px-2 py-0.5 hover:bg-ws-hover">Добавить правило</button>
+            <button onClick={() => setConditionalPanelOpen(false)} title="Закрыть" className="ml-auto rounded p-1 text-ws-faint hover:bg-ws-hover hover:text-ws"><X size={13} /></button>
+          </div>
+          {activeMeta.conditional.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 border-t border-ws/50 pt-1">
+              <span className="text-[10px] text-ws-faint">Правила листа:</span>
+              {activeMeta.conditional.map((rule) => {
+                const labels: Record<string, string> = {
+                  greater: '>', less: '<', equal: '=', notEqual: '≠', between: 'между',
+                  contains: 'содержит', empty: 'пусто', notEmpty: 'не пусто', scale: 'шкала',
+                };
+                return (
+                  <span key={rule.id} className="flex items-center gap-1 rounded bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws-muted">
+                    {rule.range} · {labels[rule.operator]} {rule.value || ''}
+                    <button onClick={() => deleteConditionalRule(rule.id)} title="Удалить правило" className="text-ws-faint hover:text-ws-danger"><X size={10} /></button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {repairNote && (
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-ws bg-ws-elevated px-3 py-1 text-[11px] text-ws-muted">
@@ -1308,6 +2948,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       </div>
 
       {/* Сетка */}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={gridRef}
         tabIndex={0}
@@ -1317,9 +2958,15 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         onScroll={(e) => {
           if (isVirtual) setScrollTop(e.currentTarget.scrollTop);
         }}
-        className="min-h-0 flex-1 overflow-auto bg-ws-editor focus:outline-none"
+        className="h-full overflow-auto bg-ws-editor focus:outline-none"
       >
-        <table className="border-collapse select-text">
+        <table className="border-collapse select-text" style={{ tableLayout: 'fixed' }}>
+          <colgroup>
+            <col style={{ width: 48 }} />
+            {(grid[0] ?? []).map((_, c) => (
+              <col key={c} style={{ width: activeMeta.colWidths[c] ?? SheetFmt.DEFAULT_COL_WIDTH }} />
+            ))}
+          </colgroup>
           <thead>
             <tr className="sticky top-0 z-10 bg-ws-surface text-[11px] font-mono text-ws-faint">
               <th className="sticky left-0 z-20 h-7 w-12 border border-ws bg-ws-surface text-center">
@@ -1330,11 +2977,16 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                   key={c}
                   onClick={() => setSelected({ row: 0, col: c })}
                   className={cn(
-                    'h-7 min-w-[104px] cursor-pointer border border-ws px-2 text-center font-medium transition-colors hover:bg-ws-hover',
+                    'relative h-7 cursor-pointer border border-ws px-2 text-center font-medium transition-colors hover:bg-ws-hover',
                     selected.col === c && 'bg-emerald-500/15 text-emerald-500'
                   )}
                 >
                   {columnName(c)}
+                  <span
+                    onMouseDown={(event) => startColumnResize(event, c)}
+                    title="Потяните, чтобы изменить ширину столбца"
+                    className="absolute top-0 right-0 z-10 h-full w-1.5 cursor-col-resize bg-transparent hover:bg-emerald-500/40"
+                  />
                 </th>
               ))}
             </tr>
@@ -1345,16 +2997,29 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                 <td colSpan={(grid[0]?.length ?? 0) + 1} style={{ padding: 0, border: 'none' }} />
               </tr>
             )}
-            {visibleRows.map(({ row, r }) => (
-              <tr key={r}>
+            {visibleRows.filter(({ r }) => rowMatchesFilter(r)).map(({ row, r }) => {
+              const rowHeight = activeMeta.rowHeights[r] ?? SheetFmt.DEFAULT_ROW_HEIGHT;
+              const rowFrozen = r < activeMeta.freezeRows;
+              return (
+              <tr key={r} style={{ height: rowHeight }}>
                 <td
                   onClick={() => setSelected({ row: r, col: 0 })}
+                  style={
+                    rowFrozen
+                      ? { position: 'sticky', top: 28 + rowOffsets[r], zIndex: 14 }
+                      : undefined
+                  }
                   className={cn(
-                    'sticky left-0 z-10 h-7 w-12 cursor-pointer border border-ws bg-ws-surface text-center font-mono text-[11px] transition-colors hover:bg-ws-hover',
+                    'sticky left-0 z-10 w-12 cursor-pointer border border-ws bg-ws-surface text-center font-mono text-[11px] transition-colors hover:bg-ws-hover',
                     selected.row === r ? 'bg-emerald-500/15 font-bold text-emerald-500' : 'text-ws-faint'
                   )}
                 >
                   {r + 1}
+                  <span
+                    onMouseDown={(event) => startRowResize(event, r)}
+                    title="Потяните, чтобы изменить высоту строки"
+                    className="absolute inset-x-0 -bottom-2 z-20 h-1.5 cursor-row-resize hover:bg-emerald-500/40"
+                  />
                 </td>
 
                 {row.map((cell, c) => {
@@ -1370,6 +3035,40 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                   const raw = cell === undefined || cell === null ? '' : String(cell);
                   const display = displayCell(r, c);
                   const isFormula = raw.startsWith('=');
+                  const address = SheetFmt.cellAddress(r, c);
+                  if (mergeInfo.covered.has(address)) return null;
+                  const merge = mergeInfo.anchors.get(address);
+                  const cellStyle = activeMeta.cells[address];
+                  const shown = SheetFmt.formatCellValue(display, cellStyle?.numberFormat);
+                  const comment = activeMeta.comments[address];
+                  const validation = activeMeta.validations[address];
+                  const conditionalCss: Record<string, string | number> = {};
+                  for (const rule of activeMeta.conditional) {
+                    if (!SheetFmt.ruleContainsCell(rule, r, c)) continue;
+                    if (rule.operator === 'scale') {
+                      const bounds = conditionalScaleBounds.get(rule.id);
+                      const num = numericFromText(display);
+                      if (!bounds || num === null) continue;
+                      conditionalCss.backgroundColor = SheetFmt.scaleColor(
+                        (num - bounds.min) / Math.max(0.0001, bounds.max - bounds.min)
+                      );
+                    } else if (SheetFmt.ruleMatches(rule, display)) {
+                      Object.assign(conditionalCss, SheetFmt.conditionalCss(rule));
+                    }
+                  }
+                  const frozenRow = r < activeMeta.freezeRows;
+                  const frozenCol = c < activeMeta.freezeCols;
+                  const stickyStyle: React.CSSProperties = {};
+                  if (frozenRow) {
+                    stickyStyle.position = 'sticky';
+                    stickyStyle.top = 28 + rowOffsets[r];
+                    stickyStyle.zIndex = 8;
+                  }
+                  if (frozenCol) {
+                    stickyStyle.position = 'sticky';
+                    stickyStyle.left = 48 + colOffsets[c];
+                    stickyStyle.zIndex = frozenRow ? 9 : 8;
+                  }
 
                   // Подсветка диапазона, который сейчас выбирается мышью
                   const d = formula.drag;
@@ -1383,6 +3082,9 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                   return (
                     <td
                       key={c}
+                      rowSpan={merge?.rowSpan}
+                      colSpan={merge?.colSpan}
+                      style={{ ...SheetFmt.styleToCss(cellStyle), ...conditionalCss, ...stickyStyle }}
                       onMouseDown={(e) => {
                         // В формульном режиме клик по ячейке подставляет ссылку
                         if (formula.isFormulaMode && !isEditing) {
@@ -1443,10 +3145,18 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                           formula.setCaret(raw.length);
                         }
                       }}
-                      title={isFormula ? `${raw}  →  ${display}` : display}
+                      title={
+                        [
+                          isFormula ? `${raw}  →  ${display}` : display,
+                          comment ? `Примечание: ${comment.text}` : '',
+                        ]
+                          .filter(Boolean)
+                          .join('\n')
+                      }
                       className={cn(
-                        'relative h-7 max-w-[240px] min-w-[104px] cursor-cell truncate border border-ws px-2 text-xs',
-                        isSelected && 'bg-emerald-500/15',
+                        'relative cursor-cell overflow-hidden border border-ws px-2 text-xs',
+                        !cellStyle?.wrap && 'truncate',
+                        isSelected && 'bg-emerald-500/15 outline outline-1 outline-emerald-500/40',
                         inFill && 'bg-emerald-500/10 outline outline-1 outline-emerald-500/50',
                         isActive && 'ring-2 ring-emerald-500 ring-inset',
                         inDragRange && 'bg-emerald-500/10',
@@ -1465,7 +3175,32 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                           className="absolute -right-1 -bottom-1 z-20 h-2.5 w-2.5 cursor-crosshair border border-white bg-emerald-500"
                         />
                       )}
+                      {comment && (
+                        <span className="pointer-events-none absolute top-0 right-0 h-0 w-0 border-t-[7px] border-l-[7px] border-t-red-500 border-l-transparent" />
+                      )}
+                      {validation && !isEditing && (
+                        <span className="pointer-events-none absolute right-0.5 bottom-0 text-[8px] text-ws-faint">▾</span>
+                      )}
                       {isEditing ? (
+                        validation ? (
+                          <select
+                            autoFocus
+                            value={validation.values.includes(editorValue) ? editorValue : ''}
+                            onChange={(e) => {
+                              applyChange(r, c, e.target.value);
+                              setEditingCell(null);
+                              formula.endEdit();
+                              gridRef.current?.focus();
+                            }}
+                            onBlur={() => setEditingCell(null)}
+                            className="h-full w-full border border-emerald-500 bg-ws-surface px-1 text-xs text-ws outline-none"
+                          >
+                            <option value="">—</option>
+                            {validation.values.map((value) => (
+                              <option key={value} value={value}>{value}</option>
+                            ))}
+                          </select>
+                        ) : (
                         <input
                           ref={cellEditorRef}
                           autoFocus
@@ -1516,22 +3251,25 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                           }}
                           className="h-full w-full border border-emerald-500 bg-ws-surface px-1.5 font-mono text-xs text-ws outline-none"
                         />
+                        )
                       ) : (
                         <span
                           className={cn(
-                            'block truncate',
+                            'block',
+                            !cellStyle?.wrap && 'truncate',
                             isFormula && 'text-emerald-500',
                             isError(cell as never) && 'text-ws-danger'
                           )}
                         >
-                          {display}
+                          {shown}
                         </span>
                       )}
                     </td>
                   );
                 })}
               </tr>
-            ))}
+              );
+            })}
             {bottomSpacerHeight > 0 && (
               <tr style={{ height: `${bottomSpacerHeight}px` }}>
                 <td colSpan={(grid[0]?.length ?? 0) + 1} style={{ padding: 0, border: 'none' }} />
@@ -1539,6 +3277,42 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
             )}
           </tbody>
         </table>
+      </div>
+
+        {/* Диаграммы листа */}
+        {activeMeta.charts.map((chart) => {
+          const data = buildChartData(chart.range);
+          return (
+            <div
+              key={chart.id}
+              className="absolute z-30 flex flex-col overflow-hidden rounded-lg border border-ws bg-ws-surface shadow-xl"
+              style={{ left: chart.x, top: chart.y, width: chart.width, height: chart.height }}
+            >
+              <div
+                onMouseDown={(event) => startChartMove(event, chart, 'move')}
+                className="flex cursor-move items-center justify-between gap-2 border-b border-ws bg-ws-elevated px-2 py-1 text-[11px] select-none"
+              >
+                <span className="truncate font-medium text-ws">{chart.title}</span>
+                <button
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={() => removeChart(chart.id)}
+                  title="Удалить диаграмму"
+                  className="rounded p-0.5 text-ws-faint hover:bg-ws-hover hover:text-ws-danger"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 p-1 text-ws">
+                <SheetChart spec={chart} labels={data.labels} series={data.series} />
+              </div>
+              <span
+                onMouseDown={(event) => startChartMove(event, chart, 'resize')}
+                title="Изменить размер"
+                className="absolute right-0 bottom-0 h-3 w-3 cursor-nwse-resize bg-emerald-500/60"
+              />
+            </div>
+          );
+        })}
       </div>
 
       {/* Листы */}
@@ -1575,6 +3349,15 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         >
           <Plus size={13} />
         </button>
+        {sheetNames.length > 1 && (
+          <button
+            onClick={() => removeSheet(activeSheet)}
+            title="Удалить активный лист"
+            className="rounded p-1 text-ws-faint transition-colors hover:bg-red-500/10 hover:text-ws-danger"
+          >
+            <Trash2 size={13} />
+          </button>
+        )}
 
         <div className="ml-auto flex items-center gap-3 text-[10px] text-ws-faint">
           <span>
@@ -1585,6 +3368,130 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           {tab.isDirty && <span className="text-ws-warning">● Изменено</span>}
         </div>
       </div>
+
+      {/* Диалог диаграммы */}
+      {chartDialogOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          onMouseDown={(e) => { if (e.target === e.currentTarget) setChartDialogOpen(false); }}
+        >
+          <div className="animate-scale-in w-full max-w-md overflow-hidden rounded-xl border border-ws bg-ws-surface shadow-ws">
+            <div className="flex items-center justify-between border-b border-ws px-4 py-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-emerald-500">
+                <BarChart3 size={15} />
+                Диаграмма
+              </div>
+              <button onClick={() => setChartDialogOpen(false)} className="text-ws-faint hover:text-ws"><X size={14} /></button>
+            </div>
+            <div className="space-y-3 p-4 text-xs">
+              <p className="text-[11px] text-ws-muted">
+                Диапазон: <strong className="font-mono text-ws">{selectionLabel}</strong>. Первая
+                строка — заголовки, первый столбец — подписи категорий.
+              </p>
+              <label className="block space-y-1">
+                <span className="text-ws-muted">Тип</span>
+                <select
+                  value={chartType}
+                  onChange={(e) => setChartType(e.target.value as SheetFmt.ChartType)}
+                  className="w-full rounded border border-ws bg-ws-editor px-2 py-1 text-xs text-ws"
+                >
+                  <option value="bar">Столбчатая</option>
+                  <option value="line">Линейная</option>
+                  <option value="pie">Круговая</option>
+                </select>
+              </label>
+              <label className="block space-y-1">
+                <span className="text-ws-muted">Название</span>
+                <input
+                  value={chartTitle}
+                  onChange={(e) => setChartTitle(e.target.value)}
+                  className="w-full rounded border border-ws bg-ws-editor px-2 py-1 text-xs text-ws focus:border-emerald-500 focus:outline-none"
+                />
+              </label>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-ws px-4 py-3">
+              <Button variant="secondary" onClick={() => setChartDialogOpen(false)}>Отмена</Button>
+              <Button variant="primary" onClick={createChart}>Создать</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Диалог сводной таблицы */}
+      {pivotOpen && (() => {
+        const pivotRange = SheetFmt.detectUsedRange(grid, selected.row, selected.col);
+        const headerOptions: { index: number; label: string }[] = [];
+        for (let col = pivotRange.startCol; col <= pivotRange.endCol; col++) {
+          headerOptions.push({
+            index: col,
+            label: `${columnName(col)} — ${displayCell(pivotRange.startRow, col) || 'без названия'}`,
+          });
+        }
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onMouseDown={(e) => { if (e.target === e.currentTarget) setPivotOpen(false); }}
+          >
+            <div className="animate-scale-in w-full max-w-md overflow-hidden rounded-xl border border-ws bg-ws-surface shadow-ws">
+              <div className="flex items-center justify-between border-b border-ws px-4 py-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-emerald-500">
+                  <Table2 size={15} />
+                  Сводная таблица
+                </div>
+                <button onClick={() => setPivotOpen(false)} className="text-ws-faint hover:text-ws"><X size={14} /></button>
+              </div>
+              <div className="space-y-3 p-4 text-xs">
+                <p className="text-[11px] leading-relaxed text-ws-muted">
+                  Источник: <strong className="font-mono text-ws">{SheetFmt.rangeToAddress(pivotRange)}</strong>.
+                  Результат будет создан на новом листе.
+                </p>
+                <label className="block space-y-1">
+                  <span className="text-ws-muted">Строки (поле группировки)</span>
+                  <select
+                    value={pivotRowCol}
+                    onChange={(e) => setPivotRowCol(Number(e.target.value))}
+                    className="w-full rounded border border-ws bg-ws-editor px-2 py-1 text-xs text-ws"
+                  >
+                    {headerOptions.map((option) => (
+                      <option key={option.index} value={option.index}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block space-y-1">
+                  <span className="text-ws-muted">Значения</span>
+                  <select
+                    value={pivotValueCol}
+                    onChange={(e) => setPivotValueCol(Number(e.target.value))}
+                    className="w-full rounded border border-ws bg-ws-editor px-2 py-1 text-xs text-ws"
+                  >
+                    {headerOptions.map((option) => (
+                      <option key={option.index} value={option.index}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block space-y-1">
+                  <span className="text-ws-muted">Агрегация</span>
+                  <select
+                    value={pivotAgg}
+                    onChange={(e) => setPivotAgg(e.target.value as typeof pivotAgg)}
+                    className="w-full rounded border border-ws bg-ws-editor px-2 py-1 text-xs text-ws"
+                  >
+                    <option value="sum">Сумма</option>
+                    <option value="count">Количество</option>
+                    <option value="average">Среднее</option>
+                    <option value="min">Минимум</option>
+                    <option value="max">Максимум</option>
+                  </select>
+                </label>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-ws px-4 py-3">
+                <Button variant="secondary" onClick={() => setPivotOpen(false)}>Отмена</Button>
+                <Button variant="primary" onClick={createPivot}>Создать лист</Button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Диалог AI-формулы */}
       {showFormulaAI && (

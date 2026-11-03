@@ -42,6 +42,11 @@ function registerIPC() {
   ipcMain.handle('window:maximize', () => false);
   ipcMain.handle('window:isMaximized', () => false);
   ipcMain.handle('window:close', () => undefined);
+  // Каналы есть в preload приложения, но в проверочной среде главный процесс
+  // свой — без заглушек рендерер получает отказ и пишет ошибку в консоль.
+  ipcMain.handle('system:getInitialExternalPath', () => null);
+  ipcMain.handle('window:getAlwaysOnTop', () => false);
+  ipcMain.handle('window:setAlwaysOnTop', (_e, value) => ({ success: true, alwaysOnTop: Boolean(value) }));
   ipcMain.handle('fs:getCurrentWorkspace', () => SANDBOX);
   ipcMain.handle('fs:setWorkspaceRoot', () => ({ success: true }));
   ipcMain.handle('fs:openFolderDialog', () => SANDBOX);
@@ -94,6 +99,29 @@ function registerIPC() {
       return { success: false, error: err.message };
     }
   });
+
+  ipcMain.handle('fs:readPreview', async (_e, filePath, maxBytes = 65536) => {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      const size = Math.min(Math.max(1024, maxBytes), stat.size);
+      const handle = await fs.promises.open(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(size);
+        const { bytesRead } = await handle.read(buffer, 0, size, 0);
+        return {
+          success: true,
+          base64: buffer.subarray(0, bytesRead).toString('base64'),
+          size: stat.size,
+        };
+      } finally {
+        await handle.close();
+      }
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle('system:openPath', async () => ({ success: true }));
 
   ipcMain.handle('fs:writeFile', async (_e, filePath, content, encoding = 'utf-8') => {
     try {
@@ -325,6 +353,11 @@ app.whenReady().then(async () => {
           hasHeading: !!document.querySelector('.ws-prose h1'),
           hasList: !!document.querySelector('.ws-prose ul, .ws-prose ol'),
           hasTable: !!document.querySelector('.ws-prose table'),
+          tableTextClean: !(document.querySelector('.ws-prose table')?.innerText || '').includes('[object Object]'),
+          tableHasData: (() => {
+            const text = document.querySelector('.ws-prose table')?.innerText || '';
+            return /A/.test(text) && /B/.test(text) && /1/.test(text) && /2/.test(text);
+          })(),
           hasCodeBlock: !!document.querySelector('.ws-prose pre'),
           hasCheckbox: !!document.querySelector('.ws-prose input[type=checkbox]'),
           hasTextarea: !!document.querySelector('textarea'),
@@ -489,9 +522,462 @@ app.whenReady().then(async () => {
           hasFormulaBar: t.includes('fx') || !!document.querySelector('input[placeholder*="формула"], input[placeholder*="SUM"]'),
           hasAIDialog: /AI-формула/.test(t),
           formulaEvaluated: t.includes('500') && t.includes('400'),
+          hasFormattingToolbar: !!document.querySelector('button[title="Полужирный (Ctrl+B)"]'),
+          hasMerge: !!document.querySelector('button[title="Объединить ячейки"]'),
+          hasFreeze: !!document.querySelector('button[title*="Закрепить строки"]'),
+          hasFind: !!document.querySelector('button[title="Найти и заменить (Ctrl+F)"]'),
+          hasNumberFormats: !!document.querySelector('select[title="Числовой формат"]'),
+          hasExcelBridge: !!document.querySelector('button[title*="настоящем Excel"]'),
+          hasMacroButton: !!document.querySelector('button[title*="VBA-макрос"]'),
+          hasReloadButton: !!document.querySelector('button[title*="Перечитать файл"]'),
         };
       })()
     `);
+
+    /* ---- Форматирование ячейки и сохранение в файл ---- */
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const bold = document.querySelector('button[title="Полужирный (Ctrl+B)"]');
+        if (bold) bold.click();
+        return !!bold;
+      })()
+    `);
+    await sleep(700);
+    results.excelFormatting = await win.webContents.executeJavaScript(`
+      (() => {
+        const cell = [...document.querySelectorAll('tbody td')]
+          .find((td) => td.textContent.trim() === 'Товар');
+        return {
+          boldApplied: !!cell && getComputedStyle(cell).fontWeight === '700',
+        };
+      })()
+    `);
+
+    // Числовой формат: выбираем ячейку с числом и включаем «Финансовый»
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const cell = [...document.querySelectorAll('tbody td')]
+          .find((td) => td.textContent.trim() === '500');
+        if (cell) cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        return !!cell;
+      })()
+    `);
+    await sleep(500);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const select = document.querySelector('select[title="Числовой формат"]');
+        if (!select) return false;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+        setter.call(select, 'currency');
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()
+    `);
+    await sleep(700);
+    const currencyApplied = await win.webContents.executeJavaScript(`
+      (() => {
+        const cell = [...document.querySelectorAll('tbody td')]
+          .find((td) => td.textContent.includes('500'));
+        return !!cell && (cell.textContent.includes('₽') || cell.textContent.includes('\\u20BD'));
+      })()
+    `);
+    results.excelFormatting.currencyApplied = currencyApplied;
+
+    // Объединение ячеек: выделяем A1:B1 и нажимаем «Объединить»
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const cells = [...document.querySelectorAll('tbody td')];
+        const a1 = cells.find((td) => td.textContent.trim() === 'Товар');
+        const b1 = cells.find((td) => td.textContent.trim() === 'Кол-во');
+        if (a1) a1.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        if (b1) b1.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1, shiftKey: true }));
+        return Boolean(a1 && b1);
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Объединить ячейки"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(600);
+    results.excelMerge = await win.webContents.executeJavaScript(`
+      (() => {
+        const merged = [...document.querySelectorAll('tbody td[colspan]')];
+        const cell = merged.find((td) => td.textContent.includes('Товар'));
+        return {
+          mergeApplied: !!cell && cell.getAttribute('colspan') === '2',
+        };
+      })()
+    `);
+
+    // Фильтр: панель со значениями выбранного столбца
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Фильтр по значениям выбранного столбца"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(600);
+    results.excelFilter = await win.webContents.executeJavaScript(`
+      (() => {
+        const t = document.body.innerText;
+        return {
+          panelOpened: t.includes('Фильтр:'),
+          hasCheckboxes: document.querySelectorAll('input[type=checkbox]').length > 0,
+        };
+      })()
+    `);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const input = [...document.querySelectorAll('input[type=checkbox]')];
+        if (input.length > 0) {
+          input[0].click();
+        }
+        return input.length > 0;
+      })()
+    `);
+    await sleep(500);
+    results.excelFilter.rowsHidden = await win.webContents.executeJavaScript(`
+      (() => {
+        const visibleRows = document.querySelectorAll('tbody tr').length;
+        return visibleRows < 60;
+      })()
+    `);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Сбросить');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true }));
+        return true;
+      })()
+    `);
+    await sleep(1800);
+    const savedWorkbook = XLSX.read(fs.readFileSync(path.join(SANDBOX, 'Финансы.xlsx')), {
+      type: 'buffer',
+    });
+    const savedRawMeta = (savedWorkbook.Custprops as Record<string, string> | undefined)
+      ?.WorkSpaceStyles;
+    const savedMeta =
+      typeof savedRawMeta === 'string' && savedRawMeta.startsWith('b64:')
+        ? Buffer.from(savedRawMeta.slice(4), 'base64').toString('utf8')
+        : savedRawMeta;
+    const savedSheet = savedWorkbook.Sheets['Продажи'] as
+      | { '!merges'?: unknown[] }
+      | undefined;
+    results.excelPersistence = {
+      stylesSaved: typeof savedMeta === 'string' && savedMeta.includes('"bold":true'),
+      mergeSaved: Array.isArray(savedSheet?.['!merges']) && savedSheet['!merges'].length === 1,
+    };
+
+    // Сортировка: выбираем B2 (10) и сортируем по возрастанию
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const cell = [...document.querySelectorAll('tbody td')]
+          .find((td) => td.textContent.trim() === '10');
+        if (cell) cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        return !!cell;
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Сортировка по возрастанию"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(700);
+    results.excelSort = await win.webContents.executeJavaScript(`
+      (() => {
+        const values = [...document.querySelectorAll('tbody tr')]
+          .map((tr) => tr.querySelectorAll('td')[2]?.textContent.trim() || '')
+          .filter((value) => /^\\d+$/.test(value));
+        return {
+          sortedAsc: values[0] === '5' && values[1] === '10' && values[2] === '15',
+        };
+      })()
+    `);
+
+    // Закрепление области
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title*="Закрепить строки"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(600);
+    results.excelFreeze = await win.webContents.executeJavaScript(`
+      (() => {
+        const sticky = [...document.querySelectorAll('tbody td')].filter(
+          (td) => td.style.position === 'sticky' && td.style.top
+        );
+        return { freezeApplied: sticky.length > 0 };
+      })()
+    `);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Снять закрепление"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(300);
+
+    /* ---- Примечание к ячейке ---- */
+    await win.webContents.executeJavaScript(`
+      (() => {
+        window.prompt = () => 'Проверочное примечание';
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const cell = rows[0]?.querySelectorAll('td')[1];
+        if (cell) cell.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 120, clientY: 160 }));
+        return !!cell;
+      })()
+    `);
+    await sleep(300);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const item = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Примечание…');
+        if (item) item.click();
+        return !!item;
+      })()
+    `);
+    await sleep(500);
+    results.excelComment = await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const cell = rows[0]?.querySelectorAll('td')[1];
+        return {
+          commentSaved: !!cell && (cell.getAttribute('title') || '').includes('Проверочное примечание'),
+        };
+      })()
+    `);
+
+    /* ---- Диаграмма по диапазону ---- */
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const start = rows[0]?.querySelectorAll('td')[1];
+        const end = rows[3]?.querySelectorAll('td')[rows[3].querySelectorAll('td').length - 1];
+        if (start) start.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        if (end) end.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1, shiftKey: true }));
+        return Boolean(start && end);
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Построить диаграмму по выделенному диапазону"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Создать');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(800);
+    results.excelChart = await win.webContents.executeJavaScript(`
+      (() => {
+        const svg = document.querySelector('svg[role="img"]');
+        const t = document.body.innerText;
+        return {
+          chartCreated: !!svg && t.includes('Диаграмма 1'),
+        };
+      })()
+    `);
+
+    // Диаграмма должна попасть в xlsx как нативный объект OOXML
+    await sleep(1500);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true }));
+        return true;
+      })()
+    `);
+    await sleep(2500);
+    const JSZip = require('jszip');
+    const chartZip = await JSZip.loadAsync(fs.readFileSync(path.join(SANDBOX, 'Финансы.xlsx')));
+    results.excelChartFile = {
+      chartPart: Boolean(chartZip.file('xl/charts/chart1.xml')),
+      drawingPart: Boolean(chartZip.file('xl/drawings/drawing1.xml')),
+      drawingRel: Boolean(chartZip.file('xl/drawings/_rels/drawing1.xml.rels')),
+    };
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Удалить диаграмму"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(300);
+
+    /* ---- Проверка данных списком ---- */
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const cell = rows[1]?.querySelectorAll('td')[2];
+        if (cell) cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        return !!cell;
+      })()
+    `);
+    await sleep(300);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Проверка данных: выпадающий список"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(300);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const input = document.querySelector('input[placeholder*="Значения через ;"]');
+        if (!input) return false;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(input, 'Да; Нет');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        const apply = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Применить');
+        if (apply) apply.click();
+        return !!apply;
+      })()
+    `);
+    await sleep(600);
+    results.excelValidation = await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const cell = rows[1]?.querySelectorAll('td')[2];
+        return { indicatorShown: !!cell && (cell.textContent || '').includes('▾') };
+      })()
+    `);
+
+    /* ---- Условное форматирование ---- */
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const start = rows[1]?.querySelectorAll('td')[2];
+        const end = rows[3]?.querySelectorAll('td')[2];
+        if (start) start.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        if (end) end.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1, shiftKey: true }));
+        return Boolean(start && end);
+      })()
+    `);
+    await sleep(300);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Условное форматирование"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(300);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const value = document.querySelector('input[placeholder="Значение"]');
+        if (value) {
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setter.call(value, '6');
+          value.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        const add = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Добавить правило');
+        if (add) add.click();
+        return Boolean(value && add);
+      })()
+    `);
+    await sleep(600);
+    results.excelConditional = await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const cells = [rows[1], rows[2], rows[3]].map((row) => row?.querySelectorAll('td')[2]);
+        return {
+          ruleApplied: cells.some((cell) => cell && getComputedStyle(cell).backgroundColor === 'rgb(253, 230, 138)'),
+        };
+      })()
+    `);
+
+    /* ---- Сводная таблица ---- */
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Сводная таблица по выделенному диапазону"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(500);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Создать лист');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(900);
+    results.excelPivot = await win.webContents.executeJavaScript(`
+      (() => {
+        const t = document.body.innerText || '';
+        return {
+          sheetCreated: t.includes('Сводная 1'),
+          refreshButton: !!document.querySelector('button[title="Пересчитать сводную по исходным данным"]'),
+        };
+      })()
+    `);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Пересчитать сводную по исходным данным"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(700);
+    results.excelPivot.refreshed = await win.webContents.executeJavaScript(`
+      (() => {
+        const t = document.body.innerText || '';
+        return t.includes('Сводная таблица обновлена');
+      })()
+    `);
+
+    // Сохранение новых возможностей в xlsx: примечание, правило, сводный лист
+    await win.webContents.executeJavaScript(`
+      (() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true }));
+        return true;
+      })()
+    `);
+    await sleep(1600);
+    const finalWorkbook = XLSX.read(fs.readFileSync(path.join(SANDBOX, 'Финансы.xlsx')), {
+      type: 'buffer',
+    });
+    const finalRawMeta = (finalWorkbook.Custprops as Record<string, string> | undefined)
+      ?.WorkSpaceStyles;
+    const finalMeta =
+      typeof finalRawMeta === 'string' && finalRawMeta.startsWith('b64:')
+        ? Buffer.from(finalRawMeta.slice(4), 'base64').toString('utf8')
+        : finalRawMeta;
+    results.excelExtrasPersistence = {
+      commentSaved: typeof finalMeta === 'string' && finalMeta.includes('Проверочное примечание'),
+      ruleSaved: typeof finalMeta === 'string' && finalMeta.includes('"operator":"greater"'),
+      pivotSheetSaved: finalWorkbook.SheetNames.includes('Сводная 1'),
+    };
 
     /* ---- Проверяем панель поиска ---- */
     const searchToggleClicked = await win.webContents.executeJavaScript(`
@@ -532,11 +1018,142 @@ app.whenReady().then(async () => {
     `);
     await sleep(600);
 
+    /* ---- Любой файл, включая EXE, открывается в бинарном просмотрщике ---- */
+    fs.writeFileSync(
+      path.join(SANDBOX, 'sample.exe'),
+      Buffer.from([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00])
+    );
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const refreshBtn = [...document.querySelectorAll('button')].find(
+          (b) => (b.title || '').includes('Обновить дерево')
+        );
+        if (refreshBtn) refreshBtn.click();
+        return !!refreshBtn;
+      })()
+    `);
+    await sleep(1200);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const node = [...document.querySelectorAll('div')].find(
+          (d) => d.textContent?.trim() === 'sample.exe' && d.className.includes('cursor-pointer')
+        );
+        if (node) node.click();
+        return !!node;
+      })()
+    `);
+    await sleep(1500);
+    results.binaryViewer = await win.webContents.executeJavaScript(`
+      (() => {
+        const t = document.body.innerText || '';
+        return {
+          opened: t.includes('sample.exe') && t.includes('Offset'),
+          hasHex: /4D\\s+5A/.test(t),
+          hasOpenExternal: t.includes('Открыть в системе'),
+          hasReveal: t.includes('Проводник'),
+        };
+      })()
+    `);
+
     /* ---- Скриншоты ключевых состояний ---- */
     win.show();
     await sleep(700);
     const shot = await win.webContents.capturePage();
     fs.writeFileSync(path.join(ROOT, 'render-screenshot.png'), shot.toPNG());
+
+    /* ---- Повторное открытие файла: форматирование и метаданные из xlsx ---- */
+    win.webContents.reload();
+    await sleep(3500);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const node = [...document.querySelectorAll('div')].find(
+          (d) => d.textContent?.trim() === 'Финансы.xlsx' && d.className.includes('cursor-pointer')
+        );
+        if (node) node.click();
+        return !!node;
+      })()
+    `);
+    await sleep(2500);
+    results.excelReload = await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const a1 = rows[0]?.querySelectorAll('td')[1];
+        const bCells = [rows[1], rows[2], rows[3]].map((row) => row?.querySelectorAll('td')[2]);
+        return {
+          commentRestored: !!a1 && (a1.getAttribute('title') || '').includes('Проверочное примечание'),
+          validationRestored: !!bCells[0] && (bCells[0].textContent || '').includes('▾'),
+          conditionalRestored: bCells.some(
+            (cell) => cell && getComputedStyle(cell).backgroundColor === 'rgb(253, 230, 138)'
+          ),
+        };
+      })()
+    `);
+
+    // Финальная диаграмма остаётся в файле для проверки реальным Excel
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const rows = [...document.querySelectorAll('tbody tr')];
+        const start = rows[0]?.querySelectorAll('td')[1];
+        const end = rows[3]?.querySelectorAll('td')[3];
+        if (start) start.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+        if (end) end.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1, shiftKey: true }));
+        return Boolean(start && end);
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = document.querySelector('button[title="Построить диаграмму по выделенному диапазону"]');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(400);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const button = [...document.querySelectorAll('button')]
+          .find((b) => (b.textContent || '').trim() === 'Создать');
+        if (button) button.click();
+        return !!button;
+      })()
+    `);
+    await sleep(1800);
+    await win.webContents.executeJavaScript(`
+      (() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true }));
+        return true;
+      })()
+    `);
+    await sleep(2500);
+    results.excelChartFinal = await (async () => {
+      const finalZip = await JSZip.loadAsync(fs.readFileSync(path.join(SANDBOX, 'Финансы.xlsx')));
+      return { chartInFile: Boolean(finalZip.file('xl/charts/chart1.xml')) };
+    })();
+
+    /* ---- Кнопки «Вставить в документ» / «Заменить документ» для Excel ---- */
+    results.excelChatInsert = await win.webContents.executeJavaScript(`
+      (async () => {
+        window.dispatchEvent(new CustomEvent('workspace:excel-insert-text', {
+          detail: { text: '| Тест1 | Тест2 |\\n| --- | --- |\\n| 11 | 22 |' },
+        }));
+        await new Promise((r) => setTimeout(r, 900));
+        const t = document.body.innerText || '';
+        return { inserted: t.includes('Тест1') && t.includes('22') };
+      })()
+    `);
+    results.excelChatReplace = await win.webContents.executeJavaScript(`
+      (async () => {
+        window.dispatchEvent(new CustomEvent('workspace:excel-replace-document', {
+          detail: { text: '| R1 | R2 |\\n| --- | --- |\\n| 1 | 2 |' },
+        }));
+        await new Promise((r) => setTimeout(r, 900));
+        const t = document.body.innerText || '';
+        const rows = [...document.querySelectorAll('tbody tr')].slice(0, 3).map((tr) =>
+          [...tr.querySelectorAll('td')].slice(0, 4).map((td) => td.textContent.trim())
+        );
+        return { replaced: rows[0]?.[1] === 'R1' && rows[1]?.[1] === '1', rows };
+      })()
+    `);
 
     results.errors = errors;
     fs.writeFileSync(

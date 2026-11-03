@@ -275,6 +275,26 @@ export const fileSystemService = {
     return { content: res.content, isBinary: Boolean(res.isBinary) };
   },
 
+  /** Первые байты файла для бинарного просмотрщика (EXE, архивы и т.п.). */
+  async readPreview(
+    filePath: string,
+    maxBytes = 65536
+  ): Promise<{ base64: string; size: number }> {
+    if (!this.isElectron()) throw new Error('Просмотр файлов доступен только в настольном приложении');
+    const res = await window.electronAPI!.readPreview(filePath, maxBytes);
+    if (!res.success || res.base64 === undefined) {
+      throw new Error(res.error || 'Ошибка чтения файла');
+    }
+    return { base64: res.base64, size: res.size ?? 0 };
+  },
+
+  /** Открывает файл средствами Windows: EXE запускается, PDF — в системном просмотрщике. */
+  async openExternally(filePath: string): Promise<void> {
+    if (!this.isElectron()) throw new Error('Открытие доступно только в настольном приложении');
+    const res = await window.electronAPI!.openPath(filePath);
+    if (!res.success) throw new Error(res.error || 'Не удалось открыть файл');
+  },
+
   async writeFile(filePath: string, content: string, encoding = 'utf-8'): Promise<void> {
     if (!this.isElectron()) throw new Error('Запись файлов доступна только в настольном приложении');
     const res = await window.electronAPI!.writeFile(filePath, content, encoding);

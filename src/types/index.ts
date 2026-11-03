@@ -38,6 +38,8 @@ export interface OpenTab {
   /** 'utf-8' | 'windows-1251' | ... | 'base64' */
   encoding: string;
   viewMode?: 'visual' | 'source' | 'split';
+  /** Внешнее обновление содержимого: заставляет редактор перечитать книгу. */
+  reloadKey?: number;
   activeSheet?: string;
   activeSlide?: number;
 }
@@ -93,6 +95,8 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   attachedFile?: ChatAttachment;
+  /** Файлы, перетащенные в чат из Проводника. */
+  attachedFiles?: ChatAttachment[];
   /** Ошибка генерации для отображения в ленте. */
   error?: string;
   /** Признак незавершённого стрима. */
@@ -162,6 +166,39 @@ declare global {
       minimizeWindow: () => Promise<void>;
       maximizeWindow: () => Promise<boolean>;
       isWindowMaximized: () => Promise<boolean>;
+      /** Закрепить/открепить окно поверх остальных приложений. */
+      setAlwaysOnTop: (value: boolean) => Promise<{ success: boolean; alwaysOnTop: boolean }>;
+      getAlwaysOnTop: () => Promise<boolean>;
+      /** Открыть таблицу в настоящем Excel. */
+      openInExcel: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+      /** Выполнить VBA-макрос в Excel и сохранить книгу. */
+      runExcelMacro: (filePath: string, macroName: string) => Promise<{ success: boolean; error?: string }>;
+      /** Перенести диаграммы WorkSpace в xlsx как нативные объекты Excel. */
+      excelExportCharts: (
+        filePath: string,
+        charts: {
+          sheet: string;
+          type: 'bar' | 'line' | 'pie';
+          range: string;
+          title: string;
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+        }[]
+      ) => Promise<{ success: boolean; count?: number; error?: string }>;
+      /** Создать настоящую обновляемую сводную таблицу Excel. */
+      excelCreatePivot: (
+        filePath: string,
+        spec: {
+          sourceSheet: string;
+          range: string;
+          rowField: string;
+          valueField: string;
+          aggregation: 'sum' | 'count' | 'average' | 'min' | 'max';
+          targetSheet: string;
+        }
+      ) => Promise<{ success: boolean; error?: string }>;
       closeWindow: () => Promise<void>;
       /** Ответ на запрос подтверждения закрытия: true — закрыть приложение. */
       confirmClose: (proceed: boolean) => Promise<{ closed: boolean }>;
@@ -180,6 +217,9 @@ declare global {
 
       listDirectory: (dirPath: string) => Promise<{ success: boolean; items: FileItem[]; error?: string }>;
       readFile: (filePath: string, encoding?: string) => Promise<{ success: boolean; content?: string; isBinary?: boolean; error?: string }>;
+      readPreview: (filePath: string, maxBytes?: number) => Promise<{ success: boolean; base64?: string; size?: number; error?: string }>;
+      openPath: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+      getPathForFile: (file: File) => string;
       writeFile: (filePath: string, content: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
       createFile: (filePath: string, initialContent?: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
       createDirectory: (dirPath: string) => Promise<{ success: boolean; error?: string }>;
@@ -210,7 +250,7 @@ declare global {
       gdriveUpload: (paths: string[], folderName?: string) => Promise<{ success: boolean; uploaded: number; failed: string[]; link?: string; error?: string }>;
       videoCapabilities: () => Promise<{ ffmpeg: string | null; ffprobe: string | null }>;
       videoProbe: (filePath: string) => Promise<{ success: boolean; duration?: number; width?: number; height?: number; hasAudio?: boolean; videoCodec?: string; audioCodec?: string; size?: number; mime?: string; error?: string }>;
-      videoEdit: (req: { filePath: string; start?: number; end?: number; stripAudio?: boolean; compress?: boolean; outputPath?: string }) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
+      videoEdit: (req: { filePath: string; start?: number; end?: number; stripAudio?: boolean; compress?: boolean; outputPath?: string; speed?: number; speedSegments?: { start: number; end: number; speed: number }[]; duration?: number; hasAudio?: boolean }) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
       youtubeCategories: () => Promise<{ success: boolean; categories: { id: string; title: string }[]; error?: string }>;
       youtubePlaylists: () => Promise<{ success: boolean; playlists: { id: string; title: string }[]; error?: string }>;
       youtubeUpload: (filePath: string, meta: { title: string; description?: string; tags?: string[]; categoryId?: string; privacyStatus: 'public' | 'unlisted' | 'private'; madeForKids: boolean; embeddable?: boolean; license?: 'youtube' | 'creativeCommon'; defaultLanguage?: string; publishAt?: string; playlistId?: string }) => Promise<{ success: boolean; id?: string; url?: string; error?: string }>;
@@ -297,6 +337,8 @@ declare global {
       getContextMenuStatus?: () => Promise<{ installed: boolean; exePath: string; error?: string }>;
       installContextMenu?: () => Promise<{ success: boolean; error?: string }>;
       removeContextMenu?: () => Promise<{ success: boolean; error?: string }>;
+      createDesktopShortcut?: () => Promise<{ success: boolean; shortcutPath?: string; error?: string }>;
+      getDesktopShortcutStatus?: () => Promise<{ installed: boolean; shortcutPath: string }>;
       getInitialExternalPath?: () => Promise<{ path: string; isDirectory: boolean } | null>;
       onOpenExternalPath?: (cb: (data: { path: string; isDirectory: boolean }) => void) => () => void;
     };

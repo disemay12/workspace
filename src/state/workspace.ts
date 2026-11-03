@@ -61,10 +61,8 @@ export function useWorkspace() {
       setRootPath(dirPath);
       setTree({});
       setExpandedDirs(new Set([dirPath]));
-      setTabs([]);
-      setActiveTabId('');
-      setSecondaryTabId('');
-      setSplitEnabled(false);
+      // Открытые документы не закрываем: переключение избранной папки
+      // не должно терять вкладки и несохранённые правки.
       await fileSystemService.setWorkspaceRoot(dirPath);
       await loadDirectory(dirPath);
     },
@@ -200,11 +198,7 @@ export function useWorkspace() {
       const ext = extName(filePath);
       const type = getFileType(ext);
 
-      if (type === 'binary') {
-        flash(`Формат .${ext} не поддерживается для просмотра`);
-        return null;
-      }
-      if (type === 'video' || type === 'pdf') {
+      if (type === 'video' || type === 'pdf' || type === 'binary') {
         const tab: OpenTab = {
           id: uid('tab'),
           path: filePath,
@@ -294,6 +288,10 @@ export function useWorkspace() {
     async (tabId: string): Promise<boolean> => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab) return false;
+      if (tab.encoding === 'path') {
+        flash('Этот файл открыт только для просмотра');
+        return false;
+      }
       try {
         await fileSystemService.writeFile(tab.path, tab.content, tab.encoding);
         setTabs((prev) =>

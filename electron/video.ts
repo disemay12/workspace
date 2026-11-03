@@ -5,11 +5,11 @@
  * а обрезка, снятие звука и сжатие запускают ffmpeg как отдельный процесс.
  * Если ffmpeg не установлен, операции сообщают об этом, а просмотр остаётся.
  */
-import { app, ipcMain, protocol, net } from 'electron';
-import { pathToFileURL } from 'url';
+import { app, ipcMain, protocol } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import { Readable } from 'stream';
 
 export const VIDEO_EXTENSIONS = [
   'mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'wmv', 'flv', 'f4v', 'mpeg', 'mpg',
@@ -31,10 +31,18 @@ const MIME: Record<string, string> = {
   ogg: 'video/ogg',
   '3gp': 'video/3gpp',
   ts: 'video/mp2t',
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
 };
 
 export function videoMime(ext: string): string {
-  return MIME[ext.toLowerCase().replace(/^\./, '')] || 'video/mp4';
+  return MIME[ext.toLowerCase().replace(/^\./, '')] || 'application/octet-stream';
 }
 
 function which(name: string): string | null {
@@ -147,6 +155,86 @@ export interface VideoEditRequest {
   stripAudio?: boolean;
   compress?: boolean;
   outputPath?: string;
+  /** Ускорение всего видео (1 — без изменений). */
+  speed?: number;
+  /** Ускорение отдельных фрагментов (в секундах исходника). */
+  speedSegments?: { start: number; end: number; speed: number }[];
+  /** Длительность и наличие звука нужны для построения фильтров. */
+  duration?: number;
+  hasAudio?: boolean;
+}
+
+function atempoChain(speed: number): string {
+  let value = Math.max(0.25, Math.min(4, speed));
+  const filters: string[] = [];
+  while (value > 2) {
+    filters.push('atempo=2');
+    value /= 2;
+  }
+  while (value < 0.5) {
+    filters.push('atempo=0.5');
+    value /= 0.5;
+  }
+  filters.push(`atempo=${value.toFixed(4)}`);
+  return filters.join(',');
+}
+
+function speedFilterGraph(
+  req: VideoEditRequest,
+  trimStart: number,
+  trimEnd: number,
+  speed: number,
+  segments: { start: number; end: number; speed: number }[],
+  withAudio: boolean
+): string {
+  const pieces: { start: number; end: number; speed: number }[] = [];
+  if (segments.length === 0) {
+    pieces.push({ start: 0, end: trimEnd - trimStart, speed });
+  } else {
+    let cursor = trimStart;
+    for (const segment of segments) {
+      const segStart = Math.max(trimStart, Math.min(trimEnd, segment.start));
+      const segEnd = Math.max(segStart, Math.min(trimEnd, segment.end));
+      if (segEnd <= cursor) continue;
+      if (segStart > cursor) {
+        pieces.push({ start: cursor - trimStart, end: segStart - trimStart, speed });
+      }
+      pieces.push({ start: Math.max(cursor, segStart) - trimStart, end: segEnd - trimStart, speed: segment.speed });
+      cursor = segEnd;
+    }
+    if (cursor < trimEnd) {
+      pieces.push({ start: cursor - trimStart, end: trimEnd - trimStart, speed });
+    }
+  }
+  if (pieces.length === 0) pieces.push({ start: 0, end: trimEnd - trimStart, speed });
+
+  const filters: string[] = [];
+  const concatInputs: string[] = [];
+  pieces.forEach((piece, index) => {
+    const vLabel = `v${index}`;
+    const aLabel = `a${index}`;
+    filters.push(
+      `[0:v]trim=start=${piece.start.toFixed(3)}:end=${piece.end.toFixed(
+        3
+      )},setpts=(PTS-STARTPTS)/${piece.speed.toFixed(4)},setsar=1[${vLabel}]`
+    );
+    if (withAudio) {
+      filters.push(
+        `[0:a]atrim=start=${piece.start.toFixed(3)}:end=${piece.end.toFixed(
+          3
+        )},asetpts=PTS-STARTPTS,${atempoChain(piece.speed)}[${aLabel}]`
+      );
+      concatInputs.push(`[${vLabel}][${aLabel}]`);
+    } else {
+      concatInputs.push(`[${vLabel}]`);
+    }
+  });
+  filters.push(
+    `${concatInputs.join('')}concat=n=${pieces.length}:v=1:a=${withAudio ? 1 : 0}[vout]${
+      withAudio ? '[aout]' : ''
+    }`
+  );
+  return filters.join(';');
 }
 
 async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; outputPath?: string; error?: string }> {
@@ -161,28 +249,67 @@ async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; out
   const end = Number(req.end) || 0;
   if (end > 0 && end <= start) return { success: false, error: 'Конец обрезки должен быть позже начала' };
 
+  const speed = Math.max(0.25, Math.min(4, Number(req.speed) || 1));
+  const duration = Number(req.duration) || 0;
+  const trimEnd = end > start ? end : duration > 0 ? duration : 0;
+  const segments = (req.speedSegments || [])
+    .map((segment) => ({
+      start: Math.max(0, Number(segment.start) || 0),
+      end: Math.max(0, Number(segment.end) || 0),
+      speed: Math.max(0.25, Math.min(4, Number(segment.speed) || 1)),
+    }))
+    .filter((segment) => segment.end > segment.start)
+    .sort((a, b) => a.start - b.start);
+  const hasSpeedChange = speed !== 1 || segments.length > 0;
+  const withAudio = !req.stripAudio && req.hasAudio !== false;
+
   const ext = path.extname(req.filePath).toLowerCase() || '.mp4';
   const base = path.basename(req.filePath, ext);
   const dir = path.dirname(req.filePath);
-  const output = req.outputPath && req.outputPath !== req.filePath
-    ? req.outputPath
-    : path.join(dir, base + (req.compress ? '.compressed' : req.stripAudio ? '.muted' : '.cut') + (ext === '.webm' ? '.webm' : '.mp4'));
+  const suffix = hasSpeedChange ? '.speed' : req.compress ? '.compressed' : req.stripAudio ? '.muted' : '.cut';
+  const output =
+    req.outputPath && req.outputPath !== req.filePath
+      ? req.outputPath
+      : path.join(dir, base + suffix + (hasSpeedChange ? '.mp4' : ext === '.webm' ? '.webm' : '.mp4'));
 
-  // -ss до -i ищет ближайший ключевой кадр и не перекодирует весь файл зря.
-  // -t — длина куска после этой точки, поэтому конец задаётся как end - start.
   const args = ['-y'];
   if (start > 0) args.push('-ss', start.toFixed(3));
   args.push('-i', req.filePath);
-  if (end > start) args.push('-t', (end - start).toFixed(3));
+  if (trimEnd > start) args.push('-t', (trimEnd - start).toFixed(3));
 
-  if (req.compress) {
+  if (hasSpeedChange) {
+    const graph = speedFilterGraph(
+      req,
+      start,
+      trimEnd > start ? trimEnd : start + (duration || 0),
+      speed,
+      segments,
+      withAudio
+    );
+    args.push('-filter_complex', graph, '-map', '[vout]');
+    if (withAudio) args.push('-map', '[aout]');
+    if (withAudio) args.push('-c:a', 'aac', '-b:a', '192k');
+    else args.push('-an');
+    args.push(
+      '-c:v',
+      'libx264',
+      '-crf',
+      '20',
+      '-preset',
+      'medium',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart'
+    );
+  } else if (req.compress) {
     args.push('-c:v', 'libx264', '-crf', '20', '-preset', 'slow');
-    if (req.stripAudio) args.push('-an');
+    if (!withAudio) args.push('-an');
     else args.push('-c:a', 'aac', '-b:a', '160k');
     args.push('-movflags', '+faststart');
   } else {
     args.push('-c:v', 'copy');
-    if (req.stripAudio) args.push('-an');
+    if (!withAudio) args.push('-an');
     else args.push('-c:a', 'copy');
   }
   args.push(output);
@@ -207,7 +334,47 @@ export function registerVideo(): void {
       if (!raw || !fs.existsSync(raw)) {
         return new Response('not found', { status: 404 });
       }
-      return net.fetch(pathToFileURL(raw).toString());
+
+      // Range-запросы обязательны для перемотки видео: без 206 Chromium
+      // не может прыгнуть на произвольную позицию и перемотка «залипает».
+      const stat = fs.statSync(raw);
+      const mime = videoMime(path.extname(raw));
+      const rangeHeader = request.headers.get('range');
+      if (rangeHeader) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+        if (match) {
+          const start = match[1] ? Number(match[1]) : 0;
+          const end = match[2]
+            ? Math.min(Number(match[2]), stat.size - 1)
+            : stat.size - 1;
+          if (start <= end && start < stat.size) {
+            const stream = fs.createReadStream(raw, { start, end });
+            return new Response(Readable.toWeb(stream) as ReadableStream, {
+              status: 206,
+              headers: {
+                'Content-Type': mime,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': String(end - start + 1),
+                'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+              },
+            });
+          }
+          return new Response('range not satisfiable', {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${stat.size}` },
+          });
+        }
+      }
+
+      const stream = fs.createReadStream(raw);
+      return new Response(Readable.toWeb(stream) as ReadableStream, {
+        status: 200,
+        headers: {
+          'Content-Type': mime,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(stat.size),
+        },
+      });
     } catch (err) {
       return new Response((err as Error).message, { status: 500 });
     }

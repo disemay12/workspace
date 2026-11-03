@@ -19,6 +19,9 @@ interface Props {
   onClose: () => void;
   height?: number;
   onHeightChange?: (height: number) => void;
+  /** Команда, отправленная ИИ: выполняется, как только сессия готова. */
+  command?: { id: string; command: string } | null;
+  onCommandConsumed?: () => void;
 }
 
 export const TerminalPanel: React.FC<Props> = ({
@@ -27,19 +30,24 @@ export const TerminalPanel: React.FC<Props> = ({
   onClose,
   height = 240,
   onHeightChange,
+  command,
+  onCommandConsumed,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const sentCommandRef = useRef('');
   const sessionIdRef = useRef<string>('term_default');
   const [isMaximized, setIsMaximized] = useState(false);
   const [resizing, setResizing] = useState(false);
+  const [ready, setReady] = useState(false);
   const startYRef = useRef(0);
   const startHeightRef = useRef(height);
 
   /* ---------------- Инициализация сессии терминала ---------------- */
   const initTerminal = useCallback(async () => {
     if (!containerRef.current) return;
+    setReady(false);
 
     // Очищаем предыдущий терминал если был
     if (terminalRef.current) {
@@ -102,6 +110,8 @@ export const TerminalPanel: React.FC<Props> = ({
       await window.electronAPI.terminalCreate({ id, cwd });
     }
 
+    setReady(true);
+
     term.onData((data) => {
       window.electronAPI?.terminalInput?.({ id, data });
     });
@@ -143,6 +153,15 @@ export const TerminalPanel: React.FC<Props> = ({
       }
     };
   }, [initTerminal]);
+
+  useEffect(() => {
+    if (!command || !ready) return;
+    // StrictMode запускает эффект дважды: команда должна уйти ровно один раз
+    if (sentCommandRef.current === command.id) return;
+    sentCommandRef.current = command.id;
+    window.electronAPI?.terminalInput?.({ id: sessionIdRef.current, data: command.command + '\r' });
+    onCommandConsumed?.();
+  }, [command, ready, onCommandConsumed]);
 
   /* ---------------- Изменение размера тягой за край ---------------- */
   const onMouseDownResize = (e: React.MouseEvent) => {

@@ -110,75 +110,106 @@ function parseApiError(status: number, body: string, label: string): Error {
 
   return new Error(`${label} (${status}): ${detail.slice(0, 400)}${hint}`);
 }
-export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты являешься интеллектуальным помощником и оператором приложения WorkSpace.
-Ты можешь не только отвечать текстом, но и НАПРЯМУЮ УПРАВЛЯТЬ приложением (создавать файлы, таблицы, текстовые документы Word, открывать документы).
+export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты — интеллектуальный помощник и оператор приложения WorkSpace. Ты не только отвечаешь текстом, но и НАПРЯМУЮ УПРАВЛЯЕШЬ приложением через блоки действий.
 
-Когда пользователь просит создать таблицу, создать документ Word, создать файл, открыть документ или выполнить действие в программе, обязательно дай краткий ответ И добавь специальный блок действия в конце ответа:
+ПРОТОКОЛ ДЕЙСТВИЙ
+Когда пользователь просит что-то сделать в приложении (создать, открыть, изменить, переименовать, удалить, сохранить, переключить панель, выполнить команду), дай краткий ответ и добавь в конце ответа один или несколько блоков:
 
-1. Создание таблицы (Excel или CSV):
 \`\`\`workspace-action
-{
-  "action": "create_table",
-  "name": "Название.xlsx",
-  "sheetName": "Лист 1",
-  "columns": ["Колонка 1", "Колонка 2", "Сумма"],
-  "rows": [
-    ["Значение A", 100, "=B2*1.2"],
-    ["Значение B", 250, "=B3*1.2"]
-  ]
-}
-\`\`\`
-(Если просили CSV: укажи "name": "данные.csv" и "format": "csv"). Для формул используй имена функций Excel (SUM, AVERAGE, IF) и формулы вида "=C2*D2".
-
-2. Создание текстового документа Word (.docx):
-\`\`\`workspace-action
-{
-  "action": "create_document",
-  "name": "Отчет.docx",
-  "title": "Отчет о продажах",
-  "content": "# Отчет о продажах\\n\\n## Основные показатели\\n\\nТекст документа с форматированием (поддерживается Markdown: заголовки, списки, жирный текст)..."
-}
+{ "action": "имя_действия", ... }
 \`\`\`
 
-3. Создание файла с кодом или обычным текстом:
-\`\`\`workspace-action
-{
-  "action": "create_file",
-  "name": "script.py",
-  "content": "print('Hello world')"
-}
-\`\`\`
+Можно вернуть несколько блоков подряд или один блок с массивом: { "actions": [ {...}, {...} ] }.
+Не описывай действие словами как выполненное, если не добавил блок. Не оборачивай JSON в таблицу.
 
-4. Открытие существующего файла:
-\`\`\`workspace-action
-{
-  "action": "open_file",
-  "path": "имя_файла.docx"
-}
-\`\`\`
+ДОСТУПНЫЕ ДЕЙСТВИЯ
 
-5. Вставка в активный документ:
-\`\`\`workspace-action
-{
-  "action": "insert_into_editor",
-  "text": "текст для вставки"
-}
-\`\`\`
+1) create_table — таблица Excel/CSV
+{ "action": "create_table", "name": "Отчет.xlsx", "sheetName": "Лист 1", "columns": ["Товар","Цена","Кол-во","Сумма"], "rows": [["Яблоки",120,3,"=B2*C2"]], "format": "xlsx" }
+Для CSV: "name": "данные.csv", "format": "csv". Формулы Excel — строками "=SUM(D2:D10)".
 
-6. Замена содержимого активного документа:
-\`\`\`workspace-action
-{
-  "action": "replace_document",
-  "text": "новый текст документа"
-}
-\`\`\`
+2) create_document — Word (.docx), content в Markdown. Без "name" имя берётся из "title".
+{ "action": "create_document", "name": "Отчет.docx", "title": "Отчет о продажах", "content": "# Заголовок\\n\\nТекст, **жирный**, списки..." }
 
-Всегда добавляй блок \`\`\`workspace-action, когда тебя просят создать таблицу, документ Word или файл, чтобы программа автоматически создала его и открыла в соответствующем редакторе!`;
+3) create_file — любой текстовый файл (код, конфиг, заметка)
+{ "action": "create_file", "name": "script.py", "path": "src", "content": "print('Hello')" }
+"path" — папка относительно корня рабочей области (необязательно).
 
-export function resolveSystemPrompt(userPrompt?: string): string {
+4) open_file — открыть существующий файл
+{ "action": "open_file", "path": "docs/Отчет.docx" }
+
+5) open_folder — сменить рабочую папку (без path откроется диалог выбора)
+{ "action": "open_folder", "path": "C:\\\\Projects\\\\MyProject" }
+
+6) create_folder — новая папка
+{ "action": "create_folder", "path": "src/components" }
+
+7) rename_path — переименовать файл или папку
+{ "action": "rename_path", "path": "old.txt", "newName": "new.txt" }
+
+8) delete_path — удалить файл или папку (потребуется подтверждение пользователя)
+{ "action": "delete_path", "path": "temp/old.txt" }
+
+9) insert_into_editor — вставить текст в активный документ в позицию курсора
+{ "action": "insert_into_editor", "text": "текст для вставки" }
+
+10) replace_document — заменить содержимое активного документа
+{ "action": "replace_document", "text": "новое содержимое" }
+
+11) open_settings — открыть настройки на вкладке provider|model|prompt|keys|integrations|system
+{ "action": "open_settings", "tab": "provider" }
+
+12) toggle_panel — показать/скрыть панель sidebar|ai|terminal|search, state open|close|toggle
+{ "action": "toggle_panel", "panel": "terminal", "state": "open" }
+
+13) select_tab — переключиться на вкладку по path, name или index (0 — первая)
+{ "action": "select_tab", "name": "Отчет.docx" }
+
+14) close_tab — закрыть вкладку (текущую или указанную)
+{ "action": "close_tab" }
+
+15) save — сохранить текущий файл или все изменённые
+{ "action": "save", "all": true }
+
+16) notify — показать уведомление
+{ "action": "notify", "message": "Готово" }
+
+17) run_command — выполнить команду в встроенном терминале (потребуется подтверждение)
+{ "action": "run_command", "command": "npm run build", "cwd": "." }
+
+18) edit_table — изменить существующую таблицу Excel/CSV (заменить или дописать строки)
+{ "action": "edit_table", "path": "comka-trash.xlsx", "mode": "append", "columns": ["Поле1","Поле2"], "rows": [["значение1","значение2"]] }
+Без "path" изменяется активная таблица. "mode": "replace" (по умолчанию) или "append".
+
+19) import_table — импортировать таблицу из файла Markdown/CSV в xlsx (без вывода строк в ответе)
+{ "action": "import_table", "source": "comka-report.md", "target": "comka-trash.xlsx", "sheetName": "Комиссионка" }
+Используй это действие, когда просят «перенеси все данные из файла в таблицу». Не переписывай строки вручную: приложение прочитает файл целиком.
+Если пользователь просит «перенеси данные в нашу таблицу», используй edit_table для открытой таблицы или import_table с её именем в target.
+
+ВЛОЖЕННЫЕ ФАЙЛЫ
+- Если в сообщении пользователя есть блок «[Файл: имя]» — это уже прочитанное содержимое файла. Используй его напрямую.
+- Никогда не отвечай, что у тебя нет доступа к файлам или файловой системе: ты управляешь WorkSpace и можешь создавать и изменять файлы через действия.
+- Если данных в файле не хватает, попроси конкретный файл или уточнение, но не отказывайся от работы.
+
+ПРАВИЛА
+- Пути указывай относительно корня рабочей области, если не нужен абсолютный.
+- Если параметр не задан пользователем, выбери разумное значение (имя файла, лист, папку).
+- Для нескольких шагов возвращай несколько действий в правильном порядке.
+- Учитывай состояние приложения из блока "Текущее состояние WorkSpace": активную вкладку, открытые файлы, панели.
+- Отвечай на русском языке, кратко и по делу.`;
+
+export function resolveSystemPrompt(userPrompt?: string, appContext?: string): string {
   const base = (userPrompt || '').trim();
-  if (base.includes('workspace-action')) return base;
-  return base ? `${base}\n\n${WORKSPACE_OPERATOR_SYSTEM_PROMPT}` : WORKSPACE_OPERATOR_SYSTEM_PROMPT;
+  const operator = base.includes('workspace-action')
+    ? base
+    : base
+      ? `${base}\n\n${WORKSPACE_OPERATOR_SYSTEM_PROMPT}`
+      : WORKSPACE_OPERATOR_SYSTEM_PROMPT;
+
+  const context = (appContext || '').trim();
+  if (!context) return operator;
+
+  return `${operator}\n\nТекущее состояние WorkSpace (актуально на момент запроса):\n${context}`;
 }
 
 export const aiService = {
@@ -311,7 +342,8 @@ export const aiService = {
     messages: ChatMessage[],
     settings: AISettings,
     callbacks: StreamCallbacks,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    appContext?: string
   ): Promise<void> {
     const preset = PROVIDER_PRESETS[settings.provider];
     if (preset.requiresKey && !settings.apiKey.trim()) {
@@ -332,11 +364,11 @@ export const aiService = {
 
     try {
       if (settings.provider === 'anthropic') {
-        await this.streamAnthropic(clean, settings, callbacks, signal);
+        await this.streamAnthropic(clean, settings, callbacks, signal, appContext);
       } else if (settings.provider === 'gemini') {
-        await this.streamGemini(clean, settings, callbacks, signal);
+        await this.streamGemini(clean, settings, callbacks, signal, appContext);
       } else {
-        await this.streamOpenAICompatible(clean, settings, callbacks, signal);
+        await this.streamOpenAICompatible(clean, settings, callbacks, signal, appContext);
       }
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') return;
@@ -461,7 +493,8 @@ export const aiService = {
     messages: ChatMessage[],
     settings: AISettings,
     { onChunk, onFinish }: StreamCallbacks,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    appContext?: string
   ): Promise<void> {
     const endpoint = this.resolveEndpoint(settings);
 
@@ -479,7 +512,7 @@ export const aiService = {
       {
         model: settings.model || 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: resolveSystemPrompt(settings.systemPrompt) },
+          { role: 'system', content: resolveSystemPrompt(settings.systemPrompt, appContext) },
           ...messages.map((m) => ({ role: m.role, content: buildMessageText(m) })),
         ],
         temperature: settings.temperature,
@@ -499,7 +532,8 @@ export const aiService = {
     messages: ChatMessage[],
     settings: AISettings,
     { onChunk, onFinish }: StreamCallbacks,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    appContext?: string
   ): Promise<void> {
     const full = await this.requestStream(
       'https://api.anthropic.com/v1/messages',
@@ -511,7 +545,7 @@ export const aiService = {
       },
       {
         model: settings.model || 'claude-3-5-sonnet-20241022',
-        system: resolveSystemPrompt(settings.systemPrompt),
+        system: resolveSystemPrompt(settings.systemPrompt, appContext),
         messages: messages.map((m) => ({
           role: m.role === 'assistant' ? 'assistant' : 'user',
           content: buildMessageText(m),
@@ -533,7 +567,8 @@ export const aiService = {
     messages: ChatMessage[],
     settings: AISettings,
     { onChunk, onFinish }: StreamCallbacks,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    appContext?: string
   ): Promise<void> {
     const model = settings.model || 'gemini-1.5-flash';
     const endpoint =
@@ -548,7 +583,7 @@ export const aiService = {
           role: m.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: buildMessageText(m) }],
         })),
-        systemInstruction: { parts: [{ text: resolveSystemPrompt(settings.systemPrompt) }] },
+        systemInstruction: { parts: [{ text: resolveSystemPrompt(settings.systemPrompt, appContext) }] },
         generationConfig: {
           temperature: settings.temperature,
           maxOutputTokens: settings.maxTokens,

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
 import {
   AlertTriangle,
   FilePlus2,
@@ -10,7 +11,7 @@ import {
   Save,
 } from 'lucide-react';
 
-import { OpenTab, ChatMessage, AIProvider, FileItem } from './types';
+import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment } from './types';
 import { fileSystemService, getFileType } from './services/fileSystemService';
 import { useWorkspace } from './state/workspace';
 import { useAISettings, useChatSessions } from './state/settings';
@@ -33,10 +34,21 @@ import { ExcelEditor, AIAction } from './components/editors/ExcelEditor';
 import { WordEditor } from './components/editors/WordEditor';
 import { PowerPointViewer } from './components/editors/PowerPointViewer';
 import { ImageViewer } from './components/editors/ImageViewer';
+import { BinaryViewer } from './components/editors/BinaryViewer';
 import { VideoEditor } from './components/editors/VideoEditor';
 import { TerminalPanel } from './components/terminal/TerminalPanel';
 import { copyToClipboard, getImgurClientId, uploadFilePath, uploadAlbum, uploadMany, gdriveUpload } from './services/shareService';
-import { generateExcelBase64, generateCsvContent, generateDocxBase64, sanitizeFileName } from './services/aiActions';
+import {
+  AIActionPayload,
+  AppActionResult,
+  SettingsTab,
+  detectMarkdownTables,
+  generateExcelBase64,
+  generateCsvContent,
+  generateDocxBase64,
+  normalizeTableValue,
+  sanitizeFileName,
+} from './services/aiActions';
 
 const App: React.FC = () => {
   const ws = useWorkspace();
@@ -51,7 +63,9 @@ const App: React.FC = () => {
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
   const [searchPanelOpen, setSearchPanelOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<'provider' | 'integrations'>('provider');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('provider');
+  /** Команда, отправленная AI в терминал: выполняется после монтирования панели. */
+  const [terminalCommand, setTerminalCommand] = useState<{ id: string; command: string } | null>(null);
   const [inlineTarget, setInlineTarget] = useState<InlineEditTarget | null>(null);
   const [pendingPrompt, setPendingPrompt] = useState<{
     prompt: string;
@@ -74,6 +88,22 @@ const App: React.FC = () => {
   const [bootError, setBootError] = useState('');
 
   const isElectron = fileSystemService.isElectron();
+
+  // Запрещаем браузеру открывать перетащенные файлы вместо приложения:
+  // обработчик чата получает их, а окно не должно уходить на file://.
+  useEffect(() => {
+    const preventFileNavigation = (event: DragEvent) => {
+      if (Array.from(event.dataTransfer?.types || []).includes('Files')) {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener('dragover', preventFileNavigation);
+    window.addEventListener('drop', preventFileNavigation);
+    return () => {
+      window.removeEventListener('dragover', preventFileNavigation);
+      window.removeEventListener('drop', preventFileNavigation);
+    };
+  }, []);
 
   /* ============================================================
      Подтверждение выхода из приложения
@@ -267,9 +297,14 @@ const App: React.FC = () => {
     };
 
     // Проверяем аргумент при холодном запуске
-    void window.electronAPI.getInitialExternalPath?.().then((init) => {
-      if (init) void handleExternalTarget(init);
-    });
+    void window.electronAPI
+      .getInitialExternalPath?.()
+      .then((init) => {
+        if (init) void handleExternalTarget(init);
+      })
+      .catch(() => {
+        // Проверочные среды могут не регистрировать этот IPC-канал
+      });
 
     // Слушаем открытие при уже работающем приложении (second-instance)
     const unsub = window.electronAPI.onOpenExternalPath((data) => {
@@ -390,6 +425,16 @@ const App: React.FC = () => {
         return;
       }
 
+      if (tab.type === 'excel') {
+        window.dispatchEvent(
+          new CustomEvent('workspace:excel-insert-text', {
+            detail: { tabId: tab.id, text },
+          })
+        );
+        ws.flash('Данные вставлены в таблицу');
+        return;
+      }
+
       if (tab.type === 'word') {
         window.dispatchEvent(
           new CustomEvent('workspace:insert-text', {
@@ -428,6 +473,16 @@ const App: React.FC = () => {
       const tab = ws.activeTab;
       if (!tab) return;
 
+      if (tab.type === 'excel') {
+        window.dispatchEvent(
+          new CustomEvent('workspace:excel-replace-document', {
+            detail: { tabId: tab.id, text },
+          })
+        );
+        ws.flash('Таблица заменена данными ответа');
+        return;
+      }
+
       if (tab.type === 'word') {
         try {
           const docTitle = tab.name.replace(/\.docx?$/i, '');
@@ -463,79 +518,622 @@ const App: React.FC = () => {
     [ws]
   );
 
-  const handleAICreateTable = useCallback(
+  /* ============================================================
+     Действия AI — полное управление приложением
+     ============================================================ */
+
+  const workspaceDir = useCallback(
+    async (): Promise<string> =>
+      ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.',
+    [ws.rootPath]
+  );
+
+  /** Относительные пути в действиях AI считаются от корня рабочей области. */
+  const resolveWorkspacePath = useCallback(
+    async (rawPath?: string): Promise<string> => {
+      const value = (rawPath || '').trim().replace(/^["']|["']$/g, '');
+      const root = await workspaceDir();
+      if (!value) return root;
+      if (/^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\')) return value;
+      return joinPath(root, value.replace(/^[\\/]+/, ''));
+    },
+    [workspaceDir]
+  );
+
+  /** Поиск открытой таблицы по имени/пути — приоритетнее склейки с корнем. */
+  const resolveTableTarget = useCallback(
+    async (rawTarget: string): Promise<string> => {
+      const normalized = rawTarget.replace(/\\/g, '/').toLowerCase();
+      const base = normalized.split('/').pop() || normalized;
+      const open = ws.tabs.find(
+        (tab) =>
+          tab.path.replace(/\\/g, '/').toLowerCase() === normalized ||
+          tab.name.toLowerCase() === base
+      );
+      if (open) return open.path;
+      const inTree = ws.allFiles.find(
+        (file) =>
+          file.name.toLowerCase() === base ||
+          file.path.replace(/\\/g, '/').toLowerCase().endsWith(`/${normalized}`)
+      );
+      if (inTree) return inTree.path;
+      return resolveWorkspacePath(rawTarget);
+    },
+    [ws.tabs, ws.allFiles, resolveWorkspacePath]
+  );
+
+  /** Поиск открытой вкладки по пути, имени или индексу — для select_tab/close_tab. */
+  const findOpenTab = useCallback(
+    (target: { path?: string; name?: string; index?: number }) => {
+      const norm = (p: string) => p.toLowerCase().replace(/\//g, '\\');
+      if (target.path) {
+        const wanted = norm(target.path);
+        const found = ws.tabs.find(
+          (t) => norm(t.path) === wanted || norm(t.path).endsWith('\\' + wanted)
+        );
+        if (found) return found;
+      }
+      if (target.name) {
+        const wanted = target.name.toLowerCase().trim();
+        const exact = ws.tabs.find((t) => t.name.toLowerCase() === wanted);
+        if (exact) return exact;
+        const partial = ws.tabs.find((t) => t.name.toLowerCase().includes(wanted));
+        if (partial) return partial;
+      }
+      if (typeof target.index === 'number' && ws.tabs[target.index]) {
+        return ws.tabs[target.index];
+      }
+      return ws.activeTab;
+    },
+    [ws.tabs, ws.activeTab]
+  );
+
+  const handleAIRunAction = useCallback(
+    async (action: AIActionPayload): Promise<AppActionResult> => {
+      const fail = (message: string): AppActionResult => ({ ok: false, message });
+
+      try {
+        switch (action.action) {
+          case 'import_table': {
+            const sourcePath = await resolveTableTarget(action.source);
+            const ext = extName(sourcePath).toLowerCase();
+            const targetPath = action.target
+              ? await resolveTableTarget(action.target)
+              : sourcePath.replace(/\.[^.\\/]+$/, '') + '.xlsx';
+
+            if (ext === 'xlsx' || ext === 'xls' || ext === 'xlsm') {
+              const res = await fileSystemService.readFile(sourcePath, 'base64');
+              try {
+                await fileSystemService.writeFile(targetPath, res.content, 'base64');
+              } catch (err) {
+                return fail(
+                  `Не удалось записать ${baseName(targetPath)}: закройте файл в Excel и повторите. ${(err as Error).message}`
+                );
+              }
+              await ws.refreshTree();
+              const openTab = ws.tabs.find((item) => item.path === targetPath);
+              if (openTab) {
+                ws.patchTab(openTab.id, {
+                  content: res.content,
+                  initialContent: res.content,
+                  isDirty: false,
+                  reloadKey: Date.now(),
+                });
+              } else {
+                await ws.openFile(targetPath);
+              }
+              return {
+                ok: true,
+                message: `Таблица скопирована: ${baseName(sourcePath)} → ${baseName(targetPath)}`,
+                path: targetPath,
+              };
+            }
+
+            if (ext !== 'md' && ext !== 'markdown' && ext !== 'txt' && ext !== 'csv' && ext !== 'tsv') {
+              return fail(`Импорт из .${ext || 'файла'} не поддерживается`);
+            }
+
+            const read = await fileSystemService.readFile(sourcePath, 'utf-8');
+            let columns: string[] = [];
+            let rows: (string | number)[][] = [];
+            const table = detectMarkdownTables(read.content)
+              .sort((a, b) => b.rows.length - a.rows.length)[0];
+            if (table) {
+              columns = table.columns;
+              rows = table.rows.map((row) => row.map((cell) => normalizeTableValue(cell) as string | number));
+            } else {
+              const parsed = XLSX.read(read.content, { type: 'string' });
+              const sheet = parsed.Sheets[parsed.SheetNames[0]];
+              const matrix = XLSX.utils.sheet_to_json(sheet, {
+                header: 1,
+                defval: '',
+                blankrows: false,
+              }) as (string | number)[][];
+              if (matrix.length > 0) {
+                columns = matrix[0].map((cell) => String(cell ?? ''));
+                rows = matrix
+                  .slice(1)
+                  .map((row) =>
+                    row.map(
+                      (cell) => normalizeTableValue(cell as string | number) as string | number
+                    )
+                  );
+              }
+            }
+            if (columns.length === 0 || rows.length === 0) {
+              return fail(`В файле ${baseName(sourcePath)} не найдена таблица`);
+            }
+
+            const sheetName = action.sheetName || 'Лист 1';
+            let base64 = generateExcelBase64(columns, rows, sheetName);
+            try {
+              const existing = await fileSystemService.readFile(targetPath, 'base64');
+              const workbook = XLSX.read(existing.content, { type: 'base64' });
+              workbook.Sheets[sheetName] = XLSX.utils.aoa_to_sheet([columns, ...rows]);
+              if (!workbook.SheetNames.includes(sheetName)) workbook.SheetNames.push(sheetName);
+              base64 = XLSX.write(workbook, { bookType: 'xlsx', type: 'base64' });
+            } catch {
+              // целевого файла ещё нет — оставляем новую книгу
+            }
+            try {
+              await fileSystemService.writeFile(targetPath, base64, 'base64');
+            } catch (err) {
+              return fail(
+                `Не удалось записать ${baseName(targetPath)}: закройте файл в Excel и повторите. ${(err as Error).message}`
+              );
+            }
+            await ws.refreshTree();
+            const openTab = ws.tabs.find((item) => item.path === targetPath);
+            if (openTab) {
+              ws.patchTab(openTab.id, {
+                content: base64,
+                initialContent: base64,
+                isDirty: false,
+                reloadKey: Date.now(),
+              });
+            } else {
+              await ws.openFile(targetPath);
+            }
+            return {
+              ok: true,
+              message: `Импортировано ${rows.length} строк из ${baseName(
+                sourcePath
+              )} в ${baseName(targetPath)}`,
+              path: targetPath,
+            };
+          }
+
+          case 'create_table': {
+            const isCsv = action.format === 'csv' || /\.csv$/i.test(action.name || '');
+            const name = sanitizeFileName(action.name || 'Таблица', isCsv ? '.csv' : '.xlsx');
+            const dir = await resolveWorkspacePath(action.path);
+            const content = isCsv
+              ? generateCsvContent(action.columns || [], action.rows || [])
+              : generateExcelBase64(
+                  action.columns || [],
+                  action.rows || [],
+                  action.sheetName || 'Лист 1'
+                );
+            const created = await ws.createFile(dir, name, content, isCsv ? 'utf-8' : 'base64');
+            return created
+              ? { ok: true, message: `Создана таблица: ${name}`, path: created }
+              : fail(`Не удалось создать таблицу: ${name}`);
+          }
+
+          case 'edit_table': {
+            const rawTarget = action.path || action.name;
+            const targetPath = rawTarget
+              ? await resolveTableTarget(rawTarget)
+              : ws.activeTab?.path;
+            if (!targetPath) return fail('Не указана таблица для изменения');
+            const ext = extName(targetPath).toLowerCase();
+            const tableRows = (action.rows ?? []).map((row) =>
+              row.map((cell) => normalizeTableValue(cell))
+            );
+            if (ext === 'csv' || ext === 'tsv') {
+              const read = await fileSystemService
+                .readFile(targetPath, 'utf-8')
+                .catch(() => null);
+              const workbook = read
+                ? XLSX.read(read.content, { type: 'string' })
+                : XLSX.utils.book_new();
+              if (workbook.SheetNames.length === 0) {
+                XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([[]]), 'Лист 1');
+              }
+              const sheetName = workbook.SheetNames[0];
+              const existing = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+                header: 1,
+                defval: '',
+                blankrows: false,
+              }) as XLSX.CellObject[][];
+              const base =
+                action.mode === 'append'
+                  ? [...existing, ...tableRows]
+                  : [...(action.columns?.length ? [action.columns] : []), ...tableRows];
+              const sheet = XLSX.utils.aoa_to_sheet(base as unknown[][]);
+              const csv = XLSX.utils.sheet_to_csv(sheet);
+              await fileSystemService.writeFile(targetPath, csv, 'utf-8');
+              const openTab = ws.tabs.find((item) => item.path === targetPath);
+              if (openTab) ws.patchTab(openTab.id, { content: csv, initialContent: csv, isDirty: false, reloadKey: Date.now() });
+              else await ws.openFile(targetPath);
+              return { ok: true, message: `Таблица обновлена: ${baseName(targetPath)}`, path: targetPath };
+            }
+
+            const read = await fileSystemService
+              .readFile(targetPath, 'base64')
+              .catch(() => null);
+            const workbook = read
+              ? XLSX.read(read.content, { type: 'base64', bookVBA: ext === 'xlsm' })
+              : XLSX.utils.book_new();
+            if (workbook.SheetNames.length === 0) {
+              XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([[]]), 'Лист 1');
+            }
+            const sheetName =
+              action.sheetName && workbook.SheetNames.includes(action.sheetName)
+                ? action.sheetName
+                : workbook.SheetNames[0];
+            if (!sheetName) return fail('В книге нет листов');
+            const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+              header: 1,
+              defval: '',
+              blankrows: false,
+            }) as XLSX.CellObject[][];
+            const nonEmpty = rows.filter((row) =>
+              row.some((cell) => String(cell ?? '').trim() !== '')
+            );
+            const base =
+              action.mode === 'append'
+                ? [...nonEmpty, ...tableRows]
+                : [...(action.columns?.length ? [action.columns] : []), ...tableRows];
+            workbook.Sheets[sheetName] = XLSX.utils.aoa_to_sheet(base as unknown[][]);
+            const content = XLSX.write(workbook, {
+              bookType: ext === 'xlsm' ? 'xlsm' : 'xlsx',
+              type: 'base64',
+              bookVBA: ext === 'xlsm',
+            });
+            await fileSystemService.writeFile(targetPath, content, 'base64');
+            const openTab = ws.tabs.find((item) => item.path === targetPath);
+            if (openTab) {
+              ws.patchTab(openTab.id, {
+                content,
+                initialContent: content,
+                isDirty: false,
+                reloadKey: Date.now(),
+              });
+            } else {
+              await ws.openFile(targetPath);
+            }
+            return {
+              ok: true,
+              message: `${
+                action.mode === 'append' ? 'Добавлено строк' : 'Заменено'
+              }: ${action.rows?.length ?? 0} — ${baseName(targetPath)}`,
+              path: targetPath,
+            };
+          }
+
+          case 'create_document': {            const name = sanitizeFileName(
+              action.name || (action.title ? `${action.title}.docx` : 'Документ'),
+              '.docx'
+            );
+            const dir = await resolveWorkspacePath(action.path);
+            const title = action.title || name.replace(/\.docx?$/i, '');
+            const base64 = await generateDocxBase64(action.content || '', title);
+            const created = await ws.createFile(dir, name, base64, 'base64');
+            return created
+              ? { ok: true, message: `Создан документ Word: ${name}`, path: created }
+              : fail(`Не удалось создать документ: ${name}`);
+          }
+
+          case 'create_file': {
+            const name = sanitizeFileName(action.name || 'Файл', '.txt');
+            const dir = await resolveWorkspacePath(action.path);
+            const created = await ws.createFile(dir, name, action.content || '', 'utf-8');
+            return created
+              ? { ok: true, message: `Создан файл: ${name}`, path: created }
+              : fail(`Не удалось создать файл: ${name}`);
+          }
+
+          case 'open_file': {
+            if (!action.path) return fail('Не указан путь к файлу');
+            const target = await resolveWorkspacePath(action.path);
+            const tabId = await ws.openFile(target);
+            return tabId
+              ? { ok: true, message: `Открыт файл: ${baseName(target)}`, path: target }
+              : fail(`Файл не открыт: ${baseName(target)}`);
+          }
+
+          case 'open_folder': {
+            if (!action.path) {
+              const picked = await ws.chooseWorkspaceFolder();
+              return picked
+                ? { ok: true, message: `Открыта папка: ${picked}`, path: picked }
+                : fail('Выбор папки отменён');
+            }
+            const target = await resolveWorkspacePath(action.path);
+            await ws.openWorkspace(target);
+            return { ok: true, message: `Открыта папка: ${baseName(target)}`, path: target };
+          }
+
+          case 'create_folder': {
+            const target = await resolveWorkspacePath(action.path || action.name);
+            await fileSystemService.createDirectory(target);
+            await ws.refreshTree();
+            return { ok: true, message: `Создана папка: ${baseName(target)}`, path: target };
+          }
+
+          case 'rename_path': {
+            if (!action.path) return fail('Не указан путь для переименования');
+            const target = await resolveWorkspacePath(action.path);
+            const newName = (action.newName || action.newPath || '')
+              .replace(/[\\/]+$/, '')
+              .split(/[\\/]/)
+              .pop();
+            if (!newName) return fail('Не указано новое имя');
+            const renamed = await ws.renamePath(target, newName);
+            return renamed
+              ? { ok: true, message: `Переименовано в: ${newName}` }
+              : fail(`Не удалось переименовать: ${baseName(target)}`);
+          }
+
+          case 'delete_path': {
+            if (!action.path) return fail('Не указан путь для удаления');
+            const target = await resolveWorkspacePath(action.path);
+            const deleted = await ws.deletePath(target);
+            return deleted
+              ? { ok: true, message: `Удалено: ${baseName(target)}` }
+              : fail(`Не удалось удалить: ${baseName(target)}`);
+          }
+
+          case 'insert_into_editor': {
+            if (!ws.activeTab) return fail('Нет активного документа для вставки');
+            insertIntoEditor(action.text);
+            return { ok: true, message: `Текст вставлен в «${ws.activeTab.name}»` };
+          }
+
+          case 'replace_document': {
+            if (!ws.activeTab) return fail('Нет активного документа для замены');
+            await replaceDocument(action.text);
+            return { ok: true, message: `Документ «${ws.activeTab.name}» заменён` };
+          }
+
+          case 'open_settings': {
+            setSettingsTab((action.tab as SettingsTab) || 'provider');
+            setSettingsOpen(true);
+            return { ok: true, message: 'Настройки открыты' };
+          }
+
+          case 'toggle_panel': {
+            const state = action.state || 'toggle';
+            const next = (current: boolean) =>
+              state === 'open' ? true : state === 'close' ? false : !current;
+
+            switch (action.panel) {
+              case 'sidebar':
+                setSidebarOpen(next(sidebarOpen));
+                break;
+              case 'ai':
+                setAiPanelOpen(next(aiPanelOpen));
+                break;
+              case 'terminal':
+                setTerminalOpen(next(terminalOpen));
+                break;
+              case 'search':
+                setSidebarOpen(true);
+                setSearchPanelOpen(next(searchPanelOpen));
+                break;
+              default:
+                return fail(`Неизвестная панель: ${String(action.panel)}`);
+            }
+            const labels: Record<string, string> = {
+              sidebar: 'Проводник',
+              ai: 'Панель AI',
+              terminal: 'Терминал',
+              search: 'Поиск',
+            };
+            return { ok: true, message: `${labels[action.panel]}: ${state === 'close' ? 'закрыто' : 'готово'}` };
+          }
+
+          case 'select_tab': {
+            const tab = findOpenTab(action);
+            if (!tab) return fail('Вкладка не найдена');
+            ws.setActiveTabId(tab.id);
+            return { ok: true, message: `Активная вкладка: ${tab.name}`, path: tab.path };
+          }
+
+          case 'close_tab': {
+            const tab = findOpenTab(action);
+            if (!tab) return fail('Вкладка не найдена');
+            if (tab.isDirty) {
+              ws.setActiveTabId(tab.id);
+              setUnsavedDialog({ open: true, tabId: tab.id });
+              return fail(`«${tab.name}» содержит несохранённые изменения — подтвердите закрытие`);
+            }
+            ws.closeTab(tab.id);
+            return { ok: true, message: `Вкладка закрыта: ${tab.name}` };
+          }
+
+          case 'save': {
+            if (action.all) {
+              const { saved, failed } = await ws.saveAll();
+              return failed.length === 0
+                ? { ok: true, message: `Сохранено файлов: ${saved}` }
+                : fail(`Не сохранено: ${failed.join(', ')}`);
+            }
+            if (!ws.activeTabId) return fail('Нет активной вкладки');
+            const saved = await ws.saveTab(ws.activeTabId);
+            return saved
+              ? { ok: true, message: `Сохранено: ${ws.activeTab?.name || 'файл'}` }
+              : fail('Не удалось сохранить файл');
+          }
+
+          case 'notify': {
+            ws.flash(action.message || 'Готово');
+            return { ok: true, message: action.message || 'Готово' };
+          }
+
+          case 'run_command': {
+            if (!action.command?.trim()) return fail('Не указана команда');
+            const cwd = action.cwd ? await resolveWorkspacePath(action.cwd) : '';
+            const command = cwd
+              ? `Set-Location -LiteralPath '${cwd.replace(/'/g, "''")}'; ${action.command}`
+              : action.command;
+            setTerminalOpen(true);
+            setTerminalCommand({ id: uid('cmd'), command });
+            return { ok: true, message: `Команда отправлена в терминал: ${action.command}` };
+          }
+
+          default:
+            return fail(`Действие не поддерживается: ${(action as { action: string }).action}`);
+        }
+      } catch (err) {
+        const message = (err as Error).message;
+        ws.flash(`Ошибка действия AI: ${message}`);
+        return fail(message);
+      }
+    },
+    [
+      ws,
+      resolveWorkspacePath,
+      findOpenTab,
+      insertIntoEditor,
+      replaceDocument,
+      sidebarOpen,
+      aiPanelOpen,
+      terminalOpen,
+      searchPanelOpen,
+      setSidebarOpen,
+      setAiPanelOpen,
+      setTerminalOpen,
+    ]
+  );
+
+  /** Читает файл по абсолютному пути для вложения в чат. */
+  const readAttachmentByPath = useCallback(
+    async (filePath: string): Promise<ChatAttachment | null> => {
+      const ext = extName(filePath).toLowerCase();
+      try {
+        if (ext === 'xlsx' || ext === 'xls' || ext === 'xlsm') {
+          const res = await fileSystemService.readFile(filePath, 'base64');
+          const workbook = XLSX.read(res.content, { type: 'base64' });
+          const text = workbook.SheetNames.map(
+            (name) => `### Лист: ${name}\n${XLSX.utils.sheet_to_csv(workbook.Sheets[name])}`
+          ).join('\n\n');
+          return {
+            name: baseName(filePath),
+            path: filePath,
+            content: text.slice(0, 40000),
+            truncated: text.length > 40000,
+          };
+        }
+        if (
+          ext === 'csv' ||
+          ext === 'tsv' ||
+          ext === 'md' ||
+          ext === 'markdown' ||
+          ext === 'txt' ||
+          ext === 'log' ||
+          ext === 'json' ||
+          ext === 'xml' ||
+          ext === 'yaml' ||
+          ext === 'yml' ||
+          ext === 'ini' ||
+          ext === 'cfg' ||
+          ext === 'js' ||
+          ext === 'ts' ||
+          ext === 'tsx' ||
+          ext === 'jsx' ||
+          ext === 'py' ||
+          ext === 'css' ||
+          ext === 'html'
+        ) {
+          const res = await fileSystemService.readFile(filePath, 'utf-8');
+          return {
+            name: baseName(filePath),
+            path: filePath,
+            content: res.content.slice(0, 40000),
+            truncated: res.content.length > 40000,
+          };
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
+
+  /** Файлы, перетащенные в чат из Проводника Windows. */
+  const readDroppedChatFiles = useCallback(
+    async (paths: string[]): Promise<ChatAttachment[]> => {
+      const attachments: ChatAttachment[] = [];
+      for (const filePath of paths.slice(0, 5)) {
+        const attachment = await readAttachmentByPath(filePath);
+        if (attachment) attachments.push(attachment);
+      }
+      return attachments;
+    },
+    [readAttachmentByPath]
+  );
+
+  /** Файл из сообщения чата: читаем содержимое, чтобы модель могла с ним работать. */
+  const resolveChatAttachment = useCallback(
     async (
-      name: string,
-      columns: string[],
-      rows: (string | number | boolean | null)[][],
-      sheetName = 'Лист 1',
-      format: 'xlsx' | 'csv' = 'xlsx'
-    ): Promise<string | null> => {
-      try {
-        const isCsv = format === 'csv' || name.toLowerCase().endsWith('.csv');
-        const finalName = sanitizeFileName(name, isCsv ? '.csv' : '.xlsx');
-        const content = isCsv
-          ? generateCsvContent(columns, rows)
-          : generateExcelBase64(columns, rows, sheetName);
-        const encoding = isCsv ? 'utf-8' : 'base64';
-
-        const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
-        const createdPath = await ws.createFile(parentDir, finalName, content, encoding);
-        if (createdPath) {
-          ws.flash(`Создана таблица: ${finalName}`);
-        }
-        return createdPath;
-      } catch (err) {
-        ws.flash(`Ошибка создания таблицы: ${(err as Error).message}`);
-        return null;
-      }
+      rawName: string
+    ): Promise<{ name: string; path: string; content: string } | null> => {
+      const cleaned = rawName
+        .trim()
+        .replace(/^["'«]+|["'»]+$/g, '')
+        .replace(/\\/g, '/');
+      const fileName = cleaned.split('/').pop() || cleaned;
+      const root = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+      const normalized = cleaned.toLowerCase();
+      const byPath =
+        ws.allFiles.find(
+          (file) =>
+            file.name.toLowerCase() === fileName.toLowerCase() ||
+            file.path.replace(/\\/g, '/').toLowerCase().endsWith(`/${normalized}`)
+        ) ||
+        ws.allFiles.find((file) =>
+          file.path.replace(/\\/g, '/').toLowerCase().endsWith(normalized)
+        );
+      let target = byPath?.path || (root ? joinPath(root, cleaned) : '');
+      if (!target) return null;
+      return readAttachmentByPath(target);
     },
-    [ws]
+    [ws.rootPath, ws.allFiles, readAttachmentByPath]
   );
 
-  const handleAICreateFile = useCallback(
-    async (name: string, content = ''): Promise<string | null> => {
-      try {
-        const isWord = /\.docx?$/i.test(name);
-        const finalName = sanitizeFileName(name, isWord ? '.docx' : '.txt');
-        let finalContent = content;
-        let encoding = 'utf-8';
-
-        if (isWord || /\.docx?$/i.test(finalName)) {
-          const docTitle = finalName.replace(/\.docx?$/i, '');
-          finalContent = await generateDocxBase64(content, docTitle);
-          encoding = 'base64';
-        }
-
-        const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
-        const createdPath = await ws.createFile(parentDir, finalName, finalContent, encoding);
-        if (createdPath) {
-          ws.flash(isWord ? `Создан документ Word: ${finalName}` : `Создан файл: ${finalName}`);
-        }
-        return createdPath;
-      } catch (err) {
-        ws.flash(`Ошибка создания файла: ${(err as Error).message}`);
-        return null;
-      }
-    },
-    [ws]
-  );
-
-  const handleAIOpenFile = useCallback(
-    async (filePath: string): Promise<void> => {
-      try {
-        let target = filePath;
-        if (!filePath.includes('\\') && !filePath.includes('/')) {
-          const parentDir = ws.rootPath || (await fileSystemService.getCurrentWorkspace()) || '.';
-          target = joinPath(parentDir, filePath);
-        }
-        await ws.openFile(target);
-      } catch (err) {
-        ws.flash(`Не удалось открыть файл: ${(err as Error).message}`);
-      }
-    },
-    [ws]
-  );
+  /** Снимок состояния приложения для системного промта AI. */
+  const aiAppContext = useMemo(() => {
+    const lines: string[] = [
+      `Рабочая папка: ${ws.rootPath || 'не выбрана'}`,
+      `Активная вкладка: ${ws.activeTab ? `${ws.activeTab.name} (${ws.activeTab.type})` : 'нет'}`,
+    ];
+    if (ws.tabs.length > 0) {
+      lines.push(
+        'Открытые вкладки:\n' +
+          ws.tabs
+            .map((tab) => `- ${tab.name}${tab.isDirty ? ' *не сохранён*' : ''}`)
+            .join('\n')
+      );
+    }
+    lines.push(
+      `Панели: проводник ${sidebarOpen ? 'открыт' : 'закрыт'}, AI ${aiPanelOpen ? 'открыта' : 'закрыта'}, терминал ${terminalOpen ? 'открыт' : 'закрыт'}`
+    );
+    lines.push(`Модель: ${ai.settings.model || 'не выбрана'}`);
+    lines.push(`Тема: ${isDark ? 'тёмная' : 'светлая'}`);
+    return lines.join('\n');
+  }, [
+    ws.rootPath,
+    ws.activeTab,
+    ws.tabs,
+    sidebarOpen,
+    aiPanelOpen,
+    terminalOpen,
+    ai.settings.model,
+    isDark,
+  ]);
 
   const handleFileAction = useCallback(async (action: string, item: FileItem, serviceId?: string, selection?: FileItem[]) => {
     if (action === 'open') {
@@ -551,6 +1149,19 @@ const App: React.FC = () => {
       void ws.openFile(item.path, 'secondary');
     } else if (action === 'open-new') {
       void ws.openFile(item.path, 'primary', true);
+    } else if (action === 'open-external') {
+      if (
+        /\.(exe|msi|com|scr|bat|cmd|ps1|vbs|js|jar)$/i.test(item.path) &&
+        !window.confirm(`Запустить файл?\n\n${item.path}`)
+      ) {
+        return;
+      }
+      try {
+        await fileSystemService.openExternally(item.path);
+        ws.flash(`Открыто в системе: ${item.name}`);
+      } catch (err) {
+        ws.flash(`Не удалось открыть: ${(err as Error).message}`);
+      }
     } else if (action === 'rename') {
       const next = window.prompt('Новое имя:', item.name);
       if (next && next.trim() && next.trim() !== item.name) await ws.renamePath(item.path, next.trim());
@@ -647,9 +1258,11 @@ const App: React.FC = () => {
     const common = {
       tab,
       onChange: (content: string) => ws.updateTabContent(tab.id, content),
-      onSave: () => void ws.saveTab(tab.id),
+      onSave: () => ws.saveTab(tab.id),
       onAskAI: askAI,
       onRequestInlineEdit: openInlineCopilot,
+      onViewModeChange: (viewMode: OpenTab['viewMode']) =>
+        ws.patchTab(tab.id, { viewMode }),
     };
 
     switch (tab.type) {
@@ -678,6 +1291,8 @@ const App: React.FC = () => {
             onOpenResult={(filePath) => void ws.openFile(filePath)}
           />
         );
+      case 'binary':
+        return <BinaryViewer tab={tab} onNotify={ws.flash} />;
       case 'image':
         return (
           <ImageViewer
@@ -907,6 +1522,8 @@ const App: React.FC = () => {
               height={terminalHeight}
               onHeightChange={setTerminalHeight}
               onClose={() => setTerminalOpen(false)}
+              command={terminalCommand}
+              onCommandConsumed={() => setTerminalCommand(null)}
             />
           )}
 
@@ -942,9 +1559,10 @@ const App: React.FC = () => {
               pendingPrompt={pendingPrompt}
               onPendingPromptConsumed={() => setPendingPrompt(null)}
               onAnswerComplete={handleAIAnswer}
-              onCreateTable={handleAICreateTable}
-              onCreateFile={handleAICreateFile}
-              onOpenFile={handleAIOpenFile}
+              onRunAction={handleAIRunAction}
+              appContext={aiAppContext}
+              onResolveAttachment={resolveChatAttachment}
+              onReadDroppedFiles={readDroppedChatFiles}
             />
           </div>
         )}
