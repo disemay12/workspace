@@ -143,6 +143,8 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
   const [format, setFormat] = useState<FormatState>(EMPTY_FORMAT);
   /** HTML до последней замены ассистентом — для кнопки «Вернуть прежний текст». */
   const [aiSnapshot, setAiSnapshot] = useState<string | null>(null);
+  /** Сколько изображений удалось сохранить при последней замене. */
+  const [restoredImages, setRestoredImages] = useState(0);
 
   const editorRef = useRef<HTMLDivElement>(null);
   /**
@@ -330,11 +332,15 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
       const html = markdownToDocumentHtml(detail.text || '');
       isSyncing.current = true;
       setAiSnapshot(root.innerHTML);
+      // Картинки исходного документа не должны исчезать при переписывании:
+      // модель их не воспроизводит, поэтому возвращаем на прежние места.
+      const images = collectAnchoredImages(root);
       root.innerHTML = html || '<p></p>';
+      setRestoredImages(restoreAnchoredImages(root, images));
       setWordCount(countWords(root.innerText));
-      queueMicrotask(() => {
-        isSyncing.current = false;
-      });
+      // Сбрасываем флаг до handleInput: иначе сериализация вкладки
+      // пропускается и картинки не попадают в сохраняемый .docx.
+      isSyncing.current = false;
       handleInput();
     };
 
@@ -354,9 +360,8 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
     root.innerHTML = aiSnapshot || '<p></p>';
     setWordCount(countWords(root.innerText));
     setAiSnapshot(null);
-    queueMicrotask(() => {
-      isSyncing.current = false;
-    });
+    setRestoredImages(0);
+    isSyncing.current = false;
     handleInput();
   }, [aiSnapshot, handleInput]);
 
@@ -860,7 +865,10 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
       {aiSnapshot !== null && (
         <div className="flex shrink-0 items-center gap-2 border-b border-blue-500/40 bg-blue-500/10 px-3 py-1.5 text-[11px] text-ws">
           <Sparkles size={11} className="text-blue-400" />
-          <span className="flex-1">Документ переписан ассистентом</span>
+          <span className="flex-1">
+            Документ переписан ассистентом
+            {restoredImages > 0 && ` · изображений сохранено: ${restoredImages}`}
+          </span>
           <button
             onClick={restoreAiSnapshot}
             className="flex items-center gap-1 rounded border border-ws bg-ws-surface px-1.5 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
@@ -916,6 +924,59 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
 /* ============================================================
    Вспомогательные компоненты
    ============================================================ */
+
+interface AnchoredImage {
+  src: string;
+  alt: string;
+  /** Начало текста блока, в котором стояла картинка, — якорь для возврата. */
+  anchor: string;
+  /** Порядковый номер блока на случай, если текст переписан. */
+  index: number;
+}
+
+/** Запоминает картинки документа вместе с местом, где они стояли. */
+function collectAnchoredImages(root: HTMLElement): AnchoredImage[] {
+  const blocks = [...root.children];
+  return [...root.querySelectorAll('img')]
+    .map((img) => {
+      const host = blocks.find((block) => block.contains(img)) ?? null;
+      return {
+        src: img.getAttribute('src') ?? '',
+        alt: img.getAttribute('alt') ?? '',
+        anchor: (host?.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase(),
+        index: host ? blocks.indexOf(host) : -1,
+      };
+    })
+    .filter((image) => image.src);
+}
+
+/** Возвращает картинки в переписанный документ и сообщает их число. */
+function restoreAnchoredImages(root: HTMLElement, images: AnchoredImage[]): number {
+  if (images.length === 0) return 0;
+  const blocks = [...root.children];
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().toLowerCase();
+  let restored = 0;
+
+  for (const image of images) {
+    const element = document.createElement('img');
+    element.src = image.src;
+    if (image.alt) element.alt = image.alt;
+
+    let target: Element | null = null;
+    if (image.anchor.length >= 8 && blocks.length > 0) {
+      target = blocks.find((block) => normalize(block.textContent ?? '').includes(image.anchor)) ?? null;
+    }
+    if (!target && image.index >= 0 && blocks.length > 0) {
+      target = blocks[Math.min(image.index, blocks.length - 1)];
+    }
+
+    if (target) target.insertAdjacentElement('afterend', element);
+    else root.appendChild(element);
+    restored += 1;
+  }
+  return restored;
+}
+
 
 const AIPrompt: React.FC<{
   value: string;
