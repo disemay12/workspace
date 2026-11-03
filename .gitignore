@@ -69,3 +69,6 @@ ws-userdata/
 ws-ver.err
 ws-ver.txt
 ws-*.log
+ai-settings.json
+**/ai-settings.json
+gdrive.json
