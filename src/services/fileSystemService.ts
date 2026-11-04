@@ -255,6 +255,12 @@ export const fileSystemService = {
     return dirPath.replace(/[\\/]+$/, '') + '\\' + fileName;
   },
 
+  /** Выбор папки вместо диалога сохранения файла. */
+  async pickDirectory(defaultDir?: string): Promise<string | null> {
+    if (this.isElectron()) return window.electronAPI!.pickDirectory(defaultDir);
+    return null;
+  },
+
   async showInExplorer(filePath: string): Promise<boolean> {
     if (!this.isElectron()) return false;
     const res = await window.electronAPI!.showInExplorer(filePath);

@@ -154,11 +154,11 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
     // конфигурациях Windows отказывает в записи в Videos и ломает сохранение.
     let selected: string | null;
     if (chooseLocation) {
-      selected = await fileSystemService.saveFileDialog(
-        fileName,
-        [{ name: 'Видео MP4', extensions: ['mp4'] }],
-        sourceDir || undefined
-      );
+      // Диалог сохранения файла проверяет права записи и отказывает, поэтому
+      // выбираем именно папку, а имя собираем сами.
+      const targetDir = await fileSystemService.pickDirectory(sourceDir || undefined);
+      if (!targetDir) return;
+      selected = await fileSystemService.uniquePath(targetDir, fileName);
     } else if (sourceDir) {
       selected = await fileSystemService.uniquePath(sourceDir, fileName);
     } else {

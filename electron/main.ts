@@ -937,6 +937,18 @@ ipcMain.handle('fs:trashPath', async (_event, targetPath: string) => {
   }
 });
 
+/** Выбор папки (в отличие от диалога сохранения не проверяет права записи). */
+ipcMain.handle('fs:pickDirectory', async (_event, defaultDir?: string) => {
+  if (!mainWindow) return null;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Куда сохранить копию',
+    defaultPath: defaultDir && fs.existsSync(defaultDir) ? defaultDir : undefined,
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
 ipcMain.handle('fs:renamePath', async (_event, oldPath: string, newPath: string) => {
   try {
     if (fs.existsSync(newPath)) {

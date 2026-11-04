@@ -232,6 +232,8 @@ declare global {
       deletePath: (targetPath: string) => Promise<{ success: boolean; error?: string }>;
       /** Удалить в корзину (обратимо). */
       trashPath: (targetPath: string) => Promise<{ success: boolean; error?: string }>;
+      /** Выбрать папку: диалог сохранения на Low integrity отказывает в записи. */
+      pickDirectory: (defaultDir?: string) => Promise<string | null>;
       renamePath: (oldPath: string, newPath: string) => Promise<{ success: boolean; error?: string }>;
 
       searchWorkspace: (

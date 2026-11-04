@@ -156,6 +156,9 @@ const electronAPI = {
   /** В корзину (обратимо), в отличие от deletePath. */
   trashPath: (targetPath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:trashPath', targetPath),
+  /** Выбрать папку (без проверки права записи, в отличие от диалога сохранения). */
+  pickDirectory: (defaultDir?: string): Promise<string | null> =>
+    ipcRenderer.invoke('fs:pickDirectory', defaultDir),
   renamePath: (oldPath: string, newPath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:renamePath', oldPath, newPath),
 
