@@ -452,15 +452,26 @@ function runXml(text: string, style: RunStyle): string {
   return `<w:r>${rPr}<w:t${preserve}>${escapeXml(text)}</w:t></w:r>`;
 }
 
+/**
+ * Идентификаторы объектов внутри документа должны быть уникальны,
+ * иначе Word отказывается открывать файл («Ошибка Word при попытке
+ * открытия файла») при нескольких картинках.
+ */
+let nextDrawingId = 1;
+
 function imageRunXml(id: string): string {
+  const drawingId = nextDrawingId++;
   return (
     '<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"' +
     ' distT="0" distB="0" distL="0" distR="0"><wp:extent cx="5486400" cy="3200400"/>' +
-    '<wp:docPr id="1" name="Image"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+    `<wp:docPr id="${drawingId}" name="Image ${drawingId}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
     '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
-    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill>' +
-    `<a:blip xmlns:r="${R_NS}" r:embed="${id}"/></pic:blipFill><pic:spPr><a:xfrm>` +
-    '<a:off x="0" y="0"/><a:ext cx="5486400" cy="3200400"/></a:xfrm><a:prstGeom prst="rect"/></pic:spPr>' +
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    // nvPicPr обязателен: без него Word считает пакет повреждённым.
+    `<pic:nvPicPr><pic:cNvPr id="${drawingId}" name="Image ${drawingId}"/><pic:cNvPicPr/></pic:nvPicPr>` +
+    `<pic:blipFill><a:blip xmlns:r="${R_NS}" r:embed="${id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5486400" cy="3200400"/></a:xfrm>' +
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>' +
     '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>'
   );
 }
