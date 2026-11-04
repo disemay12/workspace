@@ -92,6 +92,27 @@ let closeRequestPending = false;
 let workspaceRoot: string = '';
 
 /**
+ * Процесс с низким integrity level (Windows выдаёт его при запуске из
+ * некоторых каталогов, в т.ч. при выключенном UAC) не может писать в Videos,
+ * Documents и Desktop: ядро отвечает EACCES. Проверяем один раз.
+ */
+let lowIntegrityLevel: boolean | null = null;
+function isLowIntegrity(): boolean {
+  if (lowIntegrityLevel !== null) return lowIntegrityLevel;
+  try {
+    const out = execFileSync('whoami', ['/groups'], { encoding: 'utf8', windowsHide: true });
+    lowIntegrityLevel = /S-1-16-4096/.test(out);
+  } catch {
+    lowIntegrityLevel = false;
+  }
+  return lowIntegrityLevel;
+}
+
+const LOW_INTEGRITY_HINT =
+  'Windows ограничила права этого процесса (низкий уровень целостности) — так бывает при запуске из отдельных папок. ' +
+  'Запустите WorkSpace из обычного каталога, например C:\\WorkSpace\\WorkSpace.exe.';
+
+/**
  * Режим разработки определяется наличием URL dev-сервера, а не только
  * признаком упаковки. Иначе запуск собранного приложения распакованным
  * Electron (`npx electron dist-electron/main.js`, как в start-prod.bat)
@@ -237,6 +258,22 @@ app.whenReady().then(() => {
   registerVideo();
   registerTerminal(() => mainWindow);
   createWindow();
+
+  // Молчаливая потеря данных хуже предупреждения: при низком уровне
+  // целостности запись в Videos/Documents/Desktop невозможна вообще.
+  if (isLowIntegrity()) {
+    const options = {
+      type: 'warning' as const,
+      title: 'WorkSpace: ограниченные права',
+      message: 'Windows ограничила права приложения',
+      detail:
+        LOW_INTEGRITY_HINT +
+        '\n\nПока приложение запущено из этого каталога, файлы не сохраняются в Videos, Documents и Desktop.',
+      buttons: ['Понятно'],
+    };
+    if (mainWindow) void dialog.showMessageBox(mainWindow, options);
+    else void dialog.showMessageBox(options);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -821,9 +858,13 @@ ipcMain.handle(
       const binaryFile = /\.(xlsx|xlsm|xlsb|docx|doc|pptx|ppt|zip|7z|pdf|png|jpe?g)$/i.test(
         filePath
       );
-      const lockedError = () =>
+      const lockedError = (code?: string) =>
         new Error(
-          'Файл открыт в другой программе (Excel/Word). Закройте его и повторите сохранение.'
+          code === 'EACCES' && isLowIntegrity()
+            ? 'Не удалось сохранить файл: ' + LOW_INTEGRITY_HINT
+            : code === 'EACCES'
+              ? 'Нет прав на запись в эту папку. Выберите другую папку или запустите WorkSpace от администратора.'
+              : 'Файл открыт в другой программе (Excel/Word). Закройте его и повторите сохранение.'
         );
 
       // Уникальное имя: два параллельных сохранения не должны открывать
@@ -835,7 +876,7 @@ ipcMain.handle(
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
           // Временный файл создать нельзя (антивирус/блокировка).
-          if (binaryFile) throw lockedError();
+          if (binaryFile) throw lockedError(code);
           await writeWithRetry(filePath);
           return { success: true };
         }
@@ -846,7 +887,7 @@ ipcMain.handle(
         await fs.promises.rename(tmpPath, filePath);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
-        if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY') throw err;
+        if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY' && code !== 'EACCES') throw err;
         try {
           await fs.promises.copyFile(tmpPath, filePath);
         } catch (copyErr) {
@@ -854,7 +895,7 @@ ipcMain.handle(
           if (copyCode !== 'EPERM' && copyCode !== 'EBUSY' && copyCode !== 'EACCES') {
             throw copyErr;
           }
-          if (binaryFile) throw lockedError();
+          if (binaryFile) throw lockedError(copyCode);
           await writeWithRetry(filePath);
         }
         await fs.promises.unlink(tmpPath).catch(() => undefined);      }
