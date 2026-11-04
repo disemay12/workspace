@@ -606,11 +606,15 @@ function stylesXml(): string {
  * нумерованными, и маркеры «•» превращаются в «1. 2. 3.».
  */
 function numberingXml(): string {
+  // Маркер списка — обычный U+2022 в шрифте документа. С Symbol этот символ
+  // не отображается: Word рисует «□» (нет глифа), хотя в редакторе точка.
   const level = (fmt: string, text: string) =>
     '<w:lvl w:ilvl="0"><w:start w:val="1"/>' +
     `<w:numFmt w:val="${fmt}"/><w:lvlText w:val="${text}"/><w:lvlJc w:val="left"/>` +
     '<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>' +
-    (fmt === 'bullet' ? '<w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr>' : '') +
+    (fmt === 'bullet'
+      ? '<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:hint="default"/></w:rPr>'
+      : '') +
     '</w:lvl>';
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
