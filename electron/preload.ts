@@ -106,8 +106,11 @@ const electronAPI = {
     ipcRenderer.invoke('fs:openFileDialog', filters),
   saveFileDialog: (
     defaultName: string,
-    filters?: { name: string; extensions: string[] }[]
-  ): Promise<string | null> => ipcRenderer.invoke('fs:saveFileDialog', defaultName, filters),
+    filters?: { name: string; extensions: string[] }[],
+    defaultDir?: string
+  ): Promise<string | null> => ipcRenderer.invoke('fs:saveFileDialog', defaultName, filters, defaultDir),
+  uniquePath: (dirPath: string, fileName: string): Promise<string> =>
+    ipcRenderer.invoke('fs:uniquePath', dirPath, fileName),
   showInExplorer: (filePath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:showInExplorer', filePath),
 
@@ -150,6 +153,9 @@ const electronAPI = {
     ipcRenderer.invoke('fs:createDirectory', dirPath),
   deletePath: (targetPath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:deletePath', targetPath),
+  /** В корзину (обратимо), в отличие от deletePath. */
+  trashPath: (targetPath: string): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('fs:trashPath', targetPath),
   renamePath: (oldPath: string, newPath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:renamePath', oldPath, newPath),
 

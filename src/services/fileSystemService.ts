@@ -242,10 +242,17 @@ export const fileSystemService = {
 
   async saveFileDialog(
     defaultName: string,
-    filters?: { name: string; extensions: string[] }[]
+    filters?: { name: string; extensions: string[] }[],
+    defaultDir?: string
   ): Promise<string | null> {
-    if (this.isElectron()) return window.electronAPI!.saveFileDialog(defaultName, filters);
+    if (this.isElectron()) return window.electronAPI!.saveFileDialog(defaultName, filters, defaultDir);
     return null;
+  },
+
+  /** Свободное имя в папке (без перезаписи существующих файлов). */
+  async uniquePath(dirPath: string, fileName: string): Promise<string> {
+    if (this.isElectron()) return window.electronAPI!.uniquePath(dirPath, fileName);
+    return dirPath.replace(/[\\/]+$/, '') + '\\' + fileName;
   },
 
   async showInExplorer(filePath: string): Promise<boolean> {

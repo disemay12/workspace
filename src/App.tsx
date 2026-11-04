@@ -1382,6 +1382,7 @@ const App: React.FC = () => {
             tab={tab}
             onNotify={ws.flash}
             onOpenResult={(filePath) => void ws.openFile(filePath)}
+            onCloseTab={() => ws.closeTab(tab.id)}
           />
         );
       case 'binary':

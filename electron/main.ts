@@ -605,16 +605,35 @@ ipcMain.handle(
 
 ipcMain.handle(
   'fs:saveFileDialog',
-  async (_event, defaultName: string, filters?: { name: string; extensions: string[] }[]) => {
+  async (
+    _event,
+    defaultName: string,
+    filters?: { name: string; extensions: string[] }[],
+    defaultDir?: string
+  ) => {
     if (!mainWindow) return null;
+    // Голое имя файла Windows трактует как «текущая папка процесса» и диалог
+    // открывается в случайном месте (часто в Videos) — передаём полный путь.
+    const dir = defaultDir && fs.existsSync(defaultDir) ? defaultDir : undefined;
     const result = await dialog.showSaveDialog(mainWindow, {
-      defaultPath: defaultName,
+      defaultPath: dir ? path.join(dir, defaultName) : defaultName,
       filters: filters || [{ name: 'Все файлы', extensions: ['*'] }],
     });
     if (result.canceled || !result.filePath) return null;
     return result.filePath;
   }
 );
+
+/** Свободный путь в папке: name.mp4 → name (2).mp4 → name (3).mp4 … */
+ipcMain.handle('fs:uniquePath', async (_event, dirPath: string, fileName: string) => {
+  const ext = path.extname(fileName);
+  const base = path.basename(fileName, ext);
+  let candidate = path.join(dirPath, fileName);
+  for (let i = 2; fs.existsSync(candidate) && i < 1000; i += 1) {
+    candidate = path.join(dirPath, `${base} (${i})${ext}`);
+  }
+  return candidate;
+});
 
 ipcMain.handle('fs:showInExplorer', async (_event, filePath: string) => {
   try {
@@ -903,6 +922,15 @@ ipcMain.handle('fs:deletePath', async (_event, targetPath: string) => {
     } else {
       await fs.promises.unlink(targetPath);
     }
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+ipcMain.handle('fs:trashPath', async (_event, targetPath: string) => {
+  try {
+    await shell.trashItem(targetPath);
     return { success: true };
   } catch (err) {
     return { success: false, error: (err as Error).message };

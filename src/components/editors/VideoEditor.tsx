@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Clapperboard, Gauge, Scissors, Upload, VolumeX } from 'lucide-react';
+import { Clapperboard, Gauge, Scissors, Trash2, Upload, VolumeX } from 'lucide-react';
 import { OpenTab } from '../../types';
 import { Button, Field, Input, Select, Textarea } from '../ui';
 import { gdriveStatus } from '../../services/shareService';
@@ -9,6 +9,8 @@ interface Props {
   tab: OpenTab;
   onNotify: (message: string) => void;
   onOpenResult: (filePath: string) => void;
+  /** Закрыть вкладку исходного файла (после удаления оригинала). */
+  onCloseTab?: () => void;
 }
 
 interface Probe {
@@ -46,7 +48,13 @@ function sizeLabel(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(1) + ' МБ';
 }
 
-export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) => {
+/** Каталог файла для путей вида `C:\dir\file.mp4`. */
+function dirOf(filePath: string): string {
+  const cut = Math.max(filePath.lastIndexOf('\\'), filePath.lastIndexOf('/'));
+  return cut > 0 ? filePath.slice(0, cut) : '';
+}
+
+export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCloseTab }) => {
   const src = useMemo(() => 'media://local/?path=' + encodeURIComponent(tab.path), [tab.path]);
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const [probe, setProbe] = useState<Probe | null>(null);
@@ -64,6 +72,7 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
   const [stripAudio, setStripAudio] = useState(false);
   const [compress, setCompress] = useState(false);
   const [busy, setBusy] = useState('');
+  const [savedCopy, setSavedCopy] = useState('');
   const [progress, setProgress] = useState(0);
   const [publishOpen, setPublishOpen] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -85,6 +94,7 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
 
   useEffect(() => {
     let stop = false;
+    setSavedCopy('');
     void window.electronAPI?.videoCapabilities?.().then((caps) => {
       if (!stop) setFfmpeg(caps.ffmpeg);
     });
@@ -127,7 +137,7 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
     onNotify(`Фрагмент ${clock(from)}–${clock(to)}: ${speedValue}×`);
   };
 
-  const apply = async () => {
+  const apply = async (chooseLocation = false) => {
     const baseName = tab.name.replace(/\.[^.]+$/, '');
     const suffix =
       speed !== 1 || speedSegments.length > 0
@@ -137,10 +147,28 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
           : stripAudio
             ? '.muted'
             : '.copy';
-    const selected = await fileSystemService.saveFileDialog(`${baseName}${suffix}.mp4`, [
-      { name: 'Видео MP4', extensions: ['mp4'] },
-    ]);
-    if (!selected) return;
+    const fileName = `${baseName}${suffix}.mp4`;
+    const sourceDir = dirOf(tab.path);
+
+    // По умолчанию пишем рядом с исходником: нативный диалог на некоторых
+    // конфигурациях Windows отказывает в записи в Videos и ломает сохранение.
+    let selected: string | null;
+    if (chooseLocation) {
+      selected = await fileSystemService.saveFileDialog(
+        fileName,
+        [{ name: 'Видео MP4', extensions: ['mp4'] }],
+        sourceDir || undefined
+      );
+    } else if (sourceDir) {
+      selected = await fileSystemService.uniquePath(sourceDir, fileName);
+    } else {
+      selected = null;
+    }
+    if (!selected) {
+      if (chooseLocation) return;
+      onNotify('Не удалось определить папку исходного видео — используйте «Сохранить как…»');
+      return;
+    }
     const outputPath = /\.mp4$/i.test(selected) ? selected : `${selected}.mp4`;
     if (outputPath.toLowerCase() === tab.path.toLowerCase()) {
       onNotify('Выберите другое имя: нельзя сохранить копию поверх исходного видео');
@@ -162,8 +190,26 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
         outputPath,
       });
       if (!result.success || !result.outputPath) throw new Error(result.error || 'Не удалось обработать видео');
+      setSavedCopy(result.outputPath);
       onNotify('Готово: ' + result.outputPath);
       onOpenResult(result.outputPath);
+    } catch (err) {
+      onNotify((err as Error).message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const deleteOriginal = async () => {
+    const name = tab.name;
+    if (!window.confirm(`Удалить оригинал «${name}»?\n\nКопия уже сохранена, файл будет перемещён в корзину.`)) return;
+    setBusy('delete');
+    try {
+      const response = await window.electronAPI!.trashPath(tab.path);
+      if (!response.success) throw new Error(response.error || 'Не удалось удалить файл');
+      onNotify('Оригинал удалён: ' + name);
+      setSavedCopy('');
+      onCloseTab?.();
     } catch (err) {
       onNotify((err as Error).message);
     } finally {
@@ -349,10 +395,25 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult }) =>
           <Button variant="primary" disabled={!ffmpeg || Boolean(busy)} onClick={() => void apply()}>
             <Scissors size={12} /> {busy === 'ffmpeg' ? 'Обработка…' : 'Сохранить копию'}
           </Button>
+          <Button variant="secondary" disabled={!ffmpeg || Boolean(busy)} onClick={() => void apply(true)}>
+            Сохранить как…
+          </Button>
+          <Button
+            variant="danger"
+            disabled={!savedCopy || Boolean(busy)}
+            title={savedCopy ? 'Удалить исходное видео после сохранения копии' : 'Сначала сохраните копию'}
+            onClick={() => void deleteOriginal()}
+          >
+            <Trash2 size={12} /> {busy === 'delete' ? 'Удаление…' : 'Удалить оригинал'}
+          </Button>
           <Button variant="secondary" disabled={Boolean(busy)} onClick={() => void openPublish()}>
             <Upload size={12} /> На YouTube
           </Button>
         </div>
+        <p className="text-[10px] text-ws-faint">
+          Копия сохраняется рядом с исходником: {dirOf(tab.path) || 'папка не определена'}
+          {savedCopy ? ' · ' + savedCopy : ''}
+        </p>
 
         {publishOpen && (
           <div className="space-y-3 rounded-lg border border-ws bg-ws-elevated p-3">

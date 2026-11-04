@@ -209,7 +209,8 @@ declare global {
       getCurrentWorkspace: () => Promise<string>;
       openFolderDialog: () => Promise<string | null>;
       openFileDialog: (filters?: { name: string; extensions: string[] }[]) => Promise<string | null>;
-      saveFileDialog: (defaultName: string, filters?: { name: string; extensions: string[] }[]) => Promise<string | null>;
+      saveFileDialog: (defaultName: string, filters?: { name: string; extensions: string[] }[], defaultDir?: string) => Promise<string | null>;
+      uniquePath: (dirPath: string, fileName: string) => Promise<string>;
       showInExplorer: (filePath: string) => Promise<{ success: boolean; error?: string }>;
       setWorkspaceRoot: (dirPath: string) => Promise<{ success: boolean }>;
       getFavorites: () => Promise<{ path: string; name: string }[]>;
@@ -229,6 +230,8 @@ declare global {
       createFile: (filePath: string, initialContent?: string, encoding?: string) => Promise<{ success: boolean; error?: string }>;
       createDirectory: (dirPath: string) => Promise<{ success: boolean; error?: string }>;
       deletePath: (targetPath: string) => Promise<{ success: boolean; error?: string }>;
+      /** Удалить в корзину (обратимо). */
+      trashPath: (targetPath: string) => Promise<{ success: boolean; error?: string }>;
       renamePath: (oldPath: string, newPath: string) => Promise<{ success: boolean; error?: string }>;
 
       searchWorkspace: (

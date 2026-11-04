@@ -67,9 +67,11 @@ const skipDocs = (name) =>
 copyDir(path.join(srcRoot, 'node_modules', 'iconv-lite'), path.join(stage, 'node_modules', 'iconv-lite'), skipDocs);
 copyDir(path.join(srcRoot, 'node_modules', 'safer-buffer'), path.join(stage, 'node_modules', 'safer-buffer'), skipDocs);
 
+const { version } = require(path.join(srcRoot, 'package.json'));
+
 fs.writeFileSync(
   path.join(stage, 'package.json'),
-  JSON.stringify({ name: 'workspace', version: '1.0.0', main: 'dist-electron/main.js' }, null, 2)
+  JSON.stringify({ name: 'workspace', version, main: 'dist-electron/main.js' }, null, 2)
 );
 
 let count = 0;
