@@ -344,11 +344,17 @@ interface ParagraphOptions {
   align?: string;
   style?: string;
   list?: 'ul' | 'ol';
+  /** Абзац внутри таблицы: без отступа Normal, иначе ячейки раздуваются. */
+  tight?: boolean;
 }
 
 function paragraphXml(runs: string, options: ParagraphOptions): string {
   const props: string[] = [];
   if (options.style) props.push(`<w:pStyle w:val="${options.style}"/>`);
+  if (options.tight) {
+    // В ячейках таблицы абзацный отступ Normal раздувает строки.
+    props.push('<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>');
+  }
   if (options.list) {
     props.push(`<w:numPr><w:ilvl w:val="0"/><w:numId w:val="${options.list === 'ul' ? '1' : '2'}"/></w:numPr>`);
   }
@@ -369,7 +375,8 @@ interface RunStyle {
   font?: string;
   sizePt?: number;
   color?: string;
-  highlight?: string;
+  /** Цвет фона текста в #RRGGBB: в Word это не highlight, а заливка w:shd. */
+  shading?: string;
 }
 
 function runsFromInline(
@@ -423,12 +430,18 @@ function styleFromElement(el: Element): RunStyle {
   if (color) style.color = cssColorToHex(color);
 
   const bg = cssValue(css, 'background-color') || cssValue(css, 'background');
-  if (bg && bg !== 'transparent') style.highlight = nearestHighlight(cssColorToHex(bg));
+  if (bg && bg !== 'transparent') {
+    const fill = cssColorToHex(bg);
+    if (isMeaningfulFill(fill)) style.shading = fill;
+  }
 
   return style;
 }
 
 function runXml(text: string, style: RunStyle): string {
+  // Порядок элементов в w:rPr задан схемой OOXML: rFonts, b, i, strike,
+  // color, sz, szCs, u, shd, vertAlign. Word терпит нарушения, но валидаторы
+  // и часть версий — нет.
   const props: string[] = [];
   if (style.font) {
     const name = escapeXml(style.font);
@@ -436,14 +449,20 @@ function runXml(text: string, style: RunStyle): string {
   }
   if (style.bold) props.push('<w:b/>');
   if (style.italic) props.push('<w:i/>');
-  if (style.underline) props.push('<w:u w:val="single"/>');
   if (style.strike) props.push('<w:strike/>');
   if (style.color) props.push(`<w:color w:val="${style.color}"/>`);
-  if (style.sizePt) {
-    const half = String(Math.round(style.sizePt * 2));
+
+  // 12 pt — базовый кегль Normal: не дублируем его в каждом run, иначе
+  // документ приходит в Word не тем размером, что видно в редакторе.
+  const half = style.sizePt ? Math.round(style.sizePt * 2) : 0;
+  if (half >= 16 && Math.abs(half - 24) > 1) {
     props.push(`<w:sz w:val="${half}"/>`, `<w:szCs w:val="${half}"/>`);
   }
-  if (style.highlight) props.push(`<w:highlight w:val="${style.highlight}"/>`);
+
+  if (style.underline) props.push('<w:u w:val="single"/>');
+  if (style.shading) {
+    props.push(`<w:shd w:val="clear" w:color="auto" w:fill="${style.shading}"/>`);
+  }
   if (style.sup) props.push('<w:vertAlign w:val="superscript"/>');
   if (style.sub) props.push('<w:vertAlign w:val="subscript"/>');
 
@@ -481,19 +500,29 @@ function tableXml(table: Element, images: Map<string, ImageEntry>, nextId: () =>
   for (const tr of [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')]) {
     const cells: string[] = [];
     for (const tc of [...tr.querySelectorAll(':scope > td, :scope > th')]) {
-      const runs = runsFromInline(tc, tc.tagName.toLowerCase() === 'th' ? { bold: true } : {}, images, nextId);
-      cells.push(`<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>${paragraphXml(runs, {})}</w:tc>`);
+      const isHeader = tc.tagName.toLowerCase() === 'th';
+      const runs = runsFromInline(tc, isHeader ? { bold: true } : {}, images, nextId);
+      // Заливка шапки и небольшие отступы: без них таблица в Word выглядит
+      // голой сеткой, а не как в редакторе.
+      const props =
+        '<w:tcPr><w:tcW w:w="0" w:type="auto"/>' +
+        (isHeader ? '<w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/>' : '') +
+        '</w:tcPr>';
+      cells.push(`<w:tc>${props}${paragraphXml(runs, { tight: true })}</w:tc>`);
     }
     rows.push(`<w:tr>${cells.join('')}</w:tr>`);
   }
   return (
     '<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/>' +
-    '<w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>' +
-    '<w:left w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>' +
-    '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>' +
-    '<w:right w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>' +
-    '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>' +
-    '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/></w:tblBorders></w:tblPr>' +
+    '<w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"/>' +
+    '<w:left w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"/>' +
+    '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"/>' +
+    '<w:right w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"/>' +
+    '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"/>' +
+    '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"/></w:tblBorders>' +
+    '<w:tblCellMar><w:top w:w="60" w:type="dxa"/><w:left w:w="108" w:type="dxa"/>' +
+    '<w:bottom w:w="60" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar>' +
+    '</w:tblPr>' +
     `${rows.join('')}</w:tbl>`
   );
 }
@@ -545,20 +574,29 @@ function documentXml(body: string): string {
 }
 
 function stylesXml(): string {
-  const heading = (id: string, size: number) =>
+  const heading = (id: string, size: number, before: number, after: number, outline: number) =>
     `<w:style w:type="paragraph" w:styleId="${id}"><w:name w:val="${id.replace(/(\d)/, ' $1')}"/>` +
-    `<w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="${size}"/></w:rPr></w:style>`;
+    `<w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
+    `<w:pPr><w:keepNext/><w:spacing w:before="${before}" w:after="${after}"/><w:outlineLvl w:val="${outline}"/></w:pPr>` +
+    `<w:rPr><w:b/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/></w:rPr></w:style>`;
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     `<w:styles xmlns:w="${W_NS}">` +
-    '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/>' +
-    '<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="30"/></w:rPr></w:style>' +
-    heading('Heading1', 44) +
-    heading('Heading2', 36) +
-    heading('Heading3', 28) +
-    heading('Heading4', 24) +
-    '<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/>' +
-    '<w:basedOn w:val="Normal"/><w:rPr><w:i/></w:rPr></w:style></w:styles>'
+    // Базовый кегль 12 pt — так документ совпадает с тем, что показывает редактор.
+    '<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>' +
+    '<w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr></w:rPrDefault>' +
+    '<w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>' +
+    '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/>' +
+    '<w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr>' +
+    '<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr></w:style>' +
+    heading('Heading1', 44, 240, 120, 0) +
+    heading('Heading2', 32, 240, 100, 1) +
+    heading('Heading3', 26, 200, 80, 2) +
+    heading('Heading4', 24, 160, 80, 3) +
+    '<w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:qFormat/>' +
+    '<w:pPr><w:ind w:left="360"/><w:spacing w:after="160"/></w:pPr>' +
+    '<w:rPr><w:i/><w:color w:val="595959"/></w:rPr></w:style>' +
+    '</w:styles>'
   );
 }
 
@@ -699,20 +737,14 @@ function cssColorToHex(value: string): string {
   return [rgb[1], rgb[2], rgb[3]].map((n) => Number(n).toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
-function nearestHighlight(hex: string): string {
-  if (!hex) return 'yellow';
-  const rgb = hexToRgb(hex);
-  let best = 'yellow';
-  let bestDist = Number.POSITIVE_INFINITY;
-  for (const [name, color] of Object.entries(HIGHLIGHTS)) {
-    const other = hexToRgb(color.slice(1));
-    const dist = (rgb[0] - other[0]) ** 2 + (rgb[1] - other[1]) ** 2 + (rgb[2] - other[2]) ** 2;
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = name;
-    }
-  }
-  return best;
+/**
+ * Почти белый фон в Word — просто шум: редактор рисует такие заливки
+ * от копипасты, а в документе они дают грязные серые плашки.
+ */
+function isMeaningfulFill(hex: string): boolean {
+  if (!/^[0-9A-F]{6}$/.test(hex)) return false;
+  const [r, g, b] = hexToRgb(hex);
+  return (r * 0.299 + g * 0.587 + b * 0.114) < 0.94 * 255;
 }
 
 function hexToRgb(hex: string): [number, number, number] {
