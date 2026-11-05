@@ -1,6 +1,6 @@
 {
   "name": "workspace",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "WorkSpace",
   "main": "dist-electron/main.js",
   "author": "WorkSpace",
@@ -23,7 +23,8 @@
     "checks": "npm run checks:build && npm run checks:sync && node dist-electron/run-all-checks.js",
     "pack": "npm run build && electron-builder --win --x64 --dir",
     "dist": "npm run build && electron-builder --win --x64",
-    "build:portable": "node scripts/build-portable.js"
+    "build:portable": "node scripts/build-portable.js",
+    "pack:release": "node scripts/pack-release.js"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

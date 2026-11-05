@@ -7,6 +7,7 @@
  * secrets.local.ps1» в настройках), чтобы ключ не оказывался в UI
  * без ведома владельца.
  */
+import { app } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -36,11 +37,14 @@ function parseEnvAssignments(content: string): Record<string, string> {
   return result;
 }
 
-/** Ищет secrets.local.ps1 вверх по дереву каталогов от точки запуска. */
+/** Ищет secrets.local.ps1: профиль пользователя, затем проект/папка exe. */
 function locateSecretsFile(): string | null {
   const candidates: string[] = [];
 
-  // 1. Рядом с исполняемым файлом / текущим рабочим каталогом
+  // 1. Профиль пользователя: единственное место, которое переживает обновление.
+  candidates.push(path.join(app.getPath('userData'), 'secrets.local.ps1'));
+
+  // 2. Рядом с исполняемым файлом / текущим рабочим каталогом
   candidates.push(path.join(process.cwd(), 'secrets.local.ps1'));
 
   // 2. В каталоге приложения (dev: корень проекта; prod: рядом с ресурсами)
@@ -68,13 +72,47 @@ function locateSecretsFile(): string | null {
   return null;
 }
 
+/**
+ * Создаёт шаблон в профиле пользователя, если файла нет нигде: пользователь
+ * не должен вручную придумывать путь к файлу секретов.
+ */
+function ensureTemplate(): string | null {
+  const target = path.join(app.getPath('userData'), 'secrets.local.ps1');
+  const template = [
+    '# WorkSpace: локальные секреты. Файл создан автоматически при первом запуске.',
+    '# Впишите значения и перезапустите WorkSpace. Файл не публикуйте.',
+    '# $env:API_BASE_URL = "https://api.deepseek.com/v1"',
+    '# $env:API_KEY = ""',
+    '# $env:TEXT_MODEL = "deepseek-chat"',
+    '# $env:IMAGE_MODEL = ""',
+    '',
+  ].join('\r\n');
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, template, 'utf8');
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+/** Существующий файл секретов или созданный шаблон; null — записать некуда. */
+function ensureSecretsFile(): string | null {
+  return locateSecretsFile() ?? ensureTemplate();
+}
+
 export const secretsImporter = {
+  /**
+   * Гарантирует, что файл секретов есть: возвращает существующий или создаёт
+   * шаблон в профиле пользователя.
+   */
+  ensure: ensureSecretsFile,
   /**
    * Читает локальный файл секретов.
    * API-ключ возвращается только при includeKey = true.
    */
   read(includeKey = false): LocalSecrets {
-    const filePath = locateSecretsFile();
+    const filePath = ensureSecretsFile();
 
     if (!filePath) {
       return {

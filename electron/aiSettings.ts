@@ -4,10 +4,11 @@
  * localStorage в собранном приложении привязан к адресу файла страницы и
  * обнуляется после перезапуска. Ключ хранится в обычном файле.
  *
- * Сначала — рядом с приложением (папка WorkSpace): этот процесс может её
- * писать, и файл переносится вместе с папкой на другой компьютер.
- * Если папка только для чтения — в профиле пользователя.
- * Открытый ключ на диск не пишется: он шифруется средствами Windows.
+ * Файл живёт только в профиле пользователя (%APPDATA%\WorkSpace): папка
+ * релиза перезаписывается при обновлении, и настройки в ней терялись бы.
+ * Если старая версия положила ai-settings.json рядом с exe — переносим его
+ * один раз при первом запуске. Открытый ключ на диск не пишется: он
+ * шифруется средствами Windows.
  */
 import { app, ipcMain, safeStorage } from 'electron';
 import * as fs from 'fs';
@@ -26,50 +27,78 @@ interface StoredSettings {
   keys?: Record<string, string>;
 }
 
-/** Места хранения от предпочтительного к запасному. */
-function candidatePaths(): string[] {
-  const paths: string[] = [];
+/** Базовые значения: файл создаётся при первом запуске, чтобы UI был не пустым. */
+const DEFAULT_SETTINGS: StoredSettings = {
+  temperature: 0.7,
+  maxTokens: 4096,
+};
+
+/** Единственное место записи: профиль пользователя. */
+function settingsPath(): string {
+  return path.join(app.getPath('userData'), 'ai-settings.json');
+}
+
+/** Файлы старой версии рядом с exe — только источник для разовой миграции. */
+function legacyPaths(): string[] {
+  const list = [path.join(path.dirname(process.execPath), 'ai-settings.json')];
   if (app.isPackaged) {
-    // execPath — это WorkSpace\app\WorkSpace.exe, файл кладём на уровень выше.
-    paths.push(path.resolve(path.dirname(process.execPath), '..', 'ai-settings.json'));
+    // execPath — это WorkSpace\app\WorkSpace.exe, старый файл лежал на уровень выше.
+    list.push(path.resolve(path.dirname(process.execPath), '..', 'ai-settings.json'));
   }
-  paths.push(path.join(app.getPath('userData'), 'ai-settings.json'));
-  return paths;
+  return list;
 }
 
 function readFrom(target: string): StoredSettings | null {
   try {
-    const parsed = JSON.parse(fs.readFileSync(target, 'utf8')) as StoredSettings;
+    // Notepad сохраняет UTF-8 с BOM — JSON.parse на таком файле падает.
+    const raw = fs.readFileSync(target, 'utf8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(raw) as StoredSettings;
     return parsed && typeof parsed === 'object' ? parsed : null;
   } catch {
     return null;
   }
 }
 
-function read(): StoredSettings {
-  for (const target of candidatePaths()) {
-    const data = readFrom(target);
-    if (data) return data;
-  }
-  return {};
+function writeTo(target: string, data: StoredSettings): void {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = target + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+  fs.renameSync(tmp, target);
 }
 
-/** Пишет в первое доступное место. Бросает ошибку, только если не вышло нигде. */
-function write(data: StoredSettings): void {
-  const payload = JSON.stringify(data);
-  let lastError: unknown;
-  for (const target of candidatePaths()) {
+function read(): StoredSettings {
+  const target = settingsPath();
+  const own = readFrom(target);
+  if (own) return own;
+
+  // Старая версия держала файл рядом с exe — переносим его в профиль.
+  for (const legacy of legacyPaths()) {
+    const data = readFrom(legacy);
+    if (!data) continue;
     try {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      const tmp = target + '.tmp';
-      fs.writeFileSync(tmp, payload, 'utf8');
-      fs.renameSync(tmp, target);
-      return;
-    } catch (err) {
-      lastError = err;
+      writeTo(target, data);
+    } catch {
+      // Перенести не удалось (профиль только для чтения) — работаем с копией.
     }
+    return data;
   }
-  throw lastError instanceof Error ? lastError : new Error('Не удалось сохранить настройки');
+
+  // Ничего нет: создаём файл с базовыми значениями.
+  try {
+    writeTo(target, DEFAULT_SETTINGS);
+  } catch {
+    // Не удалось — вернём значения в память, сохранение попробует ещё раз.
+  }
+  return { ...DEFAULT_SETTINGS };
+}
+
+/** Пишет только в профиль пользователя: папка релиза при обновлении меняется. */
+function write(data: StoredSettings): void {
+  try {
+    writeTo(settingsPath(), data);
+  } catch (err) {
+    throw err instanceof Error ? err : new Error('Не удалось сохранить настройки');
+  }
 }
 
 /** Шифрует ключ средствами ОС. Если шифрование недоступно — кодирует в base64. */

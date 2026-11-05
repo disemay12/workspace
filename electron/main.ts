@@ -257,6 +257,9 @@ app.whenReady().then(() => {
   registerContextMenuIpc();
   registerVideo();
   registerTerminal(() => mainWindow);
+  // Файл секретов создаётся сразу: в релизе его нет, пользователь должен
+  // увидеть готовый шаблон в профиле, а не «файл не найден».
+  secretsImporter.ensure();
   createWindow();
 
   // Молчаливая потеря данных хуже предупреждения: при низком уровне

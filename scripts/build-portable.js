@@ -78,11 +78,22 @@ const sensitiveFiles = [
   path.join(outDir, 'secrets.local.ps1'),
   path.join(appDir, 'ai-settings.json'),
   path.join(outDir, 'ai-settings.json'),
+  path.join(appDir, 'gdrive.json'),
+  path.join(outDir, 'gdrive.json'),
+  path.join(appDir, 'workspace-session.json'),
+  path.join(outDir, 'workspace-session.json'),
 ];
 for (const file of sensitiveFiles) {
   if (fs.existsSync(file)) {
     try { fs.unlinkSync(file); } catch {}
   }
+}
+
+// README релиза: одинаковый текст для архива и для папки сборки.
+const readmeSrc = path.join(rootDir, 'scripts', 'release-readme.txt');
+if (fs.existsSync(readmeSrc)) {
+  fs.copyFileSync(readmeSrc, path.join(outDir, 'README.txt'));
+  fs.copyFileSync(readmeSrc, path.join(appDir, 'README.txt'));
 }
 
 // 5. Компиляция оконного загрузчика WorkSpace.exe
