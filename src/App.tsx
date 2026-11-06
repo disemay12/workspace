@@ -18,8 +18,18 @@ import { useAISettings, useChatSessions } from './state/settings';
 import { useTheme } from './hooks/useTheme';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { cn, baseName, extName, joinPath, uid } from './lib/utils';
-import { docxText, pptxText, tabToDocumentText } from './lib/documentText';
+import { docxText, pptxText, tabToDocumentText, htmlToPlainText } from './lib/documentText';
 import { extractLegacyDocText } from './lib/legacyDoc';
+import { docxBase64ToHtml, htmlToDocxBase64 } from './lib/docx';
+import { markdownToDocumentHtml } from './lib/aiDocument';
+import {
+  applyDocumentTool,
+  BLOCK_TOOL_TAB_TYPES,
+  DOCUMENT_TAB_TYPES,
+  DOCUMENT_WRITE_TOOLS,
+  type DocumentToolResult,
+} from './lib/documentModel';
+import { getDocumentController } from './services/docBridge';
 
 import { TitleBar } from './components/workspace/TitleBar';
 import { FileTree } from './components/workspace/FileTree';
@@ -72,6 +82,11 @@ const App: React.FC = () => {
   const [aiPanelOpen, setAiPanelOpen] = useLocalStorage('ws_ai_panel_open', true);
   /** Права ассистента на запись в открытый документ: по умолчанию выданы. */
   const [aiDocWrite, setAiDocWrite] = useLocalStorage('ws_ai_doc_write', true);
+  /** Актуальные значения для агентного цикла: колбэк живёт дольше одного рендера. */
+  const wsRef = useRef(ws);
+  wsRef.current = ws;
+  const aiDocWriteRef = useRef(aiDocWrite);
+  aiDocWriteRef.current = aiDocWrite;
   const [terminalOpen, setTerminalOpen] = useLocalStorage('ws_terminal_open', false);
   const [terminalHeight, setTerminalHeight] = useLocalStorage('ws_terminal_height', 240);
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
@@ -614,6 +629,86 @@ const App: React.FC = () => {
     [ws.tabs, ws.activeTab]
   );
 
+  /**
+   * Исполнитель инструментов документа для агентного цикла.
+   * Читает живое полотно через docBridge, пишет через него же, чтобы правки
+   * сразу были видны в редакторе, а не только в base64 вкладки.
+   */
+  const runDocumentTool = useCallback(
+    async (
+      name: string,
+      args: Record<string, unknown> = {},
+      transactionId = `doc_${Date.now()}`,
+      tabId?: string
+    ): Promise<DocumentToolResult> => {
+      const current = wsRef.current;
+      const tab = tabId
+        ? current.tabs.find((item) => item.id === tabId)
+        : current.activeTab;
+
+      if (!tab || !DOCUMENT_TAB_TYPES.has(tab.type)) {
+        return { ok: false, message: 'Документ закрыт или недоступен для правки' };
+      }
+
+      if (DOCUMENT_WRITE_TOOLS.has(name) && !aiDocWriteRef.current) {
+        return {
+          ok: false,
+          message:
+            'Нет прав записи в открытый документ. Нажмите «Предоставить права на запись» в панели AI.',
+        };
+      }
+
+      if (
+        !BLOCK_TOOL_TAB_TYPES.has(tab.type) &&
+        !['get_document', 'replace_document', 'find_replace'].includes(name)
+      ) {
+        return {
+          ok: false,
+          message: `Инструмент ${name} недоступен для «${tab.name}»: для текста доступны только get_document, replace_document и find_replace.`,
+        };
+      }
+
+      try {
+        const controller = getDocumentController(tab.id);
+        let html = '';
+
+        if (tab.type === 'word') {
+          html = controller?.readHtml() || (await docxBase64ToHtml(tab.content)).html;
+        } else {
+          html = markdownToDocumentHtml(tab.content);
+        }
+
+        const result = applyDocumentTool(html, name, args);
+        if (!result.ok) return result;
+
+        if (result.changed && result.html !== undefined) {
+          if (tab.type === 'word') {
+            if (controller) {
+              controller.writeHtml(result.html, transactionId);
+            } else {
+              const base64 = await htmlToDocxBase64(result.html);
+              current.updateTabContent(tab.id, base64);
+            }
+          } else {
+            // Markdown/текст хранят содержимое строкой — HTML разбираем обратно.
+            current.updateTabContent(tab.id, htmlToPlainText(result.html));
+          }
+        }
+
+        return {
+          ...result,
+          structure: result.structure ? `Файл: ${tab.name}\n${result.structure}` : result.structure,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          message: `Не удалось применить ${name}: ${(error as Error).message}`,
+        };
+      }
+    },
+    []
+  );
+
   const handleAIRunAction = useCallback(
     async (action: AIActionPayload): Promise<AppActionResult> => {
       const fail = (message: string): AppActionResult => ({ ok: false, message });
@@ -923,6 +1018,27 @@ const App: React.FC = () => {
             return { ok: true, message: `Документ «${ws.activeTab.name}» заменён` };
           }
 
+          case 'document_apply': {
+            if (!wsRef.current.activeTab) return fail('Нет активного документа');
+            const transactionId = `action_${Date.now()}`;
+            let applied = 0;
+
+            for (const operation of action.operations) {
+              const { tool, ...args } = operation;
+              if (!tool) continue;
+              const result = await runDocumentTool(tool, args, transactionId);
+              if (!result.ok) {
+                return fail(`Операция «${tool}»: ${result.message}`);
+              }
+              applied += 1;
+            }
+
+            return {
+              ok: true,
+              message: `Выполнено операций с документом: ${applied}`,
+            };
+          }
+
           case 'open_settings': {
             setSettingsTab((action.tab as SettingsTab) || 'provider');
             setSettingsOpen(true);
@@ -1024,6 +1140,7 @@ const App: React.FC = () => {
       findOpenTab,
       insertIntoEditor,
       replaceDocument,
+      runDocumentTool,
       sidebarOpen,
       aiPanelOpen,
       terminalOpen,
@@ -1196,6 +1313,13 @@ const App: React.FC = () => {
     );
     lines.push(`Модель: ${ai.settings.model || 'не выбрана'}`);
     lines.push(`Тема: ${isDark ? 'тёмная' : 'светлая'}`);
+    if (ws.activeTab && DOCUMENT_TAB_TYPES.has(ws.activeTab.type)) {
+      lines.push(
+        `Открытый документ: ${ws.activeTab.name} · права записи: ${aiDocWrite ? 'есть' : 'нет'}`
+      );
+    } else {
+      lines.push(`Права записи AI: ${aiDocWrite ? 'есть' : 'нет'}`);
+    }
     return lines.join('\n');
   }, [
     ws.rootPath,
@@ -1205,6 +1329,7 @@ const App: React.FC = () => {
     aiPanelOpen,
     terminalOpen,
     ai.settings.model,
+    aiDocWrite,
     isDark,
   ]);
 
@@ -1664,6 +1789,7 @@ const App: React.FC = () => {
               onPendingPromptConsumed={() => setPendingPrompt(null)}
               onAnswerComplete={handleAIAnswer}
               onRunAction={handleAIRunAction}
+              onDocumentTool={runDocumentTool}
               appContext={aiAppContext}
               onResolveAttachment={resolveChatAttachment}
               onReadDroppedFiles={readDroppedChatFiles}

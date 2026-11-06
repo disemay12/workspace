@@ -21,6 +21,7 @@ export type AppActionKind =
   | 'delete_path'
   | 'insert_into_editor'
   | 'replace_document'
+  | 'document_apply'
   | 'open_settings'
   | 'toggle_panel'
   | 'select_tab'
@@ -114,6 +115,17 @@ export interface AIReplaceDocPayload {
   text: string;
 }
 
+/** Одна операция документа в текстовом fallback-протоколе. */
+export interface AIDocumentOperation extends Record<string, unknown> {
+  tool: string;
+}
+
+/** Серия правок открытого документа для моделей без function calling. */
+export interface AIDocumentApplyPayload {
+  action: 'document_apply';
+  operations: AIDocumentOperation[];
+}
+
 export type SettingsTab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system';
 
 export interface AIOpenSettingsPayload {
@@ -171,6 +183,7 @@ export type AIActionPayload =
   | AIDeletePathPayload
   | AIInsertEditorPayload
   | AIReplaceDocPayload
+  | AIDocumentApplyPayload
   | AIOpenSettingsPayload
   | AITogglePanelPayload
   | AISelectTabPayload
@@ -260,6 +273,11 @@ const ACTION_ALIASES: Record<string, AppActionKind> = {
   replace_document: 'replace_document',
   replace_text: 'replace_document',
   replace: 'replace_document',
+  document_apply: 'document_apply',
+  document_edit: 'document_apply',
+  edit_document: 'document_apply',
+  apply_document: 'document_apply',
+  document_operations: 'document_apply',
   open_settings: 'open_settings',
   settings: 'open_settings',
   toggle_panel: 'toggle_panel',
@@ -563,6 +581,28 @@ function normalizeAction(input: unknown): AIActionPayload | null {
       const text = asString(body.text) ?? content;
       if (typeof text !== 'string' || !text.trim()) return null;
       return { action: 'replace_document', text: stripAssistantNoise(text) };
+    }
+
+    case 'document_apply': {
+      const rawOperations = body.operations ?? body.ops ?? body.steps;
+      if (!Array.isArray(rawOperations)) return null;
+
+      const operations: AIDocumentOperation[] = [];
+      for (const item of rawOperations) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        const tool =
+          asString(record.tool) ||
+          asString(record.name) ||
+          asString(record.op) ||
+          asString(record.type) ||
+          '';
+        if (!tool) continue;
+        operations.push({ ...record, tool });
+      }
+
+      if (operations.length === 0) return null;
+      return { action: 'document_apply', operations };
     }
 
     case 'open_settings': {

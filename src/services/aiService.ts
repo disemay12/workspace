@@ -1,6 +1,7 @@
 import { AISettings, ChatMessage } from '../types';
 import { PROVIDER_PRESETS, normalizeSettings } from '../state/settings';
 import { uid } from '../lib/utils';
+import type { ToolDefinition } from './aiTools';
 
 /** Максимальный размер прикрепляемого к запросу файла (символов). */
 export const MAX_ATTACHMENT_CHARS = 40000;
@@ -9,6 +10,33 @@ export interface StreamCallbacks {
   onChunk: (partialText: string) => void;
   onFinish: (fullText: string) => void;
   onError: (error: Error) => void;
+}
+
+/** Провайдер/модель отвергли tools — нужен текстовый протокол document_apply. */
+export class ToolsUnsupportedError extends Error {
+  constructor(message = 'Провайдер не поддерживает function calling') {
+    super(message);
+    this.name = 'ToolsUnsupportedError';
+  }
+}
+
+export interface DocumentAgentOptions {
+  messages: ChatMessage[];
+  settings: AISettings;
+  appContext?: string;
+  systemPromptExtra?: string;
+  tools: ToolDefinition[];
+  onToolCall: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  onStatus?: (status: string) => void;
+  signal?: AbortSignal;
+  /** Страховка от бесконечного цикла: каждая итерация — один ответ модели. */
+  maxIterations?: number;
+}
+
+export interface DocumentAgentResult {
+  text: string;
+  iterations: number;
+  toolCalls: number;
 }
 
 const isElectron = () => typeof window !== 'undefined' && Boolean(window.electronAPI);
@@ -45,14 +73,10 @@ function buildMessageText(message: ChatMessage): string {
   );
 }
 
-/**
- * Разбор SSE-потока. Универсальный парсер: каждая строка `data: {...}`
- * передаётся в extractDelta, которая возвращает приращение текста.
- * Возвращает накопленный текст.
- */
-function createSSEParser(extractDelta: (payload: any) => string, onChunk: (partial: string) => void) {
+/** Разбор SSE-потока на уровне JSON-событий. */
+function createPayloadParser(onPayload: (payload: any) => void) {
   let buffer = '';
-  let full = '';
+  let count = 0;
 
   return {
     /** Обрабатывает очередной фрагмент потока. */
@@ -69,16 +93,35 @@ function createSSEParser(extractDelta: (payload: any) => string, onChunk: (parti
         if (!data || data === '[DONE]') continue;
         try {
           const payload = JSON.parse(data);
-          const delta = extractDelta(payload);
-          if (delta) {
-            full += delta;
-            onChunk(full);
-          }
+          count += 1;
+          onPayload(payload);
         } catch {
           // Неполный JSON-чанк — пропускаем
         }
       }
     },
+    get count() {
+      return count;
+    },
+  };
+}
+
+/**
+ * Разбор SSE-потока с извлечением приращения текста.
+ * Возвращает накопленный текст.
+ */
+function createSSEParser(extractDelta: (payload: any) => string, onChunk: (partial: string) => void) {
+  let full = '';
+  const parser = createPayloadParser((payload) => {
+    const delta = extractDelta(payload);
+    if (delta) {
+      full += delta;
+      onChunk(full);
+    }
+  });
+
+  return {
+    push: (text: string) => parser.push(text),
     get result() {
       return full;
     },
@@ -120,6 +163,7 @@ export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты — интеллектуа
 \`\`\`
 
 Можно вернуть несколько блоков подряд или один блок с массивом: { "actions": [ {...}, {...} ] }.
+Если API предоставил инструменты (tools), выполняй действия через них, а блоки workspace-action используй только для действий, которых среди инструментов нет.
 Не описывай действие словами как выполненное, если не добавил блок. Не оборачивай JSON в таблицу.
 
 ДОСТУПНЫЕ ДЕЙСТВИЯ
@@ -187,16 +231,14 @@ export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты — интеллектуа
 Если пользователь просит «перенеси данные в нашу таблицу», используй edit_table для открытой таблицы или import_table с её именем в target.
 
 РЕДАКТИРОВАНИЕ ДОКУМЕНТА
-- Содержимое активного документа приходит в сообщении блоком «[Файл: имя]» или «[Прикреплённый файл: имя]». Ты уже видишь текст документа и имеешь право записи в него.
-- Правки применяются к Word (.docx/.doc), таблицам (.xlsx/.csv), тексту, Markdown и коду. Презентации (.pptx) приходят текстом слайдов только для чтения — переписать их нельзя, предложи вместо этого новый .docx или .md. PDF в чат не передаётся: попроси открыть его как текст или DOCX.
-- «Исправь ошибки», «перепиши», «сократи», «оформи», «приведи в порядок», «сделай красиво» — это команда заменить документ целиком: верни replace_document с полным новым текстом.
-- Дополнить документ или вставить фрагмент — insert_into_editor.
-- Запрещено отвечать «не могу редактировать документ Word», «вот рекомендации по оформлению» и вообще давать советы вместо правки. Если содержимого документа в сообщении нет, одной строкой попроси открыть файл и приложить его.
-- Оформление задавай Markdown-разметкой, приложение превратит её в настоящие стили Word: # — заголовок 1, ## — заголовок 2, ### — заголовок 3, - — маркированный список, 1. — нумерованный, **жирный**, > — цитата, | таблица |, --- — разделитель.
-- Перед блоком действия — одна короткая строка о том, что изменено. Сам текст документа в чат не дублируй: он попадёт в документ из блока действия.
-- Не добавляй в конец разбор «Что улучшено / что изменено», предложения («Хотите, я создам файл…», «Могу также…»), вопросы и списки вариантов: документ заканчивается содержательным текстом.
+- Имя открытого документа и права записи — в блоке «ОТКРЫТЫЙ ДОКУМЕНТ» ниже. Не додумывай права: если там написано «НЕТ», правку выполнять нельзя.
+- Если тебе переданы инструменты документа (get_document, replace_document, replace_block, insert_after, delete_block, find_replace, format) — правь документ только ими.
+- Если инструменты не переданы (модель без function calling), используй действие document_apply с массивом operations — те же операции, что и у инструментов.
+- Не создавай вместо правки новые файлы и не пиши «не могу редактировать документ Word».
+- Оформление в инструментах документа передавай HTML-тегами: <h1>–<h3>, <p>, <ul>/<ol> с <li>, <table>, <strong>, <em>, <u>, <s>, inline style для выравнивания, шрифта, размера и отступов. Markdown внутри HTML не применяй.
+- Сам текст документа в чат не дублируй: он попадает в документ. В чате — одна короткая строка отчёта о том, что изменено.
+- Не добавляй в конец разбор «Что улучшено / что изменено», предложения («Хотите, я создам файл…», «Могу также…»), вопросы и списки вариантов.
 - Не используй эмодзи ни в документе, ни в ответе.
-- Если блок действия вернуть не получается, отдай готовый текст документа обычным сообщением без вступления — приложение применит его к открытому документу.
 
 ВЛОЖЕННЫЕ ФАЙЛЫ
 - Если в сообщении пользователя есть блок «[Файл: имя]» — это уже прочитанное содержимое файла. Используй его напрямую.
@@ -222,6 +264,42 @@ export function resolveSystemPrompt(userPrompt?: string, appContext?: string): s
   if (!context) return operator;
 
   return `${operator}\n\nТекущее состояние WorkSpace (актуально на момент запроса):\n${context}`;
+}
+
+/** Системный промпт = пользовательский/встроенный + состояние приложения + блок документа. */
+function composeSystemPrompt(
+  settings: AISettings,
+  appContext?: string,
+  extraSystem?: string
+): string {
+  const base = resolveSystemPrompt(settings.systemPrompt, appContext);
+  const extra = (extraSystem || '').trim();
+  return extra ? `${base}\n\n${extra}` : base;
+}
+
+/** Провайдер ответил, что tools/function calling не поддерживаются. */
+function isToolsUnsupported(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status;
+  if (status !== 400 && status !== 404 && status !== 422) return false;
+  const message = String((error as Error)?.message || '');
+  return /tool|function|unsupported|not supported|invalid parameter/i.test(message);
+}
+
+function describeToolStatus(name: string): string {
+  switch (name) {
+    case 'get_document':
+      return 'Читаю документ…';
+    case 'replace_document':
+      return 'Переписываю документ…';
+    case 'find_replace':
+      return 'Ищу и заменяю текст…';
+    case 'format':
+      return 'Меняю оформление…';
+    case 'delete_block':
+      return 'Удаляю лишнее…';
+    default:
+      return 'Правлю документ…';
+  }
 }
 
 export const aiService = {
@@ -358,7 +436,8 @@ export const aiService = {
     settings: AISettings,
     callbacks: StreamCallbacks,
     signal?: AbortSignal,
-    appContext?: string
+    appContext?: string,
+    extraSystem?: string
   ): Promise<void> {
     // Адрес и модель обязаны соответствовать провайдеру: иначе ключ Starimg
     // уходит на api.openai.com и приложение «перестаёт подключаться».
@@ -382,11 +461,11 @@ export const aiService = {
 
     try {
       if (effective.provider === 'anthropic') {
-        await this.streamAnthropic(clean, effective, callbacks, signal, appContext);
+        await this.streamAnthropic(clean, effective, callbacks, signal, appContext, extraSystem);
       } else if (effective.provider === 'gemini') {
-        await this.streamGemini(clean, effective, callbacks, signal, appContext);
+        await this.streamGemini(clean, effective, callbacks, signal, appContext, extraSystem);
       } else {
-        await this.streamOpenAICompatible(clean, effective, callbacks, signal, appContext);
+        await this.streamOpenAICompatible(clean, effective, callbacks, signal, appContext, extraSystem);
       }
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') return;
@@ -395,7 +474,7 @@ export const aiService = {
   },
 
   /**
-   * Выполняет POST-запрос со стримингом.
+   * Низкоуровневый POST-запрос: отдаёт сырые чанки тела ответа.
    *
    * В Electron запрос идёт через главный процесс (`net`-модуль), потому что
    * браузерный fetch блокируется политикой CORS: часть OpenAI-совместимых
@@ -404,23 +483,19 @@ export const aiService = {
    *
    * В браузере (режим отладки без Electron) используется обычный fetch.
    */
-  async requestStream(
+  async transportStream(
     endpoint: string,
     headers: Record<string, string>,
-    body: unknown,
-    extractDelta: (payload: any) => string,
-    onChunk: (partial: string) => void,
+    bodyText: string,
+    onChunk: (chunk: string) => void,
     signal?: AbortSignal,
     label = 'Ошибка API'
-  ): Promise<string> {
-    const bodyText = JSON.stringify(body);
-
+  ): Promise<void> {
     /* ---------- Путь через Electron ---------- */
     if (isElectron() && window.electronAPI?.aiStream) {
       const requestId = uid('ai');
 
-      return new Promise<string>((resolve, reject) => {
-        const parser = createSSEParser(extractDelta, onChunk);
+      return new Promise<void>((resolve, reject) => {
         let settled = false;
 
         const cleanup = () => {
@@ -438,19 +513,21 @@ export const aiService = {
 
         const offChunk = window.electronAPI!.onAiChunk((data) => {
           if (data.requestId !== requestId) return;
-          parser.push(data.chunk);
+          onChunk(data.chunk);
         });
 
         const offEnd = window.electronAPI!.onAiEnd((data) => {
           if (data.requestId !== requestId) return;
-          finish(() => resolve(parser.result));
+          finish(() => resolve());
         });
 
         const offError = window.electronAPI!.onAiError((data) => {
           if (data.requestId !== requestId) return;
           finish(() => {
             if (data.status) {
-              reject(parseApiError(data.status, data.message, label));
+              const error = parseApiError(data.status, data.message, label);
+              (error as Error & { status?: number }).status = data.status;
+              reject(error);
             } else {
               reject(new Error(data.message || 'Неизвестная ошибка сети'));
             }
@@ -490,21 +567,234 @@ export const aiService = {
 
     if (!response.ok) {
       const errText = await response.text();
-      throw parseApiError(response.status, errText, label);
+      const error = parseApiError(response.status, errText, label);
+      (error as Error & { status?: number }).status = response.status;
+      throw error;
     }
     if (!response.body) throw new Error('Сервер вернул пустой ответ');
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
-    const parser = createSSEParser(extractDelta, onChunk);
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      parser.push(decoder.decode(value, { stream: true }));
+      onChunk(decoder.decode(value, { stream: true }));
+    }
+  },
+
+  /** Стриминговый запрос с накоплением текста. */
+  async requestStream(
+    endpoint: string,
+    headers: Record<string, string>,
+    body: unknown,
+    extractDelta: (payload: any) => string,
+    onChunk: (partial: string) => void,
+    signal?: AbortSignal,
+    label = 'Ошибка API'
+  ): Promise<string> {
+    const parser = createSSEParser(extractDelta, onChunk);
+    await this.transportStream(
+      endpoint,
+      headers,
+      JSON.stringify(body),
+      (chunk) => parser.push(chunk),
+      signal,
+      label
+    );
+    return parser.result;
+  },
+
+  /**
+   * Стриминговый запрос с доступом к каждому SSE-событию (нужен для tool_calls).
+   * Если провайдер проигнорировал stream и вернул обычный JSON — разбирает его.
+   */
+  async requestEventStream(
+    endpoint: string,
+    headers: Record<string, string>,
+    body: unknown,
+    onPayload: (payload: any) => void,
+    signal?: AbortSignal,
+    label = 'Ошибка API'
+  ): Promise<void> {
+    const parser = createPayloadParser(onPayload);
+    let raw = '';
+    await this.transportStream(
+      endpoint,
+      headers,
+      JSON.stringify(body),
+      (chunk) => {
+        raw += chunk;
+        parser.push(chunk);
+      },
+      signal,
+      label
+    );
+
+    if (parser.count === 0 && raw.trim()) {
+      try {
+        onPayload(JSON.parse(raw));
+      } catch {
+        throw new Error('Сервер вернул ответ не в формате SSE или JSON');
+      }
+    }
+  },
+
+  /**
+   * Агентный цикл с нативным function calling.
+   *
+   * Модель вызывает инструменты, приложение выполняет их над живым документом,
+   * результат возвращается модели, и так до финального текстового ответа.
+   * Число итераций ограничено.
+   */
+  async runDocumentAgent(options: DocumentAgentOptions): Promise<DocumentAgentResult> {
+    const effective = normalizeSettings(options.settings);
+    const endpoint = this.resolveEndpoint(effective);
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (effective.apiKey.trim()) headers['Authorization'] = `Bearer ${effective.apiKey.trim()}`;
+    if (effective.provider === 'openrouter') {
+      headers['HTTP-Referer'] = 'https://workspace.local';
+      headers['X-Title'] = 'WorkSpace';
     }
 
-    return parser.result;
+    const apiMessages: any[] = [
+      {
+        role: 'system',
+        content: composeSystemPrompt(effective, options.appContext, options.systemPromptExtra),
+      },
+      ...options.messages
+        .filter((message) => message.role !== 'system' && message.content.trim())
+        .map((message) => ({ role: message.role, content: buildMessageText(message) })),
+    ];
+
+    const maxIterations = Math.max(1, Math.min(options.maxIterations ?? 8, 16));
+    let lastText = '';
+    let toolCallsCount = 0;
+
+    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      const textParts: string[] = [];
+      const calls = new Map<number, { id: string; name: string; args: string }>();
+
+      try {
+        await this.requestEventStream(
+          endpoint,
+          headers,
+          {
+            model: effective.model || 'gpt-4o-mini',
+            messages: apiMessages,
+            tools: options.tools,
+            tool_choice: 'auto',
+            temperature: effective.temperature,
+            max_tokens: Math.max(effective.maxTokens, 4096),
+            stream: true,
+          },
+          (payload) => {
+            const choice = payload?.choices?.[0];
+            if (!choice) return;
+
+            const delta = choice.delta ?? choice.message ?? {};
+            if (typeof delta.content === 'string') textParts.push(delta.content);
+
+            const toolDeltas = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+            for (const part of toolDeltas) {
+              const index = typeof part.index === 'number' ? part.index : calls.size;
+              const entry = calls.get(index) ?? { id: '', name: '', args: '' };
+              if (typeof part.id === 'string' && part.id) entry.id = part.id;
+
+              const fn = part.function ?? {};
+              if (typeof fn.name === 'string' && fn.name) {
+                // Имя обычно приходит целиком в одном чанке, но некоторые
+                // шлюзы дробят его — дописываем только новые фрагменты.
+                if (!entry.name) entry.name = fn.name;
+                else if (fn.name !== entry.name && !entry.name.endsWith(fn.name)) entry.name += fn.name;
+              }
+              if (typeof fn.arguments === 'string') entry.args += fn.arguments;
+              else if (fn.arguments && typeof fn.arguments === 'object') {
+                entry.args = JSON.stringify(fn.arguments);
+              }
+              calls.set(index, entry);
+            }
+          },
+          options.signal,
+          'Ошибка API'
+        );
+      } catch (error) {
+        if ((error as Error)?.name === 'AbortError') throw error;
+        if (isToolsUnsupported(error)) {
+          throw new ToolsUnsupportedError((error as Error).message);
+        }
+        throw error;
+      }
+
+      const text = textParts.join('');
+      if (text.trim()) lastText = text.trim();
+
+      if (calls.size === 0) {
+        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount };
+      }
+
+      const toolCalls = [...calls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, call], order) => ({
+          id: call.id || `call_${iteration}_${order}`,
+          type: 'function' as const,
+          function: { name: call.name, arguments: call.args || '{}' },
+        }))
+        .filter((call) => call.function.name);
+
+      if (toolCalls.length === 0) {
+        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount };
+      }
+
+      apiMessages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
+
+      for (const call of toolCalls) {
+        toolCallsCount += 1;
+        let result: unknown;
+
+        let args: Record<string, unknown>;
+        try {
+          args = call.function.arguments.trim()
+            ? (JSON.parse(call.function.arguments) as Record<string, unknown>)
+            : {};
+        } catch {
+          result = {
+            ok: false,
+            message: `Аргументы инструмента ${call.function.name} — некорректный JSON. Вызови инструмент заново.`,
+          };
+          apiMessages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: JSON.stringify(result),
+          });
+          continue;
+        }
+
+        options.onStatus?.(describeToolStatus(call.function.name));
+        try {
+          result = await options.onToolCall(call.function.name, args);
+        } catch (error) {
+          result = {
+            ok: false,
+            message: (error as Error).message || 'Ошибка выполнения инструмента',
+          };
+        }
+
+        const serialized = JSON.stringify(result ?? { ok: true });
+        apiMessages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: serialized.length > 24000 ? `${serialized.slice(0, 24000)}…` : serialized,
+        });
+      }
+    }
+
+    return {
+      text: lastText || 'Достигнут лимит шагов работы с документом. Уточните задачу или продолжите отдельным сообщением.',
+      iterations: maxIterations,
+      toolCalls: toolCallsCount,
+    };
   },
 
   async streamOpenAICompatible(
@@ -512,7 +802,8 @@ export const aiService = {
     settings: AISettings,
     { onChunk, onFinish }: StreamCallbacks,
     signal?: AbortSignal,
-    appContext?: string
+    appContext?: string,
+    extraSystem?: string
   ): Promise<void> {
     const endpoint = this.resolveEndpoint(settings);
 
@@ -530,7 +821,7 @@ export const aiService = {
       {
         model: settings.model || 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: resolveSystemPrompt(settings.systemPrompt, appContext) },
+          { role: 'system', content: composeSystemPrompt(settings, appContext, extraSystem) },
           ...messages.map((m) => ({ role: m.role, content: buildMessageText(m) })),
         ],
         temperature: settings.temperature,
@@ -551,7 +842,8 @@ export const aiService = {
     settings: AISettings,
     { onChunk, onFinish }: StreamCallbacks,
     signal?: AbortSignal,
-    appContext?: string
+    appContext?: string,
+    extraSystem?: string
   ): Promise<void> {
     const full = await this.requestStream(
       'https://api.anthropic.com/v1/messages',
@@ -563,7 +855,7 @@ export const aiService = {
       },
       {
         model: settings.model || 'claude-3-5-sonnet-20241022',
-        system: resolveSystemPrompt(settings.systemPrompt, appContext),
+        system: composeSystemPrompt(settings, appContext, extraSystem),
         messages: messages.map((m) => ({
           role: m.role === 'assistant' ? 'assistant' : 'user',
           content: buildMessageText(m),
@@ -586,7 +878,8 @@ export const aiService = {
     settings: AISettings,
     { onChunk, onFinish }: StreamCallbacks,
     signal?: AbortSignal,
-    appContext?: string
+    appContext?: string,
+    extraSystem?: string
   ): Promise<void> {
     const model = settings.model || 'gemini-1.5-flash';
     const endpoint =
@@ -601,7 +894,9 @@ export const aiService = {
           role: m.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: buildMessageText(m) }],
         })),
-        systemInstruction: { parts: [{ text: resolveSystemPrompt(settings.systemPrompt, appContext) }] },
+        systemInstruction: {
+          parts: [{ text: composeSystemPrompt(settings, appContext, extraSystem) }],
+        },
         generationConfig: {
           temperature: settings.temperature,
           maxOutputTokens: settings.maxTokens,

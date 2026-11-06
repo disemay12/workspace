@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { IconButton, Spinner } from '../ui';
+import { registerDocumentController } from '../../services/docBridge';
 
 interface Props {
   tab: OpenTab;
@@ -143,6 +144,8 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
   const [format, setFormat] = useState<FormatState>(EMPTY_FORMAT);
   /** HTML до последней замены ассистентом — для кнопки «Вернуть прежний текст». */
   const [aiSnapshot, setAiSnapshot] = useState<string | null>(null);
+  /** Серия правок одного ответа ассистента = один шаг отката. */
+  const aiTxnRef = useRef('');
   /** Сколько изображений удалось сохранить при последней замене. */
   const [restoredImages, setRestoredImages] = useState(0);
 
@@ -282,6 +285,34 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
     onSave();
   }, [onChange, onSave]);
 
+  /* ---------------- Мост для инструментов ассистента ---------------- */
+
+  useEffect(() => {
+    return registerDocumentController({
+      tabId: tab.id,
+      readHtml: () => editorRef.current?.innerHTML ?? '',
+      writeHtml: (html, transactionId) => {
+        const root = editorRef.current;
+        if (!root) return;
+
+        // Первая правка серии запоминает документ целиком: «Вернуть прежний
+        // текст» откатывает весь ответ ассистента, а не последний блок.
+        if (aiTxnRef.current !== transactionId) {
+          aiTxnRef.current = transactionId;
+          setAiSnapshot(root.innerHTML);
+          setRestoredImages(0);
+          setAiError('');
+        }
+
+        isSyncing.current = true;
+        root.innerHTML = html || '<p></p>';
+        setWordCount(countWords(root.innerText));
+        isSyncing.current = false;
+        handleInput();
+      },
+    });
+  }, [tab.id, handleInput]);
+
   /* ---------------- Ответ AI ---------------- */
 
   useEffect(() => {
@@ -332,6 +363,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
       const html = markdownToDocumentHtml(detail.text || '');
       isSyncing.current = true;
       setAiSnapshot(root.innerHTML);
+      aiTxnRef.current = 'manual';
       // Картинки исходного документа не должны исчезать при переписывании:
       // модель их не воспроизводит, поэтому возвращаем на прежние места.
       const images = collectAnchoredImages(root);
@@ -360,6 +392,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
     root.innerHTML = aiSnapshot || '<p></p>';
     setWordCount(countWords(root.innerText));
     setAiSnapshot(null);
+    aiTxnRef.current = '';
     setRestoredImages(0);
     isSyncing.current = false;
     handleInput();
@@ -866,7 +899,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
         <div className="flex shrink-0 items-center gap-2 border-b border-blue-500/40 bg-blue-500/10 px-3 py-1.5 text-[11px] text-ws">
           <Sparkles size={11} className="text-blue-400" />
           <span className="flex-1">
-            Документ переписан ассистентом
+            Документ изменён ассистентом
             {restoredImages > 0 && ` · изображений сохранено: ${restoredImages}`}
           </span>
           <button

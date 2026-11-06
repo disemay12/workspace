@@ -29,6 +29,7 @@ BuildersWorkspace/
 
 # ---------- Тестовые артефакты проверок ----------
 test-workspace/
+test-workspace-doc-agent/
 *-check.json
 final-report.txt
 smoke-out.txt

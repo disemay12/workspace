@@ -81,7 +81,7 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
           blocks.push(kind === 'ul' ? '<ul>' : '<ol>');
           list = { numId, kind };
         }
-        blocks.push('<li>' + (await paragraphInner(child, images)) + '</li>');
+        blocks.push('<li' + listItemStyle(child) + '>' + (await paragraphInner(child, images)) + '</li>');
       } else {
         closeList();
         blocks.push(renderParagraph(child, await paragraphInner(child, images)));
@@ -177,13 +177,43 @@ function paragraphNumbering(p: Element): string | null {
   return numPr ? attr(firstByLocal(numPr, 'numId'), 'val') : null;
 }
 
+/** Оформление элемента списка: выравнивание и отступы. */
+function listItemStyle(p: Element): string {
+  const pPr = firstByLocal(p, 'pPr');
+  const align = pPr ? attr(firstByLocal(pPr, 'jc'), 'val') : '';
+  const css = [align ? `text-align:${cssAlign(align)}` : '', paragraphIndent(pPr)]
+    .filter(Boolean)
+    .join(';');
+  return css ? ` style="${css}"` : '';
+}
+
 function renderParagraph(p: Element, inner: string): string {
   const pPr = firstByLocal(p, 'pPr');
   const style = pPr ? attr(firstByLocal(pPr, 'pStyle'), 'val') : '';
   const align = pPr ? attr(firstByLocal(pPr, 'jc'), 'val') : '';
-  const styleAttr = align ? ` style="text-align:${cssAlign(align)}"` : '';
+  const css = [align ? `text-align:${cssAlign(align)}` : '', paragraphIndent(pPr)]
+    .filter(Boolean)
+    .join(';');
+  const styleAttr = css ? ` style="${css}"` : '';
   const tag = headingTag(style);
   return `<${tag}${styleAttr}>${inner || '<br>'}</${tag}>`;
+}
+
+/** Отступы абзаца из OOXML: twips → pt для CSS. */
+function paragraphIndent(pPr: Element | null): string {
+  if (!pPr) return '';
+  const ind = firstByLocal(pPr, 'ind');
+  if (!ind) return '';
+
+  const parts: string[] = [];
+  const left = Number(attr(ind, 'left') || attr(ind, 'start') || 0);
+  const firstLine = Number(attr(ind, 'firstLine') || 0);
+  const hanging = Number(attr(ind, 'hanging') || 0);
+
+  if (left > 0) parts.push(`margin-left:${left / 20}pt`);
+  if (firstLine > 0) parts.push(`text-indent:${firstLine / 20}pt`);
+  if (hanging > 0) parts.push(`text-indent:-${hanging / 20}pt`);
+  return parts.join(';');
 }
 
 function headingTag(style: string): string {
@@ -314,7 +344,11 @@ function renderChildren(
       list = tag;
       for (const li of [...node.children]) {
         if (li.tagName.toLowerCase() !== 'li') continue;
-        xml += paragraphXml(runsFromInline(li, {}, images, nextId), { list: tag });
+        xml += paragraphXml(runsFromInline(li, {}, images, nextId), {
+          list: tag,
+          align: readAlign(li),
+          ...readIndent(li),
+        });
       }
       closeList();
       continue;
@@ -335,7 +369,11 @@ function renderChildren(
     closeList();
     const align = readAlign(node);
     const style = blockStyle(tag);
-    xml += paragraphXml(runsFromInline(node, {}, images, nextId), { align, style });
+    xml += paragraphXml(runsFromInline(node, {}, images, nextId), {
+      align,
+      style,
+      ...readIndent(node),
+    });
   }
   return xml;
 }
@@ -346,6 +384,8 @@ interface ParagraphOptions {
   list?: 'ul' | 'ol';
   /** Абзац внутри таблицы: без отступа Normal, иначе ячейки раздуваются. */
   tight?: boolean;
+  indentLeftPt?: number;
+  firstLinePt?: number;
 }
 
 function paragraphXml(runs: string, options: ParagraphOptions): string {
@@ -358,11 +398,43 @@ function paragraphXml(runs: string, options: ParagraphOptions): string {
   if (options.list) {
     props.push(`<w:numPr><w:ilvl w:val="0"/><w:numId w:val="${options.list === 'ul' ? '1' : '2'}"/></w:numPr>`);
   }
+  if (options.indentLeftPt || options.firstLinePt) {
+    const left = Math.round((options.indentLeftPt ?? 0) * 20);
+    const firstLine = Math.round((options.firstLinePt ?? 0) * 20);
+    const attrs: string[] = [];
+    if (left) attrs.push(`w:left="${left}"`);
+    if (firstLine > 0) attrs.push(`w:firstLine="${firstLine}"`);
+    else if (firstLine < 0) attrs.push(`w:hanging="${Math.abs(firstLine)}"`);
+    if (attrs.length > 0) props.push(`<w:ind ${attrs.join(' ')}/>`);
+  }
   if (options.align && options.align !== 'left') {
     props.push(`<w:jc w:val="${options.align}"/>`);
   }
   const pPr = props.length ? `<w:pPr>${props.join('')}</w:pPr>` : '';
   return `<w:p>${pPr}${runs || '<w:r><w:t></w:t></w:r>'}</w:p>`;
+}
+
+/** Отступы из inline-стилей блока: margin-left / padding-left и text-indent. */
+function readIndent(el: Element): { indentLeftPt?: number; firstLinePt?: number } {
+  const css = el.getAttribute('style') ?? '';
+  const left = cssLengthToPt(cssValue(css, 'margin-left') || cssValue(css, 'padding-left'));
+  const firstLine = cssLengthToPt(cssValue(css, 'text-indent'));
+  return {
+    indentLeftPt: left ?? undefined,
+    firstLinePt: firstLine ?? undefined,
+  };
+}
+
+function cssLengthToPt(value: string): number | null {
+  if (!value) return null;
+  const match = value.match(/^(-?[\d.]+)\s*(pt|px|em|rem)?$/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  const unit = (match[2] || 'pt').toLowerCase();
+  if (unit === 'px') return Math.round(amount * 0.75 * 2) / 2;
+  if (unit === 'em' || unit === 'rem') return Math.round(amount * 15 * 2) / 2;
+  return amount;
 }
 
 interface RunStyle {
