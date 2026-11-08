@@ -253,6 +253,22 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
   const versionsRef = useRef<DocumentVersion[]>(versionStore.get(tab.id) ?? []);
   const [, setVersionsTick] = useState(0);
   const [showOutline, setShowOutline] = useState(true);
+  const [zoom, setZoom] = useState(1);
+  const zoomScrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const element = zoomScrollRef.current;
+    if (!element) return;
+    const onWheel = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      setZoom((previous) =>
+        Math.min(2, Math.max(0.5, previous - event.deltaY * 0.0015))
+      );
+    };
+    element.addEventListener('wheel', onWheel, { passive: false });
+    return () => element.removeEventListener('wheel', onWheel);
+  }, [loading]);
   const [findOpen, setFindOpen] = useState(false);
   const [findText, setFindText] = useState('');
   const [replaceWith, setReplaceWith] = useState('');
@@ -1958,7 +1974,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
             )}
           </aside>
         )}
-        <div className="min-h-0 flex-1 overflow-y-auto bg-ws-editor-alt p-6">
+        <div ref={zoomScrollRef} className="min-h-0 flex-1 overflow-y-auto bg-ws-editor-alt p-6">
           <div
             ref={editorRef}
             contentEditable
@@ -1974,7 +1990,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
             }}
             onBlur={handleInput}
             className="doc-canvas mx-auto min-h-[1000px] w-full max-w-[820px] rounded-sm border border-ws bg-ws-surface p-14 text-ws shadow-ws focus:outline-none select-text"
-            style={canvasStyle}
+            style={{ ...canvasStyle, zoom }}
           />
         </div>
       </div>
@@ -1985,6 +2001,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
         <div className="flex items-center gap-3">
           {format.fontName && <span>{format.fontName}</span>}
           {format.fontSizePt && <span>{format.fontSizePt} пт</span>}
+          <span>Масштаб: {Math.round(zoom * 100)}%</span>
           <span>Слов: {wordCount.toLocaleString('ru-RU')}</span>
           {tab.isDirty && <span className="text-ws-warning">● Изменено</span>}
         </div>

@@ -16,7 +16,9 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
     import('./lib/markdownOps'),
     import('./lib/customStyles'),
     import('./lib/aiDocument'),
-  ]).then(([model, workspacePath, history, docx, session, markdownOps, customStyles, aiDocument]) => {
+    import('./lib/pptx'),
+    import('./lib/pptxTemplate'),
+  ]).then(([model, workspacePath, history, docx, session, markdownOps, customStyles, aiDocument, pptx, pptxTemplate]) => {
     const target = window as unknown as {
       __documentModel?: typeof model;
       __workspacePath?: typeof workspacePath;
@@ -26,6 +28,8 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
       __markdownOps?: typeof markdownOps;
       __customStyles?: typeof customStyles;
       __aiDocument?: typeof aiDocument;
+      __pptx?: typeof pptx;
+      __pptxTemplate?: typeof pptxTemplate;
     };
     target.__documentModel = model;
     target.__workspacePath = workspacePath;
@@ -35,6 +39,8 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
     target.__markdownOps = markdownOps;
     target.__customStyles = customStyles;
     target.__aiDocument = aiDocument;
+    target.__pptx = pptx;
+    target.__pptxTemplate = pptxTemplate;
   });
 }
 

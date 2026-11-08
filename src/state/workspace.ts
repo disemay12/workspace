@@ -4,6 +4,7 @@ import { fileSystemService, getFileType } from '../services/fileSystemService';
 import { extName, baseName, joinPath, uid } from '../lib/utils';
 import { generateDocxBase64, generateExcelBase64 } from '../services/aiActions';
 import { htmlToDocxBase64 } from '../lib/docx';
+import { BLANK_PPTX_BASE64 } from '../lib/pptxTemplate';
 import { docxPathFor, extractLegacyDocText, plainTextToHtml } from '../lib/legacyDoc';
 
 /** Типы файлов, содержимое которых читается как base64 (бинарные офисные форматы). */
@@ -141,6 +142,10 @@ export function useWorkspace() {
       const isBinary = BINARY_TYPES.includes(type) || isBinaryExcel(ext);
       if (isBinary) {
         const res = await fileSystemService.readFile(filePath, 'base64');
+        if (type === 'powerpoint' && !res.content.trim()) {
+          await fileSystemService.writeFile(filePath, BLANK_PPTX_BASE64, 'base64');
+          return { content: BLANK_PPTX_BASE64, encoding: 'base64' as const, isBinary: true };
+        }
         return { content: res.content, encoding: 'base64' as const, isBinary: true };
       }
       const res = await fileSystemService.readFile(filePath, 'utf-8');
@@ -403,6 +408,9 @@ export function useWorkspace() {
             payloadEncoding = 'base64';
           } else if (ext === 'xlsx' || ext === 'xlsm') {
             payload = generateExcelBase64([], [], 'Лист 1');
+            payloadEncoding = 'base64';
+          } else if (ext === 'pptx') {
+            payload = BLANK_PPTX_BASE64;
             payloadEncoding = 'base64';
           }
         }

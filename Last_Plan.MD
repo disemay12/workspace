@@ -308,7 +308,10 @@ npm run checks:sync
 | 2026-11-08 | 1.2 | `docx-fidelity-check`: импортированные runs получают `data-run-id` | PASS |
 | 2026-11-08 | fix | `replace_document` отклоняет отчёт «Меняю должность… / Все разделы обновлены… / сохранить?» | PASS |
 | 2026-11-08 | fix | Предупреждение о низком integrity показывается только при реальной ошибке записи в Documents; сборка обновлена в `C:\WorkSpace` | PASS |
+| 2026-11-08 | fix | Нативные стили xlsx: заливка, шрифт, границы и числовой формат видны в реальном Excel | PASS |
+| 2026-11-08 | fix | Ctrl+колесо меняет масштаб Word и Excel (50–200%) | PASS |
+| 2026-11-08 | fix | Новый `.pptx` создаётся из валидного шаблона; пустой файл чинится при открытии | PASS |
 | 2026-11-07 | 3 | `doc-agent-check`: AI создаёт верхний колонтитул, тело не меняется | PASS |
-| 2026-11-08 | финальный прогон | `typecheck`, `build:vite`, `build:electron`, `doc-agent-check` 59/59, `model-check` 67/67, `docx-fidelity-check` 11/11 + perf 400 абзацев, `docx-check` PASS, `insert-check` 4/4, `xlsx-save-check` 15/15, `formula-check` 93/93, `formula-mode-check` 30/30 | PASS |
+| 2026-11-08 | финальный прогон | `typecheck`, `build:vite`, `build:electron`, `doc-agent-check` 61/61, `model-check` 68/68, `docx-fidelity-check` 11/11 + perf 400 абзацев, `docx-check` PASS, `insert-check` 4/4, `xlsx-save-check` 22/22, `formula-check` 93/93, `formula-mode-check` 30/30 | PASS |
 | 2026-11-07 | 2.2 | `model-check`: форматирование половины слова | PASS, соседние буквы не затронуты |
 | 2026-11-07 | регресс | `doc-agent-check` | PASS, 26/26, `errors: []` |

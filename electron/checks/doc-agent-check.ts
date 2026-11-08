@@ -1858,6 +1858,27 @@ async function main() {
       ...excelWriteState,
     });
 
+    const excelZoomState = await js(`
+      const table = document.querySelector('table[style*="table-layout"]');
+      const target = table?.parentElement;
+      if (!table || !target) return null;
+      target.dispatchEvent(new WheelEvent('wheel', { deltaY: -200, ctrlKey: true, bubbles: true, cancelable: true }));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const status = [...document.querySelectorAll('span')]
+        .map((node) => node.textContent || '')
+        .find((text) => text.includes('Масштаб:'));
+      const zoom = table.style.zoom;
+      const styleAttr = table.getAttribute('style') || '';
+      const computed = getComputedStyle(table).zoom || '';
+      target.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, ctrlKey: true, bubbles: true, cancelable: true }));
+      return { zoom, styleAttr, computed, status };
+    `);
+    step('excelZoom', {
+      zoomed: /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(excelZoomState?.styleAttr || '') ||
+        Number.parseFloat(excelZoomState?.computed || '1') > 1,
+      status: /Масштаб: \d+%/.test(excelZoomState?.status || ''),
+    });
+
     const excelSheetSend = await send('Добавь лист Итоги');
     await sleep(2000);
     await win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'S', modifiers: ['control'] });
@@ -2830,6 +2851,27 @@ async function main() {
       sent: annotationSend.sent,
       idle: annotationSend.idle,
       ...annotationState,
+    });
+
+    const wordZoomState = await js(`
+      const canvas = document.querySelector('[contenteditable=true]');
+      const target = canvas?.parentElement;
+      if (!canvas || !target) return null;
+      target.dispatchEvent(new WheelEvent('wheel', { deltaY: -200, ctrlKey: true, bubbles: true, cancelable: true }));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const status = [...document.querySelectorAll('span')]
+        .map((node) => node.textContent || '')
+        .find((text) => text.includes('Масштаб:'));
+      const zoom = canvas.style.zoom;
+      const styleAttr = canvas.getAttribute('style') || '';
+      const computed = getComputedStyle(canvas).zoom || '';
+      target.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, ctrlKey: true, bubbles: true, cancelable: true }));
+      return { zoom, styleAttr, computed, status };
+    `);
+    step('wordZoom', {
+      zoomed: /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(wordZoomState?.styleAttr || '') ||
+        Number.parseFloat(wordZoomState?.computed || '1') > 1,
+      status: /Масштаб: \d+%/.test(wordZoomState?.status || ''),
     });
 
     (out as any).summary = {

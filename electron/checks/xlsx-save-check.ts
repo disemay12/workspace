@@ -6,6 +6,9 @@
  * Проверяет полный цикл: сетка -> книга -> base64 -> чтение обратно.
  */
 import * as XLSX from 'xlsx';
+import JSZip from 'jszip';
+import { emptySheetMeta, type WorkbookMeta } from '../../src/lib/sheetFormatting';
+import { injectStylesIntoXlsx } from '../../src/lib/xlsxStyles';
 
 const failures: string[] = [];
 let passed = 0;
@@ -118,14 +121,46 @@ const specialSheet = XLSX.read(specialBase64, { type: 'base64' }).Sheets['S'];
 check('формула в первой ячейке сохранена', specialSheet['A1']?.f, 'SUM(A2:A3)');
 check('точка с запятой в тексте сохранена', specialSheet['B1']?.v, 'текст; с точкой с запятой');
 
-console.log('='.repeat(72));
-console.log('  ПРОВЕРКА СОХРАНЕНИЯ ФОРМУЛ В .XLSX');
-console.log('='.repeat(72));
-console.log(`  Пройдено: ${passed}, провалов: ${failures.length}`);
-if (failures.length > 0) {
-  console.log('-'.repeat(72));
-  for (const f of failures) console.log(`   - ${f}`);
+async function main() {
+  /* ---- Нативные стили: заливка, шрифт, границы, формат ---- */
+  const styledMeta: WorkbookMeta = {
+    S: {
+      ...emptySheetMeta(),
+      cells: {
+        A1: { fill: '#DDEBF7', bold: true },
+        B1: { fill: '#DDEBF7' },
+        A2: { borders: { bottom: true } },
+        B2: { numberFormat: 'currency' },
+      },
+    },
+  };
+  const styledBase64 = await injectStylesIntoXlsx(specialBase64, styledMeta);
+  const styleZip = await JSZip.loadAsync(styledBase64, { base64: true });
+  const stylesXml = (await styleZip.file('xl/styles.xml')?.async('string')) ?? '';
+  const styledSheet = (await styleZip.file('xl/worksheets/sheet1.xml')?.async('string')) ?? '';
+  check('заливка записана в styles.xml', stylesXml.includes('FFDDEBF7'), true);
+  check('заливка solid', stylesXml.includes('patternFill patternType="solid"'), true);
+  check('жирный шрифт записан', stylesXml.includes('<b/>'), true);
+  check('границы записаны', stylesXml.includes('style="thin"'), true);
+  check('числовой формат записан', /<numFmt\b/.test(stylesXml), true);
+  check('ячейка A1 получила style index', /<c r="A1"[^>]*\bs="\d+"/.test(styledSheet), true);
+  check(
+    'WorkSpace читает файл после патча',
+    Boolean(XLSX.read(styledBase64, { type: 'base64' }).Sheets.S?.['A1']),
+    true
+  );
+
+  console.log('='.repeat(72));
+  console.log('  ПРОВЕРКА СОХРАНЕНИЯ ФОРМУЛ В .XLSX');
+  console.log('='.repeat(72));
+  console.log(`  Пройдено: ${passed}, провалов: ${failures.length}`);
+  if (failures.length > 0) {
+    console.log('-'.repeat(72));
+    for (const f of failures) console.log(`   - ${f}`);
+  }
+  console.log('='.repeat(72));
+  console.log(failures.length === 0 ? '  ИТОГ: ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ' : '  ИТОГ: ЕСТЬ ПРОВАЛЫ');
+  process.exit(failures.length === 0 ? 0 : 1);
 }
-console.log('='.repeat(72));
-console.log(failures.length === 0 ? '  ИТОГ: ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ' : '  ИТОГ: ЕСТЬ ПРОВАЛЫ');
-process.exit(failures.length === 0 ? 0 : 1);
+
+void main();

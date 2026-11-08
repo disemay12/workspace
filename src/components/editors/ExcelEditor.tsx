@@ -50,6 +50,7 @@ import * as SheetFmt from '../../lib/sheetFormatting';
 import { Button, Spinner } from '../ui';
 import { SheetChart, ChartSeries } from './SheetChart';
 import { injectChartsIntoXlsx } from '../../lib/xlsxCharts';
+import { injectStylesIntoXlsx } from '../../lib/xlsxStyles';
 import { detectMarkdownTables, normalizeTableValue } from '../../services/aiActions';
 import {
   columnName,
@@ -307,6 +308,21 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
 
   const formula = useFormulaMode();
   const gridRef = useRef<HTMLDivElement>(null);
+  const [zoom, setZoom] = useState(1);
+
+  useEffect(() => {
+    const element = gridRef.current;
+    if (!element) return;
+    const onWheel = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      setZoom((previous) =>
+        Math.min(2, Math.max(0.5, previous - event.deltaY * 0.0015))
+      );
+    };
+    element.addEventListener('wheel', onWheel, { passive: false });
+    return () => element.removeEventListener('wheel', onWheel);
+  }, [loading]);
   const gridFocusedRef = useRef(false);
   const formulaInputRef = useRef<HTMLInputElement>(null);
   const cellEditorRef = useRef<HTMLInputElement>(null);
@@ -477,7 +493,11 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   );
   // Объединённые ячейки нельзя рисовать частями: при слияниях показываем лист целиком.
   const isVirtual =
-    totalRows > 80 && mergeInfo.anchors.size === 0 && activeMeta.freezeRows === 0 && !activeFilter;
+    zoom === 1 &&
+    totalRows > 80 &&
+    mergeInfo.anchors.size === 0 &&
+    activeMeta.freezeRows === 0 &&
+    !activeFilter;
 
   const firstVisible = SheetFmt.findRowAtOffset(rowOffsets, scrollTop);
   const startRow = isVirtual ? Math.max(0, firstVisible - OVERSCAN) : 0;
@@ -604,6 +624,15 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           content = XLSX.write(wb, { bookType: 'xlsm', type: 'base64', bookVBA: true });
         } else {
           content = XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
+        }
+
+        // Нативные стили ячеек: SheetJS CE не пишет заливку/шрифт/границы.
+        if (!isCsv && tab.extension !== 'xlsm') {
+          try {
+            content = await injectStylesIntoXlsx(content, metaRef.current);
+          } catch (err) {
+            console.error('Не удалось записать стили в xlsx', err);
+          }
         }
 
         // Нативные диаграммы Excel (OOXML) — без установленного Excel
@@ -3285,7 +3314,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         }}
         className="h-full overflow-auto bg-ws-editor focus:outline-none"
       >
-        <table className="border-collapse select-text" style={{ tableLayout: 'fixed' }}>
+        <table className="border-collapse select-text" style={{ tableLayout: 'fixed', zoom }}>
           <colgroup>
             <col style={{ width: 48 }} />
             {(grid[0] ?? []).map((_, c) => (
@@ -3689,6 +3718,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
             {stats.rows} × {stats.cols}
           </span>
           <span>Заполнено: {stats.filled}</span>
+          <span>Масштаб: {Math.round(zoom * 100)}%</span>
           {formulaCount > 0 && <span className="text-emerald-500">Формул: {formulaCount}</span>}
           {tab.isDirty && <span className="text-ws-warning">● Изменено</span>}
         </div>

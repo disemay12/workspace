@@ -82,7 +82,7 @@ async function main() {
     if (!ready) throw new Error('window.__documentModel не появился: тестовый мост не собран');
 
     const steps = await win.webContents.executeJavaScript(`
-      (() => {
+      (async () => {
         const M = window.__documentModel;
         const run = (html, tool, args) => M.applyDocumentTool(html, tool, args || {});
         const steps = [];
@@ -865,6 +865,16 @@ async function main() {
           updated: Boolean(updated) && updated.capabilities.write === false,
           listed: listed.length === 1 && listed[0].capabilities.tools.length === 2,
           removed: S.getDocumentSession('tab-1') === undefined,
+        });
+
+        const PPT = window.__pptx;
+        const PPT_TPL = window.__pptxTemplate;
+        const blank = PPT && PPT_TPL ? await PPT.parsePptx(PPT_TPL.BLANK_PPTX_BASE64) : null;
+        add('blankPptx', {
+          parsed: Boolean(blank),
+          slides: Boolean(blank && blank.slides.length === 1),
+          title: Boolean(blank && blank.slides[0]?.shapes.some((shape) => shape.text.includes('Новый слайд'))),
+          layouts: Boolean(blank && blank.layouts.length > 0),
         });
 
         return steps;
