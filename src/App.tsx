@@ -9,6 +9,7 @@ import {
   Sparkles,
   Maximize2,
   Save,
+  Pencil,
 } from 'lucide-react';
 
 import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment, FileType } from './types';
@@ -175,6 +176,12 @@ const App: React.FC = () => {
     kind: 'file' | 'folder';
     name: string;
   }>({ open: false, parentDir: '', kind: 'file', name: '' });
+  const [renameDialog, setRenameDialog] = useState<{
+    open: boolean;
+    path: string;
+    name: string;
+    busy: boolean;
+  }>({ open: false, path: '', name: '', busy: false });
   const [unsavedDialog, setUnsavedDialog] = useState<{ open: boolean; tabId: string }>({
     open: false,
     tabId: '',
@@ -2178,8 +2185,7 @@ const App: React.FC = () => {
         ws.flash(`Не удалось открыть: ${(err as Error).message}`);
       }
     } else if (action === 'rename') {
-      const next = window.prompt('Новое имя:', item.name);
-      if (next && next.trim() && next.trim() !== item.name) await ws.renamePath(item.path, next.trim());
+      setRenameDialog({ open: true, path: item.path, name: item.name, busy: false });
     } else if (action === 'delete') {
       if (window.confirm('Удалить «' + item.name + '»' + (item.isDirectory ? ' и всё его содержимое' : '') + '?')) await ws.deletePath(item.path);
     } else if (action === 'copy-path') {
@@ -2863,7 +2869,61 @@ const App: React.FC = () => {
         </div>
       </Modal>
 
-      {/* Диалог несохранённых изменений */}
+      {/* Переименование файла или папки */}
+      <Modal
+        open={renameDialog.open}
+        onClose={() => setRenameDialog((d) => ({ ...d, open: false }))}
+        title="Переименовать"
+        icon={<Pencil size={15} className="text-ws-accent" />}
+        width="max-w-md"
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => setRenameDialog((d) => ({ ...d, open: false }))}
+            >
+              Отмена
+            </Button>
+            <Button
+              variant="primary"
+              disabled={!renameDialog.name.trim() || renameDialog.busy}
+              onClick={async () => {
+                const next = renameDialog.name.trim();
+                if (!next) return;
+                setRenameDialog((d) => ({ ...d, busy: true }));
+                const ok = await ws.renamePath(renameDialog.path, next);
+                setRenameDialog((d) => ({ ...d, busy: false, open: !ok }));
+              }}
+            >
+              Переименовать
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <p className="text-[11px] text-ws-muted">
+            Текущее имя: <span className="font-mono text-ws">{baseName(renameDialog.path)}</span>
+          </p>
+          <Input
+            autoFocus
+            value={renameDialog.name}
+            onChange={(e) => setRenameDialog((d) => ({ ...d, name: e.target.value }))}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && renameDialog.name.trim() && !renameDialog.busy) {
+                e.preventDefault();
+                const next = renameDialog.name.trim();
+                void (async () => {
+                  setRenameDialog((d) => ({ ...d, busy: true }));
+                  const ok = await ws.renamePath(renameDialog.path, next);
+                  setRenameDialog((d) => ({ ...d, busy: false, open: !ok }));
+                })();
+              }
+            }}
+            placeholder="Новое имя"
+          />
+        </div>
+      </Modal>
+
       <Modal
         open={unsavedDialog.open}
         onClose={() => setUnsavedDialog({ open: false, tabId: '' })}

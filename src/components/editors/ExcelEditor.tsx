@@ -47,7 +47,7 @@ import type { SheetEditResult, SheetReadResult } from '../../services/sheetBridg
 import { ClipboardPaste, Undo2, Redo2 } from 'lucide-react';
 import { parseClipboardTable } from '../../lib/clipboardTable';
 import * as SheetFmt from '../../lib/sheetFormatting';
-import { Button, Spinner } from '../ui';
+import { Button, Input, Modal, Spinner } from '../ui';
 import { SheetChart, ChartSeries } from './SheetChart';
 import { injectChartsIntoXlsx } from '../../lib/xlsxCharts';
 import { injectStylesIntoXlsx } from '../../lib/xlsxStyles';
@@ -309,6 +309,24 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   const formula = useFormulaMode();
   const gridRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(1);
+  const [promptState, setPromptState] = useState<{ title: string; value: string } | null>(null);
+  const promptResolve = useRef<((value: string | null) => void) | null>(null);
+
+  const askText = useCallback(
+    (title: string, initial = '') =>
+      new Promise<string | null>((resolve) => {
+        promptResolve.current = resolve;
+        setPromptState({ title, value: initial });
+      }),
+    []
+  );
+
+  const finishPrompt = (value: string | null) => {
+    const resolve = promptResolve.current;
+    promptResolve.current = null;
+    setPromptState(null);
+    resolve?.(value);
+  };
 
   useEffect(() => {
     const element = gridRef.current;
@@ -1126,7 +1144,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
 
   const runExcelMacro = async () => {
     if (!window.electronAPI?.runExcelMacro) return;
-    const macroName = window.prompt(
+    const macroName = await askText(
       'Имя VBA-макроса (например, Module1.Report).\nМакрос выполнит настоящий Excel.',
       ''
     );
@@ -1534,10 +1552,10 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
 
   /* ---------------- Примечания ---------------- */
 
-  const editComment = () => {
+  const editComment = async () => {
     const address = SheetFmt.cellAddress(selected.row, selected.col);
     const current = activeMeta.comments[address]?.text ?? '';
-    const text = window.prompt('Примечание к ячейке ' + address, current);
+    const text = await askText('Примечание к ячейке ' + address, current);
     if (text === null) return;
     commitMeta(
       SheetFmt.setCommentForCell(metaRef.current, activeSheet, selected.row, selected.col, text)
@@ -3679,8 +3697,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
                 selectSingle({ row: 0, col: 0 });
                 setActiveSheet(name);
               }}
-              onDoubleClick={() => {
-                const next = window.prompt('Новое имя листа:', name);
+              onDoubleClick={async () => {
+                const next = await askText('Новое имя листа:', name);
                 if (next) renameSheet(name, next);
               }}
               title="Двойной клик — переименовать лист"
@@ -3959,6 +3977,39 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
             </div>
           </div>
         </div>
+      )}
+
+      {promptState && (
+        <Modal
+          open
+          onClose={() => finishPrompt(null)}
+          title={promptState.title}
+          width="max-w-md"
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => finishPrompt(null)}>
+                Отмена
+              </Button>
+              <Button variant="primary" onClick={() => finishPrompt(promptState.value)}>
+                OK
+              </Button>
+            </>
+          }
+        >
+          <Input
+            autoFocus
+            value={promptState.value}
+            onChange={(event) =>
+              setPromptState((state) => (state ? { ...state, value: event.target.value } : state))
+            }
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                finishPrompt(promptState.value);
+              }
+            }}
+          />
+        </Modal>
       )}
     </div>
   );

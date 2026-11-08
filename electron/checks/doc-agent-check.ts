@@ -1142,7 +1142,14 @@ function registerHandlers() {
     }
   });
   ipcMain.handle('fs:deletePath', async () => ({ success: true }));
-  ipcMain.handle('fs:renamePath', async () => ({ success: true }));
+  ipcMain.handle('fs:renamePath', async (_event, oldPath, newPath) => {
+    try {
+      await fs.promises.rename(oldPath, newPath);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
   ipcMain.handle('fs:searchWorkspace', async () => ({ success: true, results: [] }));
 }
 
@@ -2872,6 +2879,51 @@ async function main() {
       zoomed: /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(wordZoomState?.styleAttr || '') ||
         Number.parseFloat(wordZoomState?.computed || '1') > 1,
       status: /Масштаб: \d+%/.test(wordZoomState?.status || ''),
+    });
+
+    const renameMenuOpened = await js(`
+      const nodes = [...document.querySelectorAll('div')]
+        .filter((node) => (node.textContent || '').trim() === 'Третий.md');
+      const node = nodes.find((item) => item.className.includes('cursor-pointer')) || nodes[0];
+      if (!node) return false;
+      node.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 120,
+        clientY: 120,
+      }));
+      return true;
+    `);
+    await sleep(300);
+    const renameMenuClicked = await js(`
+      const button = [...document.querySelectorAll('button')]
+        .find((item) => (item.textContent || '').trim() === 'Переименовать');
+      if (!button) return false;
+      button.click();
+      return true;
+    `);
+    await sleep(300);
+    const renameSubmitted = await js(`
+      const input = [...document.querySelectorAll('input')]
+        .find((item) => item.placeholder === 'Новое имя');
+      if (!input) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, 'Третий-renamed.md');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const button = [...document.querySelectorAll('button')]
+        .find((item) => (item.textContent || '').trim() === 'Переименовать');
+      if (!button) return false;
+      button.click();
+      return true;
+    `);
+    await sleep(1000);
+    step('renameFile', {
+      menu: Boolean(renameMenuOpened),
+      clicked: Boolean(renameMenuClicked),
+      submitted: Boolean(renameSubmitted),
+      renamed:
+        fs.existsSync(path.join(SANDBOX, 'Третий-renamed.md')) &&
+        !fs.existsSync(path.join(SANDBOX, 'Третий.md')),
     });
 
     (out as any).summary = {
