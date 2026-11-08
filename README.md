@@ -6,6 +6,11 @@
 Приложение не требует установки Microsoft Office и работает офлайн: все редакторы
 встроены, ключи хранятся только на вашем компьютере.
 
+## Скачать
+
+Готовая portable-сборка для Windows x64 — в разделе
+[Releases](https://github.com/disemay12/workspace/releases/latest).
+
 ---
 
 ## Возможности
