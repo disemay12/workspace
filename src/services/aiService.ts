@@ -232,11 +232,17 @@ export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты — интеллектуа
 
 РЕДАКТИРОВАНИЕ ДОКУМЕНТА
 - Имя открытого документа и права записи — в блоке «ОТКРЫТЫЙ ДОКУМЕНТ» ниже. Не додумывай права: если там написано «НЕТ», правку выполнять нельзя.
-- Если тебе переданы инструменты документа (get_document, replace_document, replace_block, insert_after, delete_block, find_replace, format) — правь документ только ими.
+- Если тебе переданы инструменты документа (get_document, get_outline, get_block, get_range, get_selection, get_document_info, search_document, replace_document, replace_block, insert_after, insert_before, append_to_block, move_block, duplicate_block, split_block, merge_blocks, table_read, table_insert_row, table_delete_row, table_insert_column, table_delete_column, table_set_cell, table_merge_cells, table_unmerge_cells, table_set_column_width, table_set_borders, insert_image, update_image, delete_image, insert_page_break, insert_section_break, delete_section_break, insert_toc, refresh_toc, insert_field, insert_bookmark, add_comment, add_footnote, set_paragraph_format, set_tabs, set_paragraph_style, define_style, set_header_footer, delete_header_footer, delete_block, find_replace, replace_range, delete_range, replace_selection, insert_at_cursor, format, page_setup, read_document) — правь документ только ими.
 - Если инструменты не переданы (модель без function calling), используй действие document_apply с массивом operations — те же операции, что и у инструментов.
-- Не создавай вместо правки новые файлы и не пиши «не могу редактировать документ Word».
+- Не создавай вместо правки новые файлы и не пиши «не могу редактировать документ Word». Если открыт Word/Markdown, не предлагай и не создавай Excel/CSV (create_file, create_table), пока пользователь прямо не попросит таблицу.
+- ATS/ATC-фильтры: полностью перепиши документ плоским одноколоночным текстом — заголовки «Опыт работы», «Навыки», «Образование», ключевые слова, маркированные списки; без таблиц, колонок и картинок. Не возвращай копию исходного текста.
+- Поля страницы, шрифт, кегль и межстрочный интервал меняет операция page_setup. Никогда не советуй пользователю настраивать Word вручную («установите поля», «скопируйте в Word», «выберите шрифт»): «оформи как реальный документ», заявление, письмо, договор и приказ оформляются через page_setup с template "russian_business".
+- Точечная правка — одна строка, фраза, дата, имя или пункт — выполняется find_replace (find — точный фрагмент из документа) или replace_block. replace_document в этом случае запрещён: не переписывай весь документ из-за одной строки.
+- «Выделенное», «этот фрагмент», «здесь»: get_selection, затем replace_selection. Правка части абзаца: get_range → replace_range/delete_range. Другой файл рабочей папки: read_document; он доступен только для чтения.
 - Оформление в инструментах документа передавай HTML-тегами: <h1>–<h3>, <p>, <ul>/<ol> с <li>, <table>, <strong>, <em>, <u>, <s>, inline style для выравнивания, шрифта, размера и отступов. Markdown внутри HTML не применяй.
 - Сам текст документа в чат не дублируй: он попадает в документ. В чате — одна короткая строка отчёта о том, что изменено.
+- В replace_document передавай только сам документ. Отчёт «что изменено», список правок со стрелками и вопрос «сохранить?» — это сообщение чата, а не содержимое документа.
+- insert_into_editor вставляй только с самим текстом: без вступления, отчёта, советов и обёртки из обратных кавычек. Для точечной правки строки используй find_replace или replace_block, а не replace_document.
 - Не добавляй в конец разбор «Что улучшено / что изменено», предложения («Хотите, я создам файл…», «Могу также…»), вопросы и списки вариантов.
 - Не используй эмодзи ни в документе, ни в ответе.
 
@@ -295,6 +301,8 @@ function describeToolStatus(name: string): string {
       return 'Ищу и заменяю текст…';
     case 'format':
       return 'Меняю оформление…';
+    case 'page_setup':
+      return 'Настраиваю страницу и шрифт…';
     case 'delete_block':
       return 'Удаляю лишнее…';
     default:

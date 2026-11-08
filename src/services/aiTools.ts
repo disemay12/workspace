@@ -55,6 +55,17 @@ const FORMAT_PROPERTIES: Record<string, unknown> = {
   },
   font: { type: 'string', description: 'Гарнитура, например "Calibri" или "Times New Roman".' },
   size_pt: { type: 'string', description: 'Размер шрифта в пунктах, например "14".' },
+  color: { type: 'string', description: 'Цвет текста: "#RRGGBB" или имя цвета.' },
+  highlight: { type: 'string', description: 'Цвет фона/выделения: "#RRGGBB" или имя цвета.' },
+  fill: { type: 'string', description: 'Заливка всего блока: "#RRGGBB" или имя цвета.' },
+  border: { type: 'boolean', description: 'true — включить рамку блока, false — снять.' },
+  border_color: { type: 'string', description: 'Цвет рамки блока: "#RRGGBB".' },
+  border_width_pt: { type: 'string', description: 'Толщина рамки в пунктах, например "1".' },
+  border_style: { type: 'string', description: 'Стиль рамки: solid, dashed, dotted, double.' },
+  link: {
+    type: 'string',
+    description: 'URL ссылки для найденного фрагмента (http/https/mailto/tel). Требуется find.',
+  },
   indent_pt: { type: 'string', description: 'Отступ слева в пунктах, например "24".' },
   first_line_indent_pt: { type: 'string', description: 'Красная строка в пунктах, например "24".' },
 };
@@ -73,9 +84,139 @@ const ALL_TOOLS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'get_outline',
+      description:
+        'Возвращает структуру документа постранично: id блоков, тип, текст и оформление. Для длинного документа вызывайте с offset, пока nextOffset не станет null.',
+      parameters: {
+        type: 'object',
+        properties: {
+          offset: { type: 'string', description: 'Номер первого блока, с которого начать (0 по умолчанию).' },
+          limit: { type: 'string', description: 'Сколько блоков вернуть, 1–100 (40 по умолчанию).' },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_block',
+      description: 'Возвращает полный HTML и текст одного блока. Используйте перед точечной правкой, если из outline непонятна разметка.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: BLOCK_ID },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_range',
+      description: 'Возвращает HTML и текст диапазона внутри блока по смещениям символов. Смещения считаются по тексту блока без разметки.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          start: { type: 'string', description: 'Начало диапазона, номер символа от 0.' },
+          end: { type: 'string', description: 'Конец диапазона, не включается.' },
+        },
+        required: ['block_id', 'start', 'end'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_document',
+      description: 'Ищет текст по всему документу и возвращает блоки и смещения совпадений. Используйте, когда фраза может быть в любом месте.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Текст для поиска.' },
+          match_case: { type: 'boolean', description: 'Учитывать регистр.' },
+          limit: { type: 'string', description: 'Сколько совпадений вернуть, 1–100 (20 по умолчанию).' },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_selection',
+      description:
+        'Возвращает текст, HTML и точные смещения выделенного пользователем фрагмента. Вызывайте, когда просят изменить «выделенное», «этот фрагмент» или «здесь».',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_document_info',
+      description:
+        'Возвращает служебные части Word: колонтитулы, сноски, комментарии, именованные стили, число секций и список частей пакета. Используйте для вопросов о колонтитулах и оформлении, которые не видны в теле документа.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_document',
+      description:
+        'Читает другой файл рабочей папки (Word, Excel, PowerPoint, Markdown, текст) без права записи. Путь можно указать относительно корня workspace.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'Путь к файлу: относительный от корня workspace или абсолютный внутри него.',
+          },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_document',
+      description:
+        'Записывает другой файл workspace (Word, Excel или Markdown/текст). Доступно только после явного разрешения записи в дополнительные файлы.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Путь к файлу внутри workspace.' },
+          html: { type: 'string', description: 'HTML содержимого для .docx.' },
+          text: { type: 'string', description: 'Текст для Markdown/текстового файла.' },
+          columns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Заголовки столбцов для .xlsx.',
+          },
+          rows: {
+            type: 'array',
+            items: { type: 'array', items: { type: 'string' } },
+            description: 'Строки для .xlsx.',
+          },
+          sheet: { type: 'string', description: 'Имя листа для .xlsx.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'replace_document',
       description:
-        'Полностью заменяет содержимое открытого документа. Используйте только когда меняется весь документ (переписать, сократить, сделать ATS-friendly).',
+        'Полностью заменяет содержимое открытого документа. Только когда меняется весь документ (переписать, сократить, сделать ATS-friendly). ' +
+        'Для одной строки, фразы, даты, имени или пункта используйте find_replace или replace_block — не переписывайте документ целиком.',
       parameters: {
         type: 'object',
         properties: { html: HTML },
@@ -113,6 +254,611 @@ const ALL_TOOLS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'insert_before',
+      description: 'Вставляет новый блок или пункт списка перед указанным блоком.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: BLOCK_ID, html: HTML },
+        required: ['block_id', 'html'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'append_to_block',
+      description:
+        'Дописывает текст в конец блока или новые пункты <li> в конец списка, не создавая новый абзац.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          html: { ...HTML, description: 'Inline HTML для абзаца или <li> для списка.' },
+        },
+        required: ['block_id', 'html'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'move_block',
+      description:
+        'Перемещает блок: перед/после другого блока или на позицию index среди верхнеуровневых блоков.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          before_id: { type: 'string', description: 'Переместить перед этим блоком.' },
+          after_id: { type: 'string', description: 'Переместить после этого блока.' },
+          index: { type: 'string', description: 'Позиция среди верхнеуровневых блоков, 0 — начало.' },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'duplicate_block',
+      description: 'Дублирует блок сразу после оригинала. Копия получает новый id.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: BLOCK_ID },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'split_block',
+      description: 'Разделяет абзац или пункт списка на два по смещению символа.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          offset: { type: 'string', description: 'Номер символа, с которого начинается второй блок.' },
+        },
+        required: ['block_id', 'offset'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'merge_blocks',
+      description: 'Объединяет блок со следующим (или с указанным next_id), сохраняя оформление первого.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          next_id: { type: 'string', description: 'Необязательно: id второго блока.' },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_read',
+      description: 'Возвращает таблицу по ячейкам: строки, столбцы, текст, объединения, плюс полный HTML.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: BLOCK_ID },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_insert_row',
+      description: 'Вставляет строку в таблицу. index — позиция с 0; без index строка добавляется в конец.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          index: { type: 'string', description: 'Позиция строки, 0 — первая.' },
+          cells: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Необязательные тексты ячеек по порядку.',
+          },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_delete_row',
+      description: 'Удаляет строку таблицы по индексу.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          index: { type: 'string', description: 'Позиция строки, 0 — первая.' },
+        },
+        required: ['block_id', 'index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_insert_column',
+      description: 'Вставляет столбец во все строки таблицы.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          index: { type: 'string', description: 'Позиция столбца, 0 — первый.' },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_delete_column',
+      description: 'Удаляет столбец таблицы по индексу.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          index: { type: 'string', description: 'Позиция столбца, 0 — первый.' },
+        },
+        required: ['block_id', 'index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_set_cell',
+      description: 'Заменяет содержимое ячейки таблицы по строке и столбцу (с 0).',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          row: { type: 'string', description: 'Строка, с 0.' },
+          col: { type: 'string', description: 'Столбец, с 0.' },
+          html: HTML,
+        },
+        required: ['block_id', 'row', 'col', 'html'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_merge_cells',
+      description: 'Объединяет ячейки таблицы, начиная с row/col, на rowspan строк и colspan столбцов.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          row: { type: 'string', description: 'Строка, с 0.' },
+          col: { type: 'string', description: 'Столбец, с 0.' },
+          rowspan: { type: 'string', description: 'Сколько строк объединить.' },
+          colspan: { type: 'string', description: 'Сколько столбцов объединить.' },
+        },
+        required: ['block_id', 'row', 'col'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_image',
+      description:
+        'Вставляет изображение из файла workspace или data URL. Без block_id — в конец документа, с block_id — после блока.',
+      parameters: {
+        type: 'object',
+        properties: {
+          src: {
+            type: 'string',
+            description:
+              'Путь к изображению внутри workspace, data:image/...;base64,... или http(s) URL.',
+          },
+          block_id: { ...BLOCK_ID, description: 'Необязательно: вставить после этого блока.' },
+          alt: { type: 'string', description: 'Альтернативный текст.' },
+          width: { type: 'string', description: 'Ширина в пикселях.' },
+          height: { type: 'string', description: 'Высота в пикселях.' },
+          align: { type: 'string', description: 'Выравнивание: left, center, right.' },
+        },
+        required: ['src'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_image',
+      description: 'Меняет размер, выравнивание или alt изображения в блоке.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          width: { type: 'string', description: 'Ширина в пикселях.' },
+          height: { type: 'string', description: 'Высота в пикселях.' },
+          alt: { type: 'string', description: 'Альтернативный текст.' },
+          align: { type: 'string', description: 'Выравнивание: left, center, right.' },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_image',
+      description: 'Удаляет изображение из блока или первое изображение документа.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: BLOCK_ID },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_page_break',
+      description: 'Вставляет разрыв страницы после блока или в конец документа.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: { ...BLOCK_ID, description: 'Необязательно: после этого блока.' } },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_section_break',
+      description: 'Вставляет разрыв секции после блока или в конец документа.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: { ...BLOCK_ID, description: 'Необязательно: после этого блока.' } },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_section_break',
+      description:
+        'Удаляет разрыв секции по block_id; без block_id — первый найденный разрыв.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: BLOCK_ID },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_paragraph_format',
+      description:
+        'Задаёт межстрочный интервал, отступы до/после, запрет разрыва и разрыв перед абзацем. Для всего документа используйте page_setup.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          line_spacing: {
+            type: 'string',
+            description: 'Множитель: "1", "1.5", "2" или число.',
+          },
+          space_before_pt: { type: 'string', description: 'Отступ перед абзацем в пунктах.' },
+          space_after_pt: { type: 'string', description: 'Отступ после абзаца в пунктах.' },
+          keep_with_next: { type: 'boolean', description: 'Не разрывать абзац со следующим.' },
+          keep_together: { type: 'boolean', description: 'Не разрывать абзац между страницами.' },
+          page_break_before: { type: 'boolean', description: 'Начать абзац с новой страницы.' },
+          widow_control: {
+            type: 'boolean',
+            description: 'Запретить одиночные строки абзаца на странице.',
+          },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_toc',
+      description:
+        'Вставляет поле оглавления Word (TOC) в начало документа или после указанного блока. Word обновляет его при открытии.',
+      parameters: {
+        type: 'object',
+        properties: { block_id: { ...BLOCK_ID, description: 'Необязательно: после этого блока.' } },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_tabs',
+      description: 'Задаёт позиции табуляции абзаца в пунктах.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          positions: {
+            type: 'string',
+            description: 'Позиции через запятую или пробел, например "24,48".',
+          },
+        },
+        required: ['block_id', 'positions'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_paragraph_style',
+      description:
+        'Назначает именованный стиль абзаца (например Title, Subtitle, Quote, Heading1, Normal). Стиль должен существовать в документе.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          style: { type: 'string', description: 'Имя или styleId стиля Word.' },
+        },
+        required: ['block_id', 'style'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'define_style',
+      description:
+        'Создаёт пользовательский стиль абзаца и сохраняет его определение в styles.xml. block_id применяет стиль сразу.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          name: { type: 'string', description: 'Имя стиля, например «Врезка».' },
+          style_id: { type: 'string', description: 'Необязательный styleId.' },
+          based_on: { type: 'string', description: 'Базовый стиль, по умолчанию Normal.' },
+          font: { type: 'string', description: 'Гарнитура.' },
+          size_pt: { type: 'string', description: 'Кегль в пунктах.' },
+          bold: { type: 'boolean' },
+          italic: { type: 'boolean' },
+          color: { type: 'string', description: 'Цвет текста #RRGGBB.' },
+          align: {
+            type: 'string',
+            enum: ['left', 'center', 'right', 'justify'],
+            description: 'Выравнивание.',
+          },
+          line_height: { type: 'string', description: 'Множитель межстрочного интервала.' },
+          space_before_pt: { type: 'string', description: 'Отступ до абзаца в пунктах.' },
+          space_after_pt: { type: 'string', description: 'Отступ после абзаца в пунктах.' },
+        },
+        required: ['name'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_header_footer',
+      description:
+        'Меняет текст верхнего или нижнего колонтитула. Сначала вызовите get_document_info, чтобы увидеть текущие колонтитулы.',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', description: '"header" — верхний, "footer" — нижний.' },
+          type: {
+            type: 'string',
+            description: 'Тип колонтитула: "default", "first" (первая страница) или "even" (чётные).',
+          },
+          text: {
+            type: 'string',
+            description:
+              'Новый текст; переносы строк — новые абзацы. {{page}} — номер страницы, {{pages}} — всего страниц.',
+          },
+        },
+        required: ['kind', 'text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_header_footer',
+      description: 'Удаляет верхний или нижний колонтитул выбранного типа.',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', description: '"header" или "footer".' },
+          type: { type: 'string', description: '"default", "first" или "even".' },
+        },
+        required: ['kind'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_unmerge_cells',
+      description: 'Снимает объединение с ячейки, восстанавливая пустые ячейки.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          row: { type: 'string', description: 'Строка, с 0.' },
+          col: { type: 'string', description: 'Столбец, с 0.' },
+        },
+        required: ['block_id', 'row', 'col'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_set_column_width',
+      description: 'Задаёт ширину столбца таблицы в пунктах или пикселях.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          col: { type: 'string', description: 'Столбец, с 0.' },
+          width_pt: { type: 'string', description: 'Ширина в пунктах.' },
+          width_px: { type: 'string', description: 'Ширина в пикселях.' },
+        },
+        required: ['block_id', 'col'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'table_set_borders',
+      description:
+        'Задаёт границы таблицы: цвет, толщину и стиль. style="none" убирает границы.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          color: { type: 'string', description: 'Цвет границ, например #000000.' },
+          size_pt: { type: 'string', description: 'Толщина в пунктах.' },
+          style: {
+            type: 'string',
+            enum: ['single', 'double', 'dashed', 'dotted', 'none'],
+            description: 'Стиль границ.',
+          },
+        },
+        required: ['block_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'refresh_toc',
+      description:
+        'Пересобирает кэш оглавления из текущих заголовков документа; страницы обновит Word.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_field',
+      description:
+        'Вставляет поле Word с номером страницы (PAGE) или общим числом страниц (NUMPAGES).',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          kind: {
+            type: 'string',
+            enum: ['PAGE', 'NUMPAGES'],
+            description: 'Тип поля.',
+          },
+          at: {
+            type: 'string',
+            enum: ['after', 'before', 'end'],
+            description: 'Куда вставить относительно block_id; end — в конец документа.',
+          },
+        },
+        required: ['kind'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_bookmark',
+      description:
+        'Добавляет закладку Word: оборачивает найденный текст или ставит метку в начало блока.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          name: { type: 'string', description: 'Имя закладки без пробелов.' },
+          find: { type: 'string', description: 'Текст, который станет закладкой.' },
+        },
+        required: ['name'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'add_comment',
+      description:
+        'Добавляет комментарий Word к найденному тексту блока или к началу блока.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          find: { type: 'string', description: 'Фрагмент текста для комментария.' },
+          text: { type: 'string', description: 'Текст комментария.' },
+          author: { type: 'string', description: 'Автор, по умолчанию AI.' },
+        },
+        required: ['block_id', 'text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'add_footnote',
+      description:
+        'Добавляет сноску Word к найденному тексту блока или к началу блока.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          find: { type: 'string', description: 'Фрагмент текста, к которому относится сноска.' },
+          text: { type: 'string', description: 'Текст сноски.' },
+        },
+        required: ['block_id', 'text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'delete_block',
       description: 'Удаляет блок, элемент списка или таблицу по идентификатору.',
       parameters: {
@@ -128,7 +874,8 @@ const ALL_TOOLS: ToolDefinition[] = [
     function: {
       name: 'find_replace',
       description:
-        'Заменяет текст на другой. По умолчанию только первое вхождение; all=true — все. Регистр по умолчанию не важен.',
+        'Заменяет текст на другой. По умолчанию только первое вхождение; all=true — все. Регистр по умолчанию не важен. ' +
+        'Работает и когда Word разбил фразу на несколько фрагментов форматирования. Используйте для точечной правки строки вместо replace_document.',
       parameters: {
         type: 'object',
         properties: {
@@ -137,6 +884,69 @@ const ALL_TOOLS: ToolDefinition[] = [
           all: { type: 'boolean', description: 'Заменить все вхождения' },
         },
         required: ['find', 'replace'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'replace_range',
+      description:
+        'Заменяет диапазон символов внутри блока. Точный инструмент для правки части абзаца: смещения берите из get_range или search_document.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          start: { type: 'string', description: 'Начало диапазона, номер символа от 0.' },
+          end: { type: 'string', description: 'Конец диапазона, не включается.' },
+          html: { ...HTML, description: 'Новый текст (inline HTML): <strong>, <em>, <u>, <span style>, <br>.' },
+        },
+        required: ['block_id', 'start', 'end', 'html'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_range',
+      description: 'Удаляет диапазон символов внутри блока, не трогая соседний текст.',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_id: BLOCK_ID,
+          start: { type: 'string', description: 'Начало диапазона, номер символа от 0.' },
+          end: { type: 'string', description: 'Конец диапазона, не включается.' },
+        },
+        required: ['block_id', 'start', 'end'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'replace_selection',
+      description:
+        'Заменяет выделенный пользователем фрагмент. Сначала вызовите get_selection, чтобы увидеть текст и смещения.',
+      parameters: {
+        type: 'object',
+        properties: { html: HTML },
+        required: ['html'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'insert_at_cursor',
+      description: 'Вставляет фрагмент в позицию каретки или в конец выделения.',
+      parameters: {
+        type: 'object',
+        properties: { html: HTML },
+        required: ['html'],
         additionalProperties: false,
       },
     },
@@ -154,14 +964,681 @@ const ALL_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'page_setup',
+      description:
+        'Оформляет страницу и основной текст всего документа: поля, размер бумаги, шрифт, кегль, межстрочный интервал, выравнивание и красная строка. ' +
+        'Вызывайте вместо советов «настройте Word»: это меняет сам .docx. Для заявления, письма, договора, приказа используйте template "russian_business".',
+      parameters: {
+        type: 'object',
+        properties: {
+          template: {
+            type: 'string',
+            description:
+              'Готовый шаблон: "russian_business" — поля 3/1,5/2/2 см, Times New Roman 14, одинарный интервал, по ширине, красная строка 1,25 см.',
+          },
+          margins: {
+            type: 'object',
+            description: 'Поля страницы в сантиметрах.',
+            properties: {
+              top: { type: 'string', description: 'Верхнее поле, см' },
+              right: { type: 'string', description: 'Правое поле, см' },
+              bottom: { type: 'string', description: 'Нижнее поле, см' },
+              left: { type: 'string', description: 'Левое поле, см' },
+            },
+            additionalProperties: false,
+          },
+          font: { type: 'string', description: 'Гарнитура основного текста, например "Times New Roman".' },
+          size_pt: { type: 'string', description: 'Кегль основного текста в пунктах, например "14".' },
+          line_spacing: {
+            type: 'string',
+            description: 'Межстрочный интервал: "single", "1.5" или число.',
+          },
+          align: { type: 'string', description: 'Выравнивание абзацев: "left", "center", "right", "justify".' },
+          first_line_indent_cm: { type: 'string', description: 'Красная строка в сантиметрах, например "1.25".' },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
-/** Полный набор для Word, урезанный — для Markdown/текста, только чтение — без прав. */
+/** Инструменты открытой книги Excel. */
+const EXCEL_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'excel_read',
+      description:
+        'Читает лист или диапазон книги. Возвращает значения, формулы и отображаемый текст ячеек.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Имя листа; по умолчанию активный.' },
+          range: { type: 'string', description: 'Диапазон A1, например A1:D20. Без него — заполненная область.' },
+          limit: { type: 'string', description: 'Максимум ячеек, 1–1200 (400 по умолчанию).' },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_get_selection',
+      description: 'Возвращает текущее выделение пользователя на активном листе.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_write_cells',
+      description:
+        'Записывает значения или формулы в ячейки. Формула начинается с "=". Можно передать список ячеек или диапазон и матрицу значений.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          cells: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                address: { type: 'string', description: 'Адрес A1, например B4.' },
+                value: { type: 'string', description: 'Значение или формула.' },
+              },
+              required: ['address', 'value'],
+              additionalProperties: false,
+            },
+            description: 'Список ячеек для записи.',
+          },
+          range: { type: 'string', description: 'Диапазон A1 для матрицы values.' },
+          values: {
+            type: 'array',
+            items: { type: 'array', items: { type: 'string' } },
+            description: 'Матрица значений для range.',
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_add_sheet',
+      description: 'Добавляет лист в книгу.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Имя нового листа.' } },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_rename_sheet',
+      description: 'Переименовывает лист.',
+      parameters: {
+        type: 'object',
+        properties: {
+          old_name: { type: 'string', description: 'Текущее имя.' },
+          new_name: { type: 'string', description: 'Новое имя.' },
+        },
+        required: ['old_name', 'new_name'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_delete_sheet',
+      description: 'Удаляет лист, если в книге останется хотя бы один лист.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Имя листа.' } },
+        required: ['name'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_set_active_sheet',
+      description: 'Переключает активный лист книги.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Имя листа.' } },
+        required: ['name'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_insert_rows',
+      description: 'Вставляет строки в лист. index — номер строки с 1, count — сколько.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          index: { type: 'string', description: 'Номер строки с 1.' },
+          count: { type: 'string', description: 'Сколько строк вставить (по умолчанию 1).' },
+        },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_delete_rows',
+      description: 'Удаляет строки. index — номер первой строки с 1.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          index: { type: 'string', description: 'Номер строки с 1.' },
+          count: { type: 'string', description: 'Сколько строк удалить (по умолчанию 1).' },
+        },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_insert_columns',
+      description: 'Вставляет столбцы. index — номер столбца с 1.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          index: { type: 'string', description: 'Номер столбца с 1.' },
+          count: { type: 'string', description: 'Сколько столбцов вставить (по умолчанию 1).' },
+        },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_delete_columns',
+      description: 'Удаляет столбцы. index — номер первого столбца с 1.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          index: { type: 'string', description: 'Номер столбца с 1.' },
+          count: { type: 'string', description: 'Сколько столбцов удалить (по умолчанию 1).' },
+        },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_merge_cells',
+      description: 'Объединяет диапазон ячеек, например A1:B1.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          range: { type: 'string', description: 'Диапазон A1:B1.' },
+        },
+        required: ['range'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_unmerge_cells',
+      description: 'Снимает объединение с диапазона.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          range: { type: 'string', description: 'Диапазон A1:B1.' },
+        },
+        required: ['range'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_format_range',
+      description: 'Форматирует диапазон: жирный, курсив, заливка, цвет, размер, выравнивание, перенос.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheet: { type: 'string', description: 'Лист; по умолчанию активный.' },
+          range: { type: 'string', description: 'Диапазон A1:D10.' },
+          bold: { type: 'boolean', description: 'Жирный.' },
+          italic: { type: 'boolean', description: 'Курсив.' },
+          fill: { type: 'string', description: 'Заливка #RRGGBB.' },
+          color: { type: 'string', description: 'Цвет текста #RRGGBB.' },
+          font_size: { type: 'string', description: 'Размер шрифта в pt.' },
+          align: { type: 'string', description: 'left, center или right.' },
+          wrap: { type: 'boolean', description: 'Перенос текста.' },
+        },
+        required: ['range'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/** Инструменты открытой презентации. */
+const PPTX_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_read',
+      description: 'Читает презентацию: слайды, фигуры с текстом, заметки.',
+      parameters: {
+        type: 'object',
+        properties: { slide: { type: 'string', description: 'Необязательно: номер слайда с 1.' } },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_get_selection',
+      description: 'Возвращает выделенную текстовую фигуру текущего слайда.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_text',
+      description:
+        'Заменяет текст фигуры на слайде. Переносы строк — новые абзацы. Сначала вызовите pptx_read, чтобы получить shape_id.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'string', description: 'Номер слайда с 1.' },
+          shape_id: { type: 'string', description: 'id фигуры из pptx_read.' },
+          text: { type: 'string', description: 'Новый текст фигуры; \\n — новый абзац.' },
+        },
+        required: ['slide', 'shape_id', 'text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_add_slide',
+      description: 'Добавляет слайд после указанного номера (с 1) или в конец.',
+      parameters: {
+        type: 'object',
+        properties: {
+          index: { type: 'string', description: 'После какого слайда вставить, с 1.' },
+          title: { type: 'string', description: 'Заголовок нового слайда.' },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_delete_slide',
+      description: 'Удаляет слайд по номеру с 1.',
+      parameters: {
+        type: 'object',
+        properties: { index: { type: 'string', description: 'Номер слайда с 1.' } },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_move_slide',
+      description: 'Меняет порядок слайдов.',
+      parameters: {
+        type: 'object',
+        properties: {
+          from: { type: 'string', description: 'Текущий номер слайда с 1.' },
+          to: { type: 'string', description: 'Новый номер с 1.' },
+        },
+        required: ['from', 'to'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_add_text_box',
+      description: 'Добавляет текстовую фигуру на слайд.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'string', description: 'Номер слайда с 1.' },
+          text: { type: 'string', description: 'Текст фигуры.' },
+        },
+        required: ['slide', 'text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_insert_image',
+      description:
+        'Вставляет изображение на слайд. src — путь внутри workspace, data URL или http(s) URL.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'string', description: 'Номер слайда с 1.' },
+          src: { type: 'string', description: 'Путь, data URL или http(s) URL.' },
+          width: { type: 'string', description: 'Ширина в пикселях.' },
+          height: { type: 'string', description: 'Высота в пикселях.' },
+          x: { type: 'string', description: 'Отступ слева в пикселях.' },
+          y: { type: 'string', description: 'Отступ сверху в пикселях.' },
+          alt: { type: 'string', description: 'Описание изображения.' },
+        },
+        required: ['slide', 'src'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_layout',
+      description:
+        'Меняет макет слайда по имени или номеру из pptx_read. Содержимое слайда сохраняется.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'string', description: 'Номер слайда с 1.' },
+          layout: { type: 'string', description: 'Имя или номер макета.' },
+        },
+        required: ['slide', 'layout'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_notes',
+      description:
+        'Заменяет заметки докладчика слайда. Пустая строка очищает заметки; переносы строк — абзацы.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'string', description: 'Номер слайда с 1.' },
+          text: { type: 'string', description: 'Текст заметок.' },
+        },
+        required: ['slide', 'text'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/** Инструменты Markdown/текста. */
+const MARKDOWN_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'md_read',
+      description: 'Читает Markdown/текстовый документ целиком.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_replace',
+      description:
+        'Заменяет текст в Markdown без пересборки разметки. По умолчанию первое вхождение; all=true — все.',
+      parameters: {
+        type: 'object',
+        properties: {
+          find: { type: 'string', description: 'Точный текст для поиска.' },
+          replace: { type: 'string', description: 'Новый текст.' },
+          all: { type: 'boolean', description: 'Заменить все вхождения.' },
+        },
+        required: ['find', 'replace'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_append',
+      description: 'Дописывает Markdown-текст в конец документа.',
+      parameters: {
+        type: 'object',
+        properties: { text: { type: 'string', description: 'Текст для добавления.' } },
+        required: ['text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_replace_document',
+      description: 'Полностью заменяет Markdown/текстовый документ.',
+      parameters: {
+        type: 'object',
+        properties: { text: { type: 'string', description: 'Новый текст документа.' } },
+        required: ['text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_set_heading',
+      description:
+        'Делает строку заголовком Markdown. find — фрагмент строки; пусто — первый непустой абзац.',
+      parameters: {
+        type: 'object',
+        properties: {
+          find: { type: 'string', description: 'Фрагмент строки для поиска.' },
+          level: {
+            type: 'string',
+            enum: ['1', '2', '3', '4', '5', '6'],
+            description: 'Уровень заголовка.',
+          },
+        },
+        required: ['level'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_toggle_list',
+      description:
+        'Превращает строку в пункт списка или убирает маркер, если он уже есть.',
+      parameters: {
+        type: 'object',
+        properties: {
+          find: { type: 'string', description: 'Фрагмент строки.' },
+          style: {
+            type: 'string',
+            enum: ['bullet', 'numbered'],
+            description: 'bullet — «-», numbered — «1.».',
+          },
+        },
+        required: ['find', 'style'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_insert_link',
+      description:
+        'Вставляет Markdown-ссылку вместо найденного текста или в конец документа.',
+      parameters: {
+        type: 'object',
+        properties: {
+          find: { type: 'string', description: 'Текст, который станет ссылкой.' },
+          text: { type: 'string', description: 'Подпись ссылки.' },
+          url: { type: 'string', description: 'http(s), mailto, #anchor или путь.' },
+        },
+        required: ['url'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'md_insert_table',
+      description: 'Добавляет Markdown-таблицу в конец документа.',
+      parameters: {
+        type: 'object',
+        properties: {
+          headers: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Заголовки столбцов.',
+          },
+          rows: {
+            type: 'array',
+            items: { type: 'array', items: { type: 'string' } },
+            description: 'Строки таблицы.',
+          },
+        },
+        required: ['headers', 'rows'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_document',
+      description: 'Ищет текст в Markdown и возвращает позиции совпадений.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Текст для поиска.' },
+          match_case: { type: 'boolean', description: 'Учитывать регистр.' },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_document',
+      description: 'Читает другой файл рабочей папки без права записи.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Путь к файлу.' } },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_document',
+      description:
+        'Записывает другой файл workspace (Word, Excel или Markdown/текст). Доступно только после явного разрешения записи в дополнительные файлы.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Путь к файлу внутри workspace.' },
+          html: { type: 'string', description: 'HTML содержимого для .docx.' },
+          text: { type: 'string', description: 'Текст для Markdown/текстового файла.' },
+          columns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Заголовки столбцов для .xlsx.',
+          },
+          rows: {
+            type: 'array',
+            items: { type: 'array', items: { type: 'string' } },
+            description: 'Строки для .xlsx.',
+          },
+          sheet: { type: 'string', description: 'Имя листа для .xlsx.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
 export function buildDocumentTools(writeAccess: boolean, tabType: FileType | string): ToolDefinition[] {
-  if (!writeAccess) return ALL_TOOLS.filter((tool) => tool.function.name === 'get_document');
+  if (tabType === 'excel') {
+    return writeAccess
+      ? EXCEL_TOOLS
+      : EXCEL_TOOLS.filter((tool) =>
+          ['excel_read', 'excel_get_selection'].includes(tool.function.name)
+        );
+  }
+  if (tabType === 'powerpoint') {
+    return writeAccess
+      ? PPTX_TOOLS
+      : PPTX_TOOLS.filter((tool) =>
+          ['pptx_read', 'pptx_get_selection'].includes(tool.function.name)
+        );
+  }
+  if (tabType === 'markdown' || tabType === 'richtext' || tabType === 'text') {
+    return writeAccess
+      ? MARKDOWN_TOOLS
+      : MARKDOWN_TOOLS.filter((tool) =>
+          ['md_read', 'search_document', 'read_document'].includes(tool.function.name)
+        );
+  }
+  const readOnly = [
+    'get_document',
+    'get_outline',
+    'get_block',
+    'get_range',
+    'search_document',
+    'get_selection',
+    'get_document_info',
+    'table_read',
+    'read_document',
+  ];
+  if (!writeAccess) return ALL_TOOLS.filter((tool) => readOnly.includes(tool.function.name));
   if (tabType === 'word') return ALL_TOOLS;
   return ALL_TOOLS.filter((tool) =>
-    ['get_document', 'replace_document', 'find_replace'].includes(tool.function.name)
+    ['get_document', 'replace_document', 'find_replace', 'search_document', 'read_document'].includes(
+      tool.function.name
+    )
   );
 }
 
@@ -176,6 +1653,8 @@ export function supportsNativeDocumentTools(provider: string): boolean {
 
 const TYPE_LABEL: Record<string, string> = {
   word: 'Word (.docx)',
+  excel: 'Excel (.xlsx)',
+  powerpoint: 'PowerPoint (.pptx)',
   markdown: 'Markdown',
   richtext: 'текст',
   text: 'текст',
@@ -198,6 +1677,68 @@ export function buildDocumentSystemPrompt(context: DocumentPromptContext): strin
     `- Права записи: ${context.writeAccess ? 'ЕСТЬ' : 'НЕТ'}.`,
   ];
 
+  if (context.type === 'excel') {
+    if (!context.writeAccess) {
+      return [
+        ...header,
+        '- Доступно только чтение: используй excel_read. Изменять книгу нельзя.',
+        '- Если просят изменить данные, скажи, что нужны права записи.',
+      ].join('\n');
+    }
+    return [
+      ...header,
+      '- Работай с книгой через excel_read и excel_write_cells. Не создавай новый файл и не предлагай CSV, если просят изменить открытую таблицу.',
+      '- excel_read: лист и диапазон A1 (например A1:F30). Возвращает значения, формулы и отображение.',
+      '- excel_get_selection: текущее выделение пользователя на листе.',
+      '- excel_write_cells: список {address, value}; формула начинается с "=". Для диапазона передай range и матрицу values.',
+      '- Листы: excel_add_sheet, excel_rename_sheet, excel_delete_sheet, excel_set_active_sheet.',
+      '- Строки/столбцы: excel_insert_rows, excel_delete_rows, excel_insert_columns, excel_delete_columns; объединение и формат: excel_merge_cells, excel_unmerge_cells, excel_format_range.',
+      '- Не выводи таблицу в чат: изменения применяются к открытой книге. В чате — короткий отчёт.',
+    ].join('\n');
+  }
+
+  if (context.type === 'powerpoint') {
+    if (!context.writeAccess) {
+      return [
+        ...header,
+        '- Доступно только чтение: используй pptx_read. Менять презентацию нельзя.',
+        '- Если просят изменить слайды, скажи, что нужны права записи.',
+      ].join('\n');
+    }
+    return [
+      ...header,
+      '- Работай с презентацией через pptx_read, pptx_set_text, pptx_add_slide, pptx_delete_slide, pptx_move_slide, pptx_add_text_box, pptx_insert_image, pptx_set_notes, pptx_set_layout.',
+      '- pptx_get_selection: выделенная текстовая фигура текущего слайда.',
+      '- pptx_set_text: slide (с 1), shape_id из pptx_read, text; переносы строк — новые абзацы.',
+      '- pptx_insert_image: slide и src (путь workspace, data URL или http-ссылка); width/height в px.',
+      '- pptx_set_notes: заметки докладчика без изменения текста слайда.',
+      '- pptx_set_layout: имя или номер макета из pptx_read.',
+      '- Не создавай новый файл и не переписывай презентацию целиком из-за одного слайда.',
+      '- В чате — короткий отчёт; текст слайдов в чат не дублируй.',
+    ].join('\n');
+  }
+
+  if (
+    !context.fallback &&
+    (context.type === 'markdown' || context.type === 'richtext' || context.type === 'text')
+  ) {
+    if (!context.writeAccess) {
+      return [
+        ...header,
+        '- Доступно только чтение: используй md_read. Изменять документ нельзя.',
+        '- Если просят изменить текст, скажи, что нужны права записи.',
+      ].join('\n');
+    }
+    return [
+      ...header,
+      '- Работай с Markdown напрямую через md_read, md_replace, md_append, md_replace_document, md_set_heading, md_toggle_list, md_insert_link, md_insert_table и search_document.',
+      '- Сохраняй Markdown-разметку: заголовки #, списки, ссылки, таблицы. Не переводи документ в HTML.',
+      '- Для точечной правки используй md_replace, а не md_replace_document.',
+      '- Другой файл меняй только write_document и только при включённом «Доп. файлы: запись».',
+      '- В чате — короткий отчёт; текст документа не дублируй.',
+    ].join('\n');
+  }
+
   if (!context.writeAccess) {
     return [
       ...header,
@@ -210,35 +1751,47 @@ export function buildDocumentSystemPrompt(context: DocumentPromptContext): strin
     ].join('\n');
   }
 
-  const rules = [...header, '- Работай только с этим документом.'];
+  const rules = [...header, '- Работай только с этим документом; другие файлы workspace можно читать через read_document, но не менять.'];
 
   if (context.fallback) {
     rules.push(
       '- Function calling недоступен. Содержимое документа приложено к сообщению выше — не вызывай get_document, работай с приложенным текстом.',
       '- Любые правки возвращай только блоком workspace-action с действием document_apply:',
       '```workspace-action',
-      '{"action":"document_apply","operations":[{"tool":"replace_document","html":"<h1>Заголовок</h1><p>Текст</p>"}]}',
+      '{"action":"document_apply","operations":[{"tool":"replace_document","html":"<h1>Заголовок</h1><p>Текст</p>"},{"tool":"page_setup","template":"russian_business"}]}',
       '```',
       '- Для переписывания и оформления используй replace_document с полным HTML документа, для точечных замен — find_replace. Блочные операции replace_block/insert_after/delete_block применяй только когда точно знаешь id блока.',
+      '- Поля страницы и базовый шрифт меняй операцией page_setup, а не советами пользователю.',
       '- После блока — одна короткая строка отчёта. Не вставляй текст документа в обычное сообщение.'
     );
   } else {
     rules.push(
-      '- Работай инструментами: get_document, replace_document, replace_block, insert_after, delete_block, find_replace, format.',
+      '- Работай инструментами: get_document, replace_document, replace_block, insert_after, delete_block, find_replace, format, page_setup.',
       '- Сначала вызови get_document, если структура ещё не известна. Идентификаторы блоков (b1, b2, …) бери из последнего ответа get_document или из результата предыдущего инструмента.',
       '- При просьбе изменить, оформить, переписать, сократить, удалить лишнее или поправить текст — вызывай инструменты. Не пиши готовый текст документа в чат.'
     );
   }
 
   rules.push(
-    '- Не создавай новые файлы (create_file, create_table, create_document) и не предлагай скачать документ: правка идёт в открытый файл.',
+    '- Не создавай и не предлагай Excel/CSV (create_file, create_table, create_document), если открыт Word/Markdown и пользователь не попросил именно таблицу. Правка идёт только в открытый документ.',
     '- Не отвечай «не могу редактировать документ Word»: правка применяется сразу.',
     '- В документ клади только содержимое документа: без вступлений («Вот вариант…»), пояснений, вопросов, советов и списков «что изменено».',
     '- В чат верни короткий отчёт: 1–3 пункта о том, что сделано. Текст документа в чат не дублируй.',
+    '- Никогда не советуй настраивать Word вручную (поля, шрифт, интервал, «скопируйте в Word»): для этого есть page_setup, он меняет сам файл.',
+    '- Другой файл рабочей папки читай через read_document по пути. Дополнительные файлы доступны только для чтения; запись в них — только инструментом write_document после разрешения «Доп. файлы: запись».',
+    '- Если просят «оформи как реальный/официальный документ», «как в Word», заявление, письмо, договор или приказ — вызови page_setup с template "russian_business" (поля 3/1,5/2/2 см, Times New Roman 14, одинарный интервал, по ширине, красная строка 1,25 см).',
+    '- ATS/ATC-фильтры: полностью замени документ плоским одноколоночным текстом. Заголовки «Опыт работы», «Навыки», «Образование», обычные абзацы и маркированные списки; ключевые слова из вакансии; без таблиц, колонок, картинок и текстовых блоков. Не возвращай копию исходного текста — формулировки и структура должны измениться.',
+    '- Если текст документа уже приложен к сообщению (полная переработка/ATS), не вызывай get_document — сразу replace_document с изменённым текстом.',
     context.fallback
-      ? '- Для точечных правок используй find_replace; replace_document — когда меняется весь документ.'
-      : '- Для точечных правок используй replace_block / insert_after / delete_block / find_replace / format. replace_document — только когда меняется весь документ.',
-    '- Формат HTML: <h1>–<h3>, <p>, <ul>/<ol> с <li>, <table>, <blockquote>, <strong>, <em>, <u>, <s>, <br>. Оформление абзаца — inline style: text-align, font-family, font-size (pt), margin-left (pt), text-indent (pt). Markdown внутри HTML не используй.'
+      ? '- Для одной строки, фразы, даты, имени или пункта используй find_replace (find — точный фрагмент). replace_document — только если меняется весь документ.'
+      : '- Для одной строки, фразы, даты, имени или пункта используй find_replace или replace_block. replace_document — только при полной переработке документа; одна строка не повод переписывать весь документ.\n' +
+        '- «Выделенное», «этот фрагмент», «здесь»: сначала get_selection, затем replace_selection. Не переписывай весь документ из-за выделения.\n' +
+        '- Правка части абзаца: get_range (смещения) → replace_range/delete_range. Полный HTML блока: get_block. Длинный документ: get_outline с offset/limit.\n' +
+        '- Колонтитулы, сноски, комментарии, именованные стили и число секций — get_document_info.\n' +
+        '- Верхний/нижний колонтитул меняется set_header_footer {kind, type, text}, удаляется delete_header_footer. Не переписывай тело документа из-за колонтитула.',
+    '- В html для replace_block/insert_after передавай только сам фрагмент: без «Вот текст…», отчётов, списков изменений и обёртки ```.',
+    '- Формат HTML: <h1>–<h3>, <p>, <ul>/<ol> с <li>, <table>, <blockquote>, <strong>, <em>, <u>, <s>, <br>. Оформление абзаца — inline style: text-align, font-family, font-size (pt), margin-left (pt), text-indent (pt). Markdown внутри HTML не используй.',
+    '- Не заворачивай HTML документа в блок кода и не добавляй к нему заголовки-комментарии.'
   );
 
   if (context.type !== 'word') {

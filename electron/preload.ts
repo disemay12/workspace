@@ -109,6 +109,12 @@ const electronAPI = {
     filters?: { name: string; extensions: string[] }[],
     defaultDir?: string
   ): Promise<string | null> => ipcRenderer.invoke('fs:saveFileDialog', defaultName, filters, defaultDir),
+  exportPdf: (
+    html: string,
+    suggestedName?: string,
+    targetPath?: string
+  ): Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }> =>
+    ipcRenderer.invoke('pdf:export', html, suggestedName, targetPath),
   uniquePath: (dirPath: string, fileName: string): Promise<string> =>
     ipcRenderer.invoke('fs:uniquePath', dirPath, fileName),
   showInExplorer: (filePath: string): Promise<{ success: boolean; error?: string }> =>

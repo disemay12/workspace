@@ -26,7 +26,7 @@ function resolveProjectRoot() {
   return path.join(__dirname, '..');
 }
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(os.tmpdir(), 'ws-insert-test-' + Date.now());
+const SANDBOX = process.env.WS_CHECK_SANDBOX || path.join(os.tmpdir(), 'ws-insert-test-' + Date.now());
 const out: any = { steps: [], errors: [] };
 const step = (name, value) => out.steps.push({ name, ...value });
 
@@ -207,7 +207,9 @@ app.whenReady().then(async () => {
       return {
         // После замены исходный print("start") должен исчезнуть
         originalGone: !raw.includes('print("start")'),
-        containsResponse: flat.includes('Вот код') && flat.includes('def hello():'),
+        // В документ попадает только содержимое ответа, без вступления «Вот код:».
+        containsResponse: flat.includes('def hello():') && flat.includes('return 1'),
+        preambleGone: !flat.includes('Вот код'),
         replacedContent: raw.slice(0, 200),
         dirtySet: /Не сохранено/.test(t),
       };

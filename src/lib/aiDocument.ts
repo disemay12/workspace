@@ -7,7 +7,7 @@
  */
 
 export function markdownToDocumentHtml(markdown: string): string {
-  const source = normalizeHtmlTags(stripEmoji(stripFence(markdown))).replace(/\r\n/g, '\n').trim();
+  const source = normalizeHtmlTags(stripEmoji(unwrapFences(markdown))).replace(/\r\n/g, '\n').trim();
   if (!source) return '';
 
   const blocks: string[] = [];
@@ -134,7 +134,26 @@ export function stripEmoji(text: string): string {
 
 /** Хвостовые фразы-предложения, которые не являются содержимым документа. */
 const META_TAIL_RE =
-  /^(готово|хотите|если хотите|если нужно|могу|либо|уточните|что дальше|варианты|дайте знать|сообщите|примечание|p\.s\.|ps:)(?=\s|,|:|—|$)/i;
+  /^(готово|сделано|записано|хотите|хочешь|если хочешь|если хотите|если нужно|если надо|могу|либо|уточните|уточни|что дальше|что скажешь|скажи|варианты|дайте знать|дай знать|сообщите|сообщи|примечание|p\.s\.|ps:)(?=\s|,|:|—|$)/i;
+
+function isMetaTailBlock(block: string): boolean {
+  const first = block
+    .trim()
+    .split('\n')[0]
+    .trim()
+    .replace(/^[#>*\-\s]+/, '')
+    .replace(/^\d+[.)]\s*/, '');
+  return META_TAIL_RE.test(first) || isAssistantReportText(block);
+}
+
+/** Срезает хвост ответа: «Готово…», «Если хочешь…», «Что скажешь?». */
+function stripTrailingMeta(text: string): string {
+  const blocks = text.split(/\n{2,}/).map((block) => block.trim());
+  while (blocks.length > 0 && isMetaTailBlock(blocks[blocks.length - 1])) {
+    blocks.pop();
+  }
+  return blocks.join('\n\n').trim();
+}
 
 /**
  * Убирает из ответа модели эмодзи и хвост «Готово / Хотите, я создам файл? /
@@ -166,14 +185,209 @@ export function stripAssistantNoise(text: string): string {
   return blocks.join('\n\n').trim();
 }
 
-/** Убирает обёртку из тройных кавычек, если модель всё-таки её добавила. */
-function stripFence(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('```')) return text;
-  const end = trimmed.lastIndexOf('```');
-  if (end <= 3) return text;
-  const firstBreak = trimmed.indexOf('\n');
-  return trimmed.slice(firstBreak + 1, end);
+/**
+ * Снимает все ```-обёртки, оставляя содержимое.
+ *
+ * Модель часто отвечает «вот документ» и заворачивает его в блок кода с
+ * языком text/plain. Если снять только внешнюю пару кавычек, литералы ```
+ * и метка языка попадают в документ.
+ */
+function unwrapFences(text: string): string {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const kept: string[] = [];
+  for (const line of lines) {
+    const fence = /^\s*```[^\s`]*\s?(.*)$/.exec(line);
+    if (fence) {
+      // «```Директор ООО…» — модель склеила маркер и текст в одну строку.
+      if (fence[1].trim()) kept.push(fence[1]);
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/** Блоки действий WorkSpace не являются содержимым документа. */
+const ACTION_FENCE_RE = /```(?:workspace-action|workspace_action)[^\n]*\n[\s\S]*?```/gi;
+
+/** Вступление чата и короткий отчёт о правке: «Понял Вас», «Исправил дату». */
+const PREAMBLE_RE =
+  /^(?:#{1,6}\s*)?(?:\*\*)?(?:понял|поняла|вот|ниже|готово|конечно|разумеется|держите|представляю|хорошо|с\s+удовольствием|обновил|обновила|изменил|изменила|исправил|исправила|заменил|заменила|убрал|убрала|удалил|удалила|добавил|добавила|оформил|оформила|настроил|настроила|сделал|сделала|переписал|переписала|сократил|сократила|вставил|вставила)(?![а-яёa-z])/i;
+
+/**
+ * Служебный блок ответа: рекомендации по настройке Word, советы «как
+ * скопировать», списки полей/шрифтов. Это не текст документа.
+ */
+export function isDocumentMetaText(raw: string): boolean {
+  const text = raw
+    .trim()
+    .split('\n')[0]
+    .replace(/^[#>*\-\s]+/, '')
+    .replace(/\*\*/g, '')
+    .replace(/^\d+[.)]\s*/, '')
+    .trim();
+
+  if (!text) return true;
+  if (/^(-{3,}|\*{3,}|_{3,})$/.test(text)) return true;
+  if (/^```\s*[\w-]*\s*$/.test(text)) return true;
+  if (
+    /^(?:что\s+(?:изменено|сделано)|список\s+изменений|изменения\s+в\s+документе|внес[её]нн?ые\s+изменения|кратко\s+об\s+изменениях|отч[её]т\s+об\s+изменениях)(?![а-яёa-z])/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  const settings = /(настройк|оформлен|форматир|инструкц|скопируйте|вставьте|откройте|сохраните)/i;
+  const target = /(word|ворд|поля|шрифт|интервал|выравнивание|красная строка|страниц)/i;
+  return settings.test(text) && target.test(text);
+}
+
+function isMetaBlock(block: string): boolean {
+  return isDocumentMetaText(block);
+}
+
+/**
+ * Служебный отчёт ассистента о проделанной работе. Модель иногда кладёт его
+ * в HTML документа: «Оформил документ… Вот итоговая версия:», «Документ
+ * Test.docx обновлён… сохранить сейчас?».
+ */
+const REPORT_START_RE =
+  /^(?:оформил|оформила|обновил|обновила|изменил|изменила|заменил|заменила|исправил|исправила|переписал|переписала|сделал|сделала|привёл|привел|привела|подготовил|подготовила|сохранил|сохранила|меняю|перерабатываю|обновляю|переписываю|оформляю|правлю|заменяю|добавляю|удаляю|сокращаю|делаю|вношу|привожу|готовлю|все\s+(?:разделы|пункты|части)\s+(?:обновлен|обновлены|переписан|переписаны|изменен|изменены))(?![а-яёa-z])/i;
+
+const REPORT_PHRASE_RE =
+  /(вот\s+итогов|итоговая\s+верси|готов(?:ая|ый)\s+верси|документ\s+[^\n]{0,100}\s+обновл[её]н|помечен\s+как\s+несохран[её]нный|сохранить\s+сейчас|файл\s+[^\n]{0,40}измен[её]н[^\n]{0,80}(?:не\s+сохран|сохран)|^обратите\s+внимание(?![а-яёa-z])|^остал[а-я]*\s+техническ)/i;
+
+export function isAssistantReportText(raw: string): boolean {
+  const text = raw
+    .replace(/\r\n/g, '\n')
+    .replace(/^[#>*\-\s]+/, '')
+    .replace(/\*\*/g, '')
+    .trim();
+  if (!text) return false;
+  if (REPORT_PHRASE_RE.test(text)) return true;
+  return (
+    REPORT_START_RE.test(text) &&
+    /(документ|текст|резюме|верси|стил|файл|професси|должност|раздел|заголов|назван)/i.test(text)
+  );
+}
+
+function isAssistantReportListText(block: string): boolean {
+  const lines = block
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^(?:[-*•]|\d+[.)])\s+/.test(line));
+  if (lines.length === 0) return false;
+  const changed = lines.filter((line) =>
+    /(→|->|(?:обновлен|переименован|переписан|заменен|добавлен|удален|исправлен|сокращен|настроен))/i.test(
+      line
+    )
+  ).length;
+  return changed >= Math.ceil(lines.length * 0.6);
+}
+
+function isBlankBlock(block: string): boolean {
+  const text = block
+    .replace(/^[#>*\-\s]+/, '')
+    .replace(/\*\*/g, '')
+    .replace(/^```\s*[\w-]*\s*$/, '')
+    .trim();
+  return !text || /^(-{3,}|\*{3,}|_{3,})$/.test(text);
+}
+
+/**
+ * Содержимое всех ```-блоков. Метку языка отбрасываем, а текст, склеенный
+ * с открывающим маркером, сохраняем: «```Директор ООО…».
+ */
+function collectFencedBlocks(text: string): string[] {
+  const blocks: string[] = [];
+  let buffer: string[] | null = null;
+
+  for (const line of text.split('\n')) {
+    const fence = /^\s*```[^\s`]*\s?(.*)$/.exec(line);
+    if (fence) {
+      if (buffer === null) {
+        buffer = [];
+        if (fence[1].trim()) buffer.push(fence[1].trim());
+      } else {
+        const body = buffer.join('\n').trim();
+        if (body) blocks.push(body);
+        buffer = null;
+      }
+      continue;
+    }
+    if (buffer !== null) buffer.push(line);
+  }
+
+  if (buffer !== null) {
+    const body = buffer.join('\n').trim();
+    if (body) blocks.push(body);
+  }
+
+  // JSON-действия и ответы инструментов — не документ.
+  return blocks.filter((body) => !/^\s*\{\s*"(?:action|actions|tool|operations)"/.test(body));
+}
+
+/**
+ * Вытаскивает из ответа ассистента именно содержимое документа.
+ *
+ * Приоритет — готовый блок кода: модель кладёт туда текст заявления, письма
+ * или договора. Если блока нет, отбрасываются вступление, разделители и
+ * служебные советы по оформлению, из-за которых в .docx раньше попадали
+ * фразы «Понял Вас», «Рекомендуемые настройки страницы» и литералы ```.
+ */
+export function extractDocumentContent(answer: string): string {
+  const source = stripEmoji(answer.replace(/\r\n/g, '\n')).trim();
+  if (!source) return '';
+
+  const withoutActions = source.replace(ACTION_FENCE_RE, '').trim();
+  if (!withoutActions) return '';
+
+  const fenced = collectFencedBlocks(withoutActions);
+  if (fenced.length > 0) {
+    const text = stripTrailingMeta(fenced.join('\n\n'));
+    if (text) return text;
+  }
+
+  const blocks = withoutActions.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  if (blocks.length === 0) return '';
+
+  let start = 0;
+  while (start < blocks.length - 1 && start < 2 && PREAMBLE_RE.test(blocks[start])) start += 1;
+
+  const kept: string[] = [];
+  // Список сразу после «Рекомендуемые настройки…» — тоже служебный:
+  // маркеры полей/шрифтов идут отдельным блоком от своего заголовка.
+  let afterMeta = false;
+  for (const block of blocks.slice(start)) {
+    if (isMetaBlock(block)) {
+      afterMeta = true;
+      continue;
+    }
+    if (isAssistantReportText(block)) {
+      afterMeta = false;
+      continue;
+    }
+    if (isAssistantReportListText(block)) {
+      afterMeta = false;
+      continue;
+    }
+    // Отчёт агента списком: «— Исправил дату», «— Заменил сумму».
+    if (
+      /^\s*(?:[-*•]|\d+[.)])\s+(?:исправил|исправила|заменил|заменила|обновил|обновила|добавил|добавила|удалил|удалила|изменил|изменила|оформил|оформила|настроил|настроила|сделал|сделала|переписал|переписала|сократил|сократила|вставил|вставила)(?![а-яёa-z])/i.test(
+        block
+      )
+    ) {
+      continue;
+    }
+    if (afterMeta && /^\s*([-*•]|\d+[.)])\s+/.test(block)) continue;
+    afterMeta = false;
+    if (isBlankBlock(block)) continue;
+    kept.push(block);
+  }
+
+  const result = stripTrailingMeta(kept.join('\n\n'));
+  return result || stripTrailingMeta(withoutActions);
 }
 
 function splitRow(line: string): string[] {

@@ -44,6 +44,25 @@ export interface OpenTab {
   activeSlide?: number;
 }
 
+/**
+ * Параметры страницы документа Word.
+ *
+ * Хранятся в самом .docx (sectPr и стили Normal), поэтому переживают
+ * сохранение и открытие файла в Word.
+ */
+export interface PageSetup {
+  widthMm?: number;
+  heightMm?: number;
+  marginTopMm?: number;
+  marginRightMm?: number;
+  marginBottomMm?: number;
+  marginLeftMm?: number;
+  fontFamily?: string;
+  fontSizePt?: number;
+  /** Множитель межстрочного интервала: 1 — одинарный, 1.5 — полуторный. */
+  lineSpacing?: number;
+}
+
 /* ============================================================
    AI
    ============================================================ */
@@ -101,6 +120,14 @@ export interface ChatMessage {
   error?: string;
   /** Признак незавершённого стрима. */
   streaming?: boolean;
+  /** Ответ уже изменил документ инструментами — вставлять его текст не нужно. */
+  toolsUsed?: boolean;
+  /** Инструменты, вызванные при подготовке ответа. */
+  toolTrace?: string[];
+  /** Дополнительные файлы, прочитанные по ходу ответа. */
+  contextFiles?: string[];
+  /** Запрос был точечной правкой: полная замена документа запрещена. */
+  preciseEdit?: boolean;
 }
 
 export interface ChatSession {
@@ -210,6 +237,7 @@ declare global {
       openFolderDialog: () => Promise<string | null>;
       openFileDialog: (filters?: { name: string; extensions: string[] }[]) => Promise<string | null>;
       saveFileDialog: (defaultName: string, filters?: { name: string; extensions: string[] }[], defaultDir?: string) => Promise<string | null>;
+      exportPdf: (html: string, suggestedName?: string, targetPath?: string) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
       uniquePath: (dirPath: string, fileName: string) => Promise<string>;
       showInExplorer: (filePath: string) => Promise<{ success: boolean; error?: string }>;
       setWorkspaceRoot: (dirPath: string) => Promise<{ success: boolean }>;

@@ -13,6 +13,8 @@ import {
 
 import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment, FileType } from './types';
 import { fileSystemService, getFileType } from './services/fileSystemService';
+import { getSheetController } from './services/sheetBridge';
+import { getPptxController } from './services/pptBridge';
 import { useWorkspace } from './state/workspace';
 import { useAISettings, useChatSessions } from './state/settings';
 import { useTheme } from './hooks/useTheme';
@@ -21,8 +23,19 @@ import { cn, baseName, extName, joinPath, uid } from './lib/utils';
 import { docxText, pptxText, tabToDocumentText, htmlToPlainText } from './lib/documentText';
 import { extractLegacyDocText } from './lib/legacyDoc';
 import { docxBase64ToHtml, htmlToDocxBase64 } from './lib/docx';
-import { markdownToDocumentHtml } from './lib/aiDocument';
+import { resolveWorkspacePath as resolvePathInsideWorkspace } from './lib/workspacePath';
+import { resolveImageSource } from './lib/imageSource';
 import {
+  getDocumentSession,
+  kindForTab,
+  listDocumentSessions,
+  registerDocumentSession,
+  removeDocumentSession,
+  updateDocumentSession,
+} from './lib/documentSession';
+import { extractDocumentContent, markdownToDocumentHtml } from './lib/aiDocument';
+import {
+  AGENT_TAB_TYPES,
   applyDocumentTool,
   BLOCK_TOOL_TAB_TYPES,
   DOCUMENT_TAB_TYPES,
@@ -30,6 +43,14 @@ import {
   type DocumentToolResult,
 } from './lib/documentModel';
 import { getDocumentController } from './services/docBridge';
+import { buildDocumentTools } from './services/aiTools';
+import { DOCUMENT_TEMPLATES } from './lib/templates';
+import {
+  insertMarkdownLink,
+  insertMarkdownTable,
+  setMarkdownHeading,
+  toggleMarkdownList,
+} from './lib/markdownOps';
 
 import { TitleBar } from './components/workspace/TitleBar';
 import { FileTree } from './components/workspace/FileTree';
@@ -44,7 +65,7 @@ import { MonacoEditorWrapper } from './components/editors/MonacoEditorWrapper';
 import { RichTextEditor } from './components/editors/RichTextEditor';
 import { ExcelEditor, AIAction } from './components/editors/ExcelEditor';
 import { WordEditor } from './components/editors/WordEditor';
-import { PowerPointViewer } from './components/editors/PowerPointViewer';
+import { PowerPointEditor } from './components/editors/PowerPointEditor';
 import { ImageViewer } from './components/editors/ImageViewer';
 import { BinaryViewer } from './components/editors/BinaryViewer';
 import { VideoEditor } from './components/editors/VideoEditor';
@@ -64,6 +85,27 @@ import {
 
 /** Форматы, в которые приложение умеет записывать правки ИИ. */
 const EDITABLE_TYPES = new Set<FileType>(['word', 'excel', 'markdown', 'richtext', 'text', 'code']);
+
+/** A1 → координаты (без листа). */
+function parseA1Cell(value: string): { row: number; col: number } | null {
+  const match = /^\$?([A-Za-z]{1,3})\$?(\d{1,7})$/.exec(value.trim());
+  if (!match) return null;
+  let col = 0;
+  const letters = match[1].toUpperCase();
+  for (const letter of letters) col = col * 26 + (letter.charCodeAt(0) - 64);
+  return { row: Number(match[2]) - 1, col: col - 1 };
+}
+
+function columnLabel(index: number): string {
+  let value = index + 1;
+  let label = '';
+  while (value > 0) {
+    const rest = (value - 1) % 26;
+    label = String.fromCharCode(65 + rest) + label;
+    value = Math.floor((value - 1) / 26);
+  }
+  return label;
+}
 
 const App: React.FC = () => {
   const ws = useWorkspace();
@@ -87,9 +129,35 @@ const App: React.FC = () => {
   wsRef.current = ws;
   const aiDocWriteRef = useRef(aiDocWrite);
   aiDocWriteRef.current = aiDocWrite;
+  const [aiExtraWrite, setAiExtraWrite] = useLocalStorage('ws_ai_extra_write', false);
+  const aiExtraWriteRef = useRef(aiExtraWrite);
+  aiExtraWriteRef.current = aiExtraWrite;
+  /** Снимок HTML на первую правку ответа: при ошибке весь ответ откатывается. */
+  const docTxnRef = useRef<{ id: string; html: string } | null>(null);
+
+  /** Реестр сессий открытых документов. */
+  useEffect(() => {
+    const openIds = new Set(ws.tabs.map((tab) => tab.id));
+    for (const tab of ws.tabs) {
+      registerDocumentSession({
+        id: tab.id,
+        kind: kindForTab(tab.type),
+        path: tab.path,
+        name: tab.name,
+        writeAccess: aiDocWrite,
+        tools: buildDocumentTools(aiDocWrite, tab.type).map((tool) => tool.function.name),
+      });
+    }
+    for (const session of listDocumentSessions()) {
+      if (!openIds.has(session.id)) removeDocumentSession(session.id);
+    }
+  }, [ws.tabs, aiDocWrite]);
   const [terminalOpen, setTerminalOpen] = useLocalStorage('ws_terminal_open', false);
   const [terminalHeight, setTerminalHeight] = useLocalStorage('ws_terminal_height', 240);
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState('');
+  const [templatesOpen, setTemplatesOpen] = useState(false);
   const [searchPanelOpen, setSearchPanelOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('provider');
@@ -207,6 +275,14 @@ const App: React.FC = () => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
+
+      // Ctrl+Shift+P — командная палитра
+      if ((e.key === 'P' || e.key === 'p') && e.shiftKey) {
+        e.preventDefault();
+        setCommandOpen(true);
+        setCommandQuery('');
+        return;
+      }
 
       // Ctrl+P — быстрый переход к файлу
       if (e.key === 'p' && !e.shiftKey) {
@@ -446,6 +522,31 @@ const App: React.FC = () => {
     [ws]
   );
 
+  const createFromTemplate = useCallback(
+    async (template: (typeof DOCUMENT_TEMPLATES)[number]) => {
+      try {
+        const base = template.name.replace(/[\\/:*?"<>|]/g, ' ').trim() || 'Документ';
+        const extension = template.extension;
+        const used = new Set((ws.allFiles ?? []).map((item) => item.name));
+        let name = `${base}.${extension}`;
+        let index = 2;
+        while (used.has(name)) name = `${base} (${index++}).${extension}`;
+
+        if (extension === 'docx') {
+          const base64 = await htmlToDocxBase64(template.html ?? '<p></p>');
+          await ws.createFile(ws.rootPath, name, base64, 'base64');
+        } else {
+          await ws.createFile(ws.rootPath, name, template.markdown ?? '', 'utf-8');
+        }
+        setTemplatesOpen(false);
+        ws.flash(`Создан «${name}»`);
+      } catch (error) {
+        ws.flash(`Не удалось создать документ: ${(error as Error).message}`);
+      }
+    },
+    [ws]
+  );
+
   const insertIntoEditor = useCallback(
     (text: string) => {
       const tab = ws.activeTab;
@@ -469,10 +570,17 @@ const App: React.FC = () => {
         return;
       }
 
+      // В документ попадает только сам текст: отчёт модели («Понял…»,
+      // «Готово», советы по оформлению, ```) вставлять нельзя.
+      const body =
+        tab.type === 'word' || tab.type === 'markdown' || tab.type === 'richtext'
+          ? extractDocumentContent(text) || text
+          : text;
+
       if (tab.type === 'word') {
         window.dispatchEvent(
           new CustomEvent('workspace:insert-text', {
-            detail: { tabId: tab.id, text },
+            detail: { tabId: tab.id, text: body },
           })
         );
         ws.flash('Текст вставлен в документ Word');
@@ -482,10 +590,10 @@ const App: React.FC = () => {
       if (tab.type === 'markdown' || tab.type === 'richtext') {
         window.dispatchEvent(
           new CustomEvent('workspace:insert-text', {
-            detail: { tabId: tab.id, text },
+            detail: { tabId: tab.id, text: body },
           })
         );
-        const next = tab.content ? `${tab.content}\n\n${text}` : text;
+        const next = tab.content ? `${tab.content}\n\n${body}` : body;
         ws.updateTabContent(tab.id, next);
         ws.flash('Текст вставлен в документ');
         return;
@@ -507,6 +615,10 @@ const App: React.FC = () => {
       const tab = ws.activeTab;
       if (!tab) return;
 
+      // Модель может прислать весь ответ чата: вступление, советы по
+      // оформлению и обёртку ```. В документ попадает только его текст.
+      const body = extractDocumentContent(text) || text;
+
       if (!EDITABLE_TYPES.has(tab.type)) {
         ws.flash(
           `Формат ${tab.extension.toUpperCase() || tab.type} доступен только для просмотра — правку некуда записать`
@@ -517,7 +629,7 @@ const App: React.FC = () => {
       if (tab.type === 'excel') {
         window.dispatchEvent(
           new CustomEvent('workspace:excel-replace-document', {
-            detail: { tabId: tab.id, text },
+            detail: { tabId: tab.id, text: body },
           })
         );
         ws.flash('Таблица заменена данными ответа');
@@ -525,15 +637,21 @@ const App: React.FC = () => {
       }
 
       if (tab.type === 'word') {
-        try {
-          const docTitle = tab.name.replace(/\.docx?$/i, '');
-          const base64 = await generateDocxBase64(text, docTitle);
-          ws.updateTabContent(tab.id, base64);
+        // Живой редактор сам пересоберёт пакет: сохранит поля страницы и
+        // вернёт картинки, которые модель не воспроизводит. Заголовок из
+        // имени файла при замене не подставляем — это не часть документа.
+        if (getDocumentController(tab.id)) {
           window.dispatchEvent(
             new CustomEvent('workspace:replace-document', {
-              detail: { tabId: tab.id, text, base64 },
+              detail: { tabId: tab.id, text: body },
             })
           );
+          ws.flash('Документ Word заменён ответом AI');
+          return;
+        }
+        try {
+          const base64 = await htmlToDocxBase64(markdownToDocumentHtml(body));
+          ws.updateTabContent(tab.id, base64);
           ws.flash('Документ Word заменён ответом AI');
         } catch (err) {
           ws.flash(`Ошибка замены документа: ${(err as Error).message}`);
@@ -542,18 +660,18 @@ const App: React.FC = () => {
       }
 
       if (tab.type === 'markdown' || tab.type === 'richtext') {
-        ws.updateTabContent(tab.id, text);
+        ws.updateTabContent(tab.id, body);
         window.dispatchEvent(
           new CustomEvent('workspace:replace-document', {
-            detail: { tabId: tab.id, text },
+            detail: { tabId: tab.id, text: body },
           })
         );
         ws.flash('Документ заменён ответом AI');
         return;
       }
 
-      ws.updateTabContent(tab.id, text);
-      editorApplier.current?.({ from: 0, to: tab.content.length, text });
+      ws.updateTabContent(tab.id, body);
+      editorApplier.current?.({ from: 0, to: tab.content.length, text: body });
       ws.flash('Документ заменён ответом AI');
     },
     [ws]
@@ -646,9 +764,13 @@ const App: React.FC = () => {
         ? current.tabs.find((item) => item.id === tabId)
         : current.activeTab;
 
-      if (!tab || !DOCUMENT_TAB_TYPES.has(tab.type)) {
+      if (!tab || !AGENT_TAB_TYPES.has(tab.type)) {
         return { ok: false, message: 'Документ закрыт или недоступен для правки' };
       }
+
+      updateDocumentSession(tab.id, {
+        capabilities: { read: true, write: aiDocWriteRef.current },
+      });
 
       if (DOCUMENT_WRITE_TOOLS.has(name) && !aiDocWriteRef.current) {
         return {
@@ -658,9 +780,402 @@ const App: React.FC = () => {
         };
       }
 
+      if (name.startsWith('excel_')) {
+        if (tab.type !== 'excel') {
+          return { ok: false, message: 'Инструменты Excel доступны только для открытой таблицы' };
+        }
+        const sheet = getSheetController(tab.id);
+        if (!sheet) return { ok: false, message: 'Редактор таблицы ещё не готов' };
+
+        if (name === 'excel_read') {
+          const read = sheet.readSheet(
+            args.sheet ? String(args.sheet) : undefined,
+            args.range ? String(args.range) : undefined,
+            Number(args.limit) || undefined
+          );
+          if (!read) return { ok: false, message: 'Лист или диапазон не найдены' };
+          const startRow = read.cells[0] ? parseA1Cell(read.cells[0].address)?.row ?? 0 : 0;
+          const table = read.rows
+            .map((row, index) => `${startRow + index + 1}\t${row.join('\t')}`)
+            .join('\n');
+          const header = `Лист «${read.sheet}», диапазон ${read.range}${
+            read.truncated ? ' (обрезано)' : ''
+          }. Листы: ${read.sheetNames.join(', ')}`;
+          return {
+            ok: true,
+            message: header,
+            changed: false,
+            content: table,
+            structure: `${header}\n${table}`,
+            meta: { sheet: read.sheet, sheetNames: read.sheetNames, cells: read.cells },
+          };
+        }
+
+        if (name === 'excel_get_selection') {
+          const read = sheet.getSelection();
+          if (!read) return { ok: false, message: 'Нет активного выделения' };
+          const table = read.rows.map((row, index) => `${index + 1}\t${row.join('\t')}`).join('\n');
+          return {
+            ok: true,
+            message: `Выделено: лист «${read.sheet}», диапазон ${read.range}`,
+            changed: false,
+            content: table,
+            structure: table,
+            meta: { sheet: read.sheet, range: read.range, cells: read.cells },
+          };
+        }
+
+        if (name === 'excel_write_cells') {
+          const cells: Array<{ address: string; value: string }> = [];
+          if (Array.isArray(args.cells)) {
+            for (const item of args.cells) {
+              if (!item || typeof item !== 'object') continue;
+              const address = String((item as Record<string, unknown>).address ?? '');
+              const value = (item as Record<string, unknown>).value;
+              if (address) cells.push({ address, value: value == null ? '' : String(value) });
+            }
+          } else if (typeof args.range === 'string' && Array.isArray(args.values)) {
+            const [startRef, endRef] = args.range.split(':');
+            const start = parseA1Cell(startRef);
+            const end = parseA1Cell(endRef || startRef);
+            if (start && end) {
+              const matrix = args.values as unknown[];
+              for (let row = start.row; row <= end.row; row += 1) {
+                const line = Array.isArray(matrix[row - start.row])
+                  ? (matrix[row - start.row] as unknown[])
+                  : [];
+                for (let col = start.col; col <= end.col; col += 1) {
+                  cells.push({
+                    address: `${columnLabel(col)}${row + 1}`,
+                    value: line[col - start.col] == null ? '' : String(line[col - start.col]),
+                  });
+                }
+              }
+            }
+          }
+          if (cells.length === 0) {
+            return { ok: false, message: 'Передайте cells или range + values' };
+          }
+          const result = sheet.writeCells(
+            args.sheet ? String(args.sheet) : undefined,
+            cells,
+            transactionId
+          );
+          return result;
+        }
+
+        if (name === 'excel_add_sheet') {
+          return sheet.addSheet(args.name ? String(args.name) : undefined);
+        }
+        if (name === 'excel_rename_sheet') {
+          return sheet.renameSheet(
+            String(args.old_name ?? args.oldName ?? ''),
+            String(args.new_name ?? args.newName ?? '')
+          );
+        }
+        if (name === 'excel_delete_sheet') {
+          return sheet.deleteSheet(String(args.name ?? ''));
+        }
+        if (name === 'excel_set_active_sheet') {
+          return sheet.setActiveSheet(String(args.name ?? ''));
+        }
+        if (name === 'excel_insert_rows') {
+          return sheet.insertRows(
+            args.sheet ? String(args.sheet) : undefined,
+            Math.max(0, (Number(args.index) || 1) - 1),
+            Math.max(1, Number(args.count) || 1)
+          );
+        }
+        if (name === 'excel_delete_rows') {
+          return sheet.deleteRows(
+            args.sheet ? String(args.sheet) : undefined,
+            Math.max(0, (Number(args.index) || 1) - 1),
+            Math.max(1, Number(args.count) || 1)
+          );
+        }
+        if (name === 'excel_insert_columns') {
+          return sheet.insertColumns(
+            args.sheet ? String(args.sheet) : undefined,
+            Math.max(0, (Number(args.index) || 1) - 1),
+            Math.max(1, Number(args.count) || 1)
+          );
+        }
+        if (name === 'excel_delete_columns') {
+          return sheet.deleteColumns(
+            args.sheet ? String(args.sheet) : undefined,
+            Math.max(0, (Number(args.index) || 1) - 1),
+            Math.max(1, Number(args.count) || 1)
+          );
+        }
+        if (name === 'excel_merge_cells') {
+          return sheet.mergeCells(
+            args.sheet ? String(args.sheet) : undefined,
+            String(args.range ?? '')
+          );
+        }
+        if (name === 'excel_unmerge_cells') {
+          return sheet.unmergeCells(
+            args.sheet ? String(args.sheet) : undefined,
+            String(args.range ?? '')
+          );
+        }
+        if (name === 'excel_format_range') {
+          const patch: Parameters<typeof sheet.formatRange>[2] = {};
+          if (args.bold !== undefined) patch.bold = Boolean(args.bold);
+          if (args.italic !== undefined) patch.italic = Boolean(args.italic);
+          if (args.fill) patch.fill = String(args.fill);
+          if (args.color) patch.color = String(args.color);
+          if (Number(args.font_size)) patch.fontSize = Number(args.font_size);
+          const align = String(args.align ?? '');
+          if (align === 'left' || align === 'center' || align === 'right') patch.align = align;
+          if (args.wrap !== undefined) patch.wrap = Boolean(args.wrap);
+          return sheet.formatRange(
+            args.sheet ? String(args.sheet) : undefined,
+            String(args.range ?? ''),
+            patch
+          );
+        }
+
+        return { ok: false, message: `Неизвестный инструмент Excel: ${name}` };
+      }
+
+      if (name.startsWith('pptx_')) {
+        if (tab.type !== 'powerpoint') {
+          return { ok: false, message: 'Инструменты PowerPoint доступны только для презентации' };
+        }
+        const ppt = getPptxController(tab.id);
+        if (!ppt) return { ok: false, message: 'Редактор презентации ещё не готов' };
+
+        if (name === 'pptx_read') {
+          const model = await ppt.readModel();
+          const lines = model.slides.map((slide) => {
+            const shapes = slide.shapes
+              .map(
+                (shape) =>
+                  `  shape_id=${shape.shapeId}${shape.isTitle ? ' [title]' : ''} «${shape.text.replace(/\s+/g, ' ').slice(0, 160)}»`
+              )
+              .join('\n');
+            const notes = slide.notes ? `\n  заметки: ${slide.notes}` : '';
+            return `Слайд ${slide.index + 1} (${slide.shapes.length} фигур):\n${shapes || '  (текста нет)'}${notes}`;
+          });
+          return {
+            ok: true,
+            message: `Слайдов: ${model.slides.length}`,
+            changed: false,
+            structure: `Макеты: ${
+              model.layouts.map((layout) => `${layout.index}. ${layout.name}`).join(', ') ||
+              '(нет)'
+            }\n\n${lines.join('\n\n')}`,
+            meta: {
+              width: model.width,
+              height: model.height,
+              layouts: model.layouts,
+              slides: model.slides.map((slide) => ({
+                index: slide.index,
+                shapes: slide.shapes.map((shape) => ({
+                  shapeId: shape.shapeId,
+                  name: shape.name,
+                  text: shape.text,
+                  isTitle: shape.isTitle,
+                })),
+              })),
+            },
+          };
+        }
+
+        if (name === 'pptx_get_selection') {
+          const selection = ppt.getSelection();
+          if (!selection) return { ok: false, message: 'Нет выделенной текстовой фигуры' };
+          return {
+            ok: true,
+            message: `Выделена фигура ${selection.shapeId} на слайде ${selection.slide + 1}`,
+            changed: false,
+            content: selection.text,
+            selection: {
+              blockId: selection.shapeId,
+              startOffset: 0,
+              endOffset: selection.text.length,
+              text: selection.text,
+              html: '',
+            },
+            meta: { slide: selection.slide, shapeId: selection.shapeId, paragraphs: selection.paragraphs },
+          };
+        }
+
+        if (name === 'pptx_set_text') {          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          const text = String(args.text ?? args.content ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          return ppt.setText(slide, shapeId, text.split('\n'));
+        }
+
+        if (name === 'pptx_add_slide') {
+          const model = await ppt.readModel();
+          const requested = Number(args.index ?? args.after);
+          const index = Number.isFinite(requested)
+            ? Math.max(0, Math.min(requested, model.slides.length))
+            : model.slides.length;
+          return ppt.addSlide(index, String(args.title ?? 'Новый слайд'));
+        }
+
+        if (name === 'pptx_delete_slide') {
+          const index = Math.max(1, Number(args.index) || 1) - 1;
+          return ppt.deleteSlide(index);
+        }
+
+        if (name === 'pptx_move_slide') {
+          const from = Math.max(1, Number(args.from) || 1) - 1;
+          const to = Math.max(1, Number(args.to) || 1) - 1;
+          return ppt.moveSlide(from, to);
+        }
+
+        if (name === 'pptx_add_text_box') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const text = String(args.text ?? args.content ?? '');
+          if (!text.trim()) return { ok: false, message: 'Пустой текст фигуры' };
+          return ppt.addTextBox(slide, text);
+        }
+
+        if (name === 'pptx_insert_image') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const src = String(args.src ?? args.image ?? '').trim();
+          if (!src) return { ok: false, message: 'Не указан источник изображения' };
+          const root =
+            current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+          const resolved = await resolveImageSource(src, root);
+          if (!resolved.ok) return { ok: false, message: resolved.message };
+          return ppt.addImage(slide, resolved.dataUrl, {
+            width: args.width !== undefined ? Number(args.width) : undefined,
+            height: args.height !== undefined ? Number(args.height) : undefined,
+            x: args.x !== undefined ? Number(args.x) : undefined,
+            y: args.y !== undefined ? Number(args.y) : undefined,
+            alt: typeof args.alt === 'string' ? args.alt : undefined,
+          });
+        }
+
+        if (name === 'pptx_set_layout') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const requested = String(args.layout ?? args.name ?? args.part ?? '').trim();
+          if (!requested) return { ok: false, message: 'Не указан макет' };
+          const model = await ppt.readModel();
+          const numeric = /^\d+$/.test(requested) ? Number(requested) : 0;
+          const layout = numeric
+            ? model.layouts[numeric - 1]
+            : model.layouts.find(
+                (item) =>
+                  item.name.toLowerCase() === requested.toLowerCase() ||
+                  item.part.toLowerCase() === requested.toLowerCase()
+              );
+          if (!layout) {
+            return {
+              ok: false,
+              message: `Макет «${requested}» не найден. Доступны: ${model.layouts
+                .map((item) => item.name)
+                .join(', ')}`,
+            };
+          }
+          return ppt.setLayout(slide, layout.part);
+        }
+
+        if (name === 'pptx_set_notes') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const text = String(args.text ?? args.content ?? '');
+          return ppt.setNotes(slide, text);
+        }
+
+        return { ok: false, message: `Неизвестный инструмент PowerPoint: ${name}` };
+      }
+
+      if (name.startsWith('md_')) {
+        if (!['markdown', 'richtext', 'text'].includes(tab.type)) {
+          return { ok: false, message: 'Markdown-инструменты доступны только для текстовых документов' };
+        }
+        const content = String(tab.content ?? '');
+        if (name === 'md_read') {
+          return {
+            ok: true,
+            message: `Файл «${tab.name}», символов: ${content.length}`,
+            changed: false,
+            content,
+            structure: content.slice(0, 12000),
+          };
+        }
+        if (name === 'md_replace') {
+          const find = String(args.find ?? '');
+          const replace = String(args.replace ?? '');
+          if (!find) return { ok: false, message: 'Не указан текст для поиска' };
+          const all = args.all === true || args.all === 'true';
+          const next = all
+            ? content.split(find).join(replace)
+            : content.replace(find, replace);
+          if (next === content) {
+            return { ok: false, message: `Текст «${find}» не найден` };
+          }
+          current.updateTabContent(tab.id, next);
+          return { ok: true, message: all ? 'Все вхождения заменены' : 'Вхождение заменено', changed: true };
+        }
+        if (name === 'md_append') {
+          const text = String(args.text ?? args.content ?? '');
+          if (!text.trim()) return { ok: false, message: 'Пустой текст для добавления' };
+          const next = `${content.replace(/\s*$/, '')}\n\n${text}`;
+          current.updateTabContent(tab.id, next);
+          return { ok: true, message: 'Текст добавлен в конец', changed: true };
+        }
+        if (name === 'md_replace_document') {
+          const text = String(args.text ?? args.content ?? '');
+          if (!text.trim()) return { ok: false, message: 'Пустой текст документа' };
+          current.updateTabContent(tab.id, text);
+          return { ok: true, message: 'Документ заменён', changed: true };
+        }
+        if (name === 'md_set_heading') {
+          const result = setMarkdownHeading(
+            content,
+            String(args.find ?? ''),
+            Number(args.level ?? 2)
+          );
+          if (!result.ok) return { ok: false, message: result.message };
+          current.updateTabContent(tab.id, result.text);
+          return { ok: true, message: result.message, changed: true };
+        }
+        if (name === 'md_toggle_list') {
+          const result = toggleMarkdownList(
+            content,
+            String(args.find ?? ''),
+            args.style === 'numbered' ? 'numbered' : 'bullet'
+          );
+          if (!result.ok) return { ok: false, message: result.message };
+          current.updateTabContent(tab.id, result.text);
+          return { ok: true, message: result.message, changed: true };
+        }
+        if (name === 'md_insert_link') {
+          const result = insertMarkdownLink(
+            content,
+            String(args.find ?? ''),
+            String(args.text ?? args.label ?? ''),
+            String(args.url ?? '')
+          );
+          if (!result.ok) return { ok: false, message: result.message };
+          current.updateTabContent(tab.id, result.text);
+          return { ok: true, message: result.message, changed: true };
+        }
+        if (name === 'md_insert_table') {
+          const headers = Array.isArray(args.headers)
+            ? args.headers.map((value) => String(value))
+            : [];
+          const rows = Array.isArray(args.rows)
+            ? args.rows.map((row) => (Array.isArray(row) ? row.map((value) => String(value)) : []))
+            : [];
+          const result = insertMarkdownTable(content, headers, rows);
+          if (!result.ok) return { ok: false, message: result.message };
+          current.updateTabContent(tab.id, result.text);
+          return { ok: true, message: result.message, changed: true };
+        }
+        return { ok: false, message: `Неизвестный Markdown-инструмент: ${name}` };
+      }
+
       if (
         !BLOCK_TOOL_TAB_TYPES.has(tab.type) &&
-        !['get_document', 'replace_document', 'find_replace'].includes(name)
+        !['get_document', 'get_document_info', 'replace_document', 'find_replace', 'search_document', 'read_document'].includes(name)
       ) {
         return {
           ok: false,
@@ -670,6 +1185,273 @@ const App: React.FC = () => {
 
       try {
         const controller = getDocumentController(tab.id);
+        if (tab.type === 'word' && controller) {
+          if (!docTxnRef.current || docTxnRef.current.id !== transactionId) {
+            docTxnRef.current = { id: transactionId, html: controller.readHtml() };
+          }
+        }
+
+        // Колонтитулы меняются в OOXML-пакете, а не в HTML-полотне.
+        if (name === 'set_header_footer' || name === 'delete_header_footer') {
+          const kindRaw = String(args.kind ?? args.part ?? 'header').toLowerCase();
+          if (kindRaw !== 'header' && kindRaw !== 'footer') {
+            return { ok: false, message: 'kind должен быть "header" или "footer"' };
+          }
+          const typeRaw = String(args.type ?? args.reference_type ?? args.referenceType ?? 'default').toLowerCase();
+          const referenceType =
+            typeRaw === 'first' || typeRaw === 'even' ? typeRaw : 'default';
+          const remove =
+            name === 'delete_header_footer' || args.remove === true || args.remove === 'true';
+          const text = String(args.text ?? args.content ?? '');
+
+          if (!remove && !text.trim()) {
+            return { ok: false, message: 'Пустой текст колонтитула' };
+          }
+          if (!controller?.setHeaderFooter) {
+            return {
+              ok: false,
+              message: 'Колонтитулы доступны только в документе Word',
+            };
+          }
+
+          const edit = await controller.setHeaderFooter({
+            kind: kindRaw,
+            referenceType,
+            text,
+            remove,
+          });
+          return edit;
+        }
+
+        // Запись в другой файл — только после явного разрешения в панели AI.
+        if (name === 'write_document') {
+          if (!aiExtraWriteRef.current) {
+            return {
+              ok: false,
+              message:
+                'Запись в дополнительные файлы запрещена. Включите «Доп. файлы: запись» в панели AI.',
+            };
+          }
+          const requested = String(args.path ?? args.file ?? '');
+          const root =
+            current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+          const targetPath = resolvePathInsideWorkspace(root, requested);
+          if (!targetPath) {
+            return { ok: false, message: `Путь «${requested}» вне рабочей папки` };
+          }
+
+          const ext = targetPath.split('.').pop()?.toLowerCase() ?? '';
+          let payload = '';
+          let encoding = 'utf-8';
+          if (ext === 'docx') {
+            const html = String(
+              args.html ??
+                markdownToDocumentHtml(String(args.text ?? args.content ?? ''))
+            );
+            payload = await htmlToDocxBase64(html);
+            encoding = 'base64';
+          } else if (['md', 'markdown', 'txt', 'text'].includes(ext)) {
+            payload = String(args.text ?? args.content ?? '');
+          } else if (ext === 'xlsx' || ext === 'xlsm') {
+            const columns = Array.isArray(args.columns)
+              ? args.columns.map((value) => String(value))
+              : [];
+            const rows = Array.isArray(args.rows)
+              ? args.rows.map((row) =>
+                  Array.isArray(row)
+                    ? row.map((value) =>
+                        typeof value === 'number' || typeof value === 'boolean'
+                          ? value
+                          : String(value ?? '')
+                      )
+                    : []
+                )
+              : [];
+            if (columns.length === 0 && rows.length === 0) {
+              return { ok: false, message: 'Для .xlsx нужны columns или rows' };
+            }
+            payload = generateExcelBase64(
+              columns,
+              rows,
+              String(args.sheet ?? 'Лист 1')
+            );
+            encoding = 'base64';
+          } else {
+            return {
+              ok: false,
+              message: `Запись в «${ext || 'без расширения'}» пока не поддерживается: доступны .docx, .xlsx, .md и .txt`,
+            };
+          }
+
+          try {
+            await fileSystemService.writeFile(targetPath, payload, encoding);
+          } catch (error) {
+            return {
+              ok: false,
+              message: `Не удалось записать файл: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            };
+          }
+
+          const openTab = current.tabs.find((item) => item.path === targetPath);
+          if (openTab) current.updateTabContent(openTab.id, payload);
+          else await current.refreshTree();
+          return { ok: true, message: `Файл «${requested}» обновлён`, changed: true };
+        }
+
+        // Служебные части Word: колонтитулы, сноски, комментарии, стили.
+        if (name === 'get_document_info') {
+          const info = await controller?.getDocumentInfo?.();
+          if (!info) {
+            return {
+              ok: false,
+              message: 'Информация о пакете доступна только для документа Word',
+            };
+          }
+          const lines = [
+            `Документ: ${tab.name} (documentId: ${tab.id})`,
+            `Частей в пакете: ${info.parts.length}`,
+            `Секций: ${info.sections}`,
+            info.styleNames.length
+              ? `Стили: ${info.styleNames.slice(0, 40).join(', ')}`
+              : 'Именованных стилей нет',
+            info.headers.length
+              ? `Верхние колонтитулы: ${info.headers.map((part) => `${part.name} — ${part.text || '(пусто)'}`).join(' | ')}`
+              : 'Верхних колонтитулов нет',
+            info.footers.length
+              ? `Нижние колонтитулы: ${info.footers.map((part) => `${part.name} — ${part.text || '(пусто)'}`).join(' | ')}`
+              : 'Нижних колонтитулов нет',
+            info.footnotes ? `Сноски: ${info.footnotes}` : 'Сносок нет',
+            info.comments ? `Комментарии: ${info.comments}` : 'Комментариев нет',
+          ];
+          return {
+            ok: true,
+            message: 'Информация о документе получена',
+            changed: false,
+            structure: lines.join('\n'),
+            meta: {
+              documentId: tab.id,
+              sections: info.sections,
+              headers: info.headers,
+              footers: info.footers,
+              footnotes: info.footnotes,
+              comments: info.comments,
+              styleNames: info.styleNames,
+              parts: info.parts,
+            },
+          };
+        }
+
+        // Другой файл workspace — только чтение. Запись в него не входит в
+        // инструменты: доп. документы по умолчанию read-only.
+        if (name === 'read_document') {
+          const requested = String(args.path ?? args.file ?? args.name ?? '');
+          const root =
+            current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+          const targetPath = resolvePathInsideWorkspace(root, requested);
+          if (!targetPath) {
+            return {
+              ok: false,
+              message: `Путь «${requested}» вне рабочей папки или не указан. Доступны только файлы workspace.`,
+            };
+          }
+
+          const ext = targetPath.split('.').pop()?.toLowerCase() ?? '';
+          const type = getFileType(ext);
+          const binary = ['word', 'excel', 'powerpoint'].includes(type);
+          let read: { content: string; isBinary: boolean };
+          try {
+            read = await fileSystemService.readFile(targetPath, binary ? 'base64' : 'utf-8');
+          } catch (error) {
+            return {
+              ok: false,
+              message: `Не удалось прочитать «${requested}»: ${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+
+          let text = '';
+          if (ext === 'docx') text = await docxText(read.content);
+          else if (ext === 'pptx') text = await pptxText(read.content);
+          else if (ext === 'doc') text = await extractLegacyDocText(read.content);
+          else if (type === 'excel') {
+            text = await tabToDocumentText({
+              type: 'excel',
+              content: read.content,
+              encoding: 'base64',
+            } as OpenTab);
+          } else if (['markdown', 'richtext', 'text', 'code'].includes(type)) {
+            text = String(read.content);
+          } else {
+            return {
+              ok: false,
+              message: `Формат «${ext || 'без расширения'}» не поддерживается для чтения: доступны Word, Excel, PowerPoint, Markdown и текст.`,
+            };
+          }
+
+          if (!text.trim()) return { ok: false, message: `Файл «${requested}» пуст или не разобран` };
+          const limit = 30000;
+          const truncated = text.length > limit;
+          return {
+            ok: true,
+            message: `Прочитан файл «${requested}»${truncated ? ` (первые ${limit} символов)` : ''}. Только чтение.`,
+            changed: false,
+            content: truncated ? `${text.slice(0, limit)}\n…` : text,
+            meta: { path: targetPath, truncated, length: text.length },
+          };
+        }
+
+        // Картинка из файла workspace превращается в data URL: документ
+        // хранит изображения внутри .docx, а не ссылками на диск.
+        if (name === 'insert_image' && typeof args.src === 'string' && args.src.trim()) {
+          const root =
+            current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+          const resolved = await resolveImageSource(args.src, root);
+          if (!resolved.ok) return { ok: false, message: resolved.message };
+          args = { ...args, src: resolved.dataUrl };
+        }
+
+        // Выделение живёт только в живом полотне: читаем и правим его без
+        // пересборки HTML всего документа.
+        if (
+          name === 'get_selection' ||
+          name === 'replace_selection' ||
+          name === 'insert_at_cursor'
+        ) {
+          const selection = controller?.getSelection?.() ?? null;
+          if (name === 'get_selection') {
+            if (!selection || !selection.text) {
+              return {
+                ok: false,
+                message: 'Нет выделенного текста в документе: попросите пользователя выделить фрагмент',
+              };
+            }
+            return {
+              ok: true,
+              message: `Выделение: блок ${selection.blockId}, символы ${selection.startOffset}–${selection.endOffset}`,
+              changed: false,
+              content: selection.text,
+              selection,
+            };
+          }
+
+          const raw = String(args.html ?? args.content ?? args.text ?? '');
+          if (!raw.trim()) return { ok: false, message: 'Пустой фрагмент для правки выделения' };
+
+          const edit =
+            name === 'replace_selection'
+              ? controller?.replaceSelection?.(raw, transactionId)
+              : controller?.insertAtSelection?.(raw, transactionId);
+
+          if (!edit) {
+            return {
+              ok: false,
+              message: 'Редактор не поддерживает работу с выделением: откройте документ Word',
+            };
+          }
+          return { ok: edit.ok, message: edit.message, changed: edit.changed };
+        }
+
         let html = '';
 
         if (tab.type === 'word') {
@@ -679,7 +1461,22 @@ const App: React.FC = () => {
         }
 
         const result = applyDocumentTool(html, name, args);
-        if (!result.ok) return result;
+        if (!result.ok) {
+          if (
+            tab.type === 'word' &&
+            controller?.restoreHtml &&
+            docTxnRef.current?.id === transactionId
+          ) {
+            controller.restoreHtml(docTxnRef.current.html);
+          }
+          return result;
+        }
+
+        // Поля, размер страницы и базовый шрифт живут в .docx, а не в HTML:
+        // передаём их живому редактору, он пересоберёт пакет.
+        if (result.page && tab.type === 'word') {
+          getDocumentController(tab.id)?.applyPageSetup?.(result.page);
+        }
 
         if (result.changed && result.html !== undefined) {
           if (tab.type === 'word') {
@@ -1492,7 +2289,7 @@ const App: React.FC = () => {
       case 'word':
         return <WordEditor {...common} />;
       case 'powerpoint':
-        return <PowerPointViewer tab={tab} onAskAI={askAI} />;
+        return <PowerPointEditor {...common} />;
       case 'pdf':
         return (
           <embed
@@ -1796,12 +2593,160 @@ const App: React.FC = () => {
               onResolveActiveDocument={resolveActiveDocument}
               docWriteAccess={aiDocWrite}
               onToggleDocWriteAccess={setAiDocWrite}
+              extraWriteAccess={aiExtraWrite}
+              onToggleExtraWriteAccess={setAiExtraWrite}
             />
           </div>
         )}
       </div>
 
       {/* ---- Оверлеи ---- */}
+      {templatesOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-24"
+          onClick={() => setTemplatesOpen(false)}
+        >
+          <div
+            data-template-palette="1"
+            className="w-full max-w-xl overflow-hidden rounded-lg border border-ws bg-ws-surface p-2 shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-2 py-1">
+              <span className="text-xs font-medium text-ws">Шаблоны документов</span>
+              <button
+                onClick={() => setTemplatesOpen(false)}
+                className="rounded px-1 text-ws-faint hover:bg-ws-hover hover:text-ws"
+              >
+                ×
+              </button>
+            </div>
+            <div className="max-h-96 overflow-y-auto">
+              {DOCUMENT_TEMPLATES.map((template) => (
+                <button
+                  key={template.id}
+                  data-template-item={template.id}
+                  onClick={() => void createFromTemplate(template)}
+                  className="flex w-full flex-col gap-0.5 rounded px-2 py-1.5 text-left hover:bg-ws-hover"
+                >
+                  <span className="flex items-center gap-2 text-xs text-ws">
+                    {template.name}
+                    <span className="rounded border border-ws px-1 text-[9px] text-ws-faint">
+                      {template.extension}
+                    </span>
+                  </span>
+                  <span className="text-[10px] text-ws-faint">{template.description}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {commandOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-24"
+          onClick={() => setCommandOpen(false)}
+        >
+          <div
+            data-command-palette="1"
+            className="w-full max-w-lg overflow-hidden rounded-lg border border-ws bg-ws-surface shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <input
+              data-command-input="1"
+              autoFocus
+              value={commandQuery}
+              onChange={(event) => setCommandQuery(event.target.value)}
+              placeholder="Команда…"
+              className="w-full border-b border-ws bg-ws-elevated px-3 py-2 text-sm text-ws placeholder:text-ws-faint focus:outline-none"
+            />
+            <div className="max-h-80 overflow-y-auto p-1">
+              {[
+                {
+                  label: 'Сохранить активный файл',
+                  hint: 'Ctrl+S',
+                  run: () => {
+                    const tab = ws.activeTab;
+                    if (tab) void ws.saveTab(tab.id);
+                  },
+                },
+                {
+                  label: 'Сохранить все файлы',
+                  hint: '',
+                  run: () => void ws.saveAll(),
+                },
+                {
+                  label: 'Быстрый переход к файлу',
+                  hint: 'Ctrl+P',
+                  run: () => setQuickOpenOpen(true),
+                },
+                {
+                  label: 'Поиск по workspace',
+                  hint: 'Ctrl+Shift+F',
+                  run: () => {
+                    setSearchPanelOpen(true);
+                    setSidebarOpen(true);
+                  },
+                },
+                {
+                  label: 'Найти и заменить в Word',
+                  hint: '',
+                  run: () => window.dispatchEvent(new CustomEvent('workspace:word-find')),
+                },
+                {
+                  label: 'История правок AI',
+                  hint: '',
+                  run: () => window.dispatchEvent(new CustomEvent('workspace:word-history')),
+                },
+                {
+                  label: 'Версии документа',
+                  hint: '',
+                  run: () => window.dispatchEvent(new CustomEvent('workspace:word-versions')),
+                },
+                {
+                  label: 'Показать/скрыть AI-панель',
+                  hint: '',
+                  run: () => setAiPanelOpen((value) => !value),
+                },
+                {
+                  label: 'Показать/скрыть терминал',
+                  hint: '',
+                  run: () => setTerminalOpen((value) => !value),
+                },
+                {
+                  label: 'Создать из шаблона',
+                  hint: '',
+                  run: () => setTemplatesOpen(true),
+                },
+                {
+                  label: 'Настройки',
+                  hint: '',
+                  run: () => setSettingsOpen(true),
+                },
+              ]
+                .filter((item) =>
+                  item.label.toLowerCase().includes(commandQuery.trim().toLowerCase())
+                )
+                .map((item) => (
+                  <button
+                    key={item.label}
+                    data-command-item="1"
+                    onClick={() => {
+                      setCommandOpen(false);
+                      setCommandQuery('');
+                      item.run();
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs text-ws hover:bg-ws-hover"
+                  >
+                    <span>{item.label}</span>
+                    {item.hint && <span className="text-[10px] text-ws-faint">{item.hint}</span>}
+                  </button>
+                ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       <QuickOpenModal
         isOpen={quickOpenOpen}
         onClose={() => setQuickOpenOpen(false)}

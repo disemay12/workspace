@@ -42,6 +42,8 @@ import {
   Play,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { registerSheetController } from '../../services/sheetBridge';
+import type { SheetEditResult, SheetReadResult } from '../../services/sheetBridge';
 import { ClipboardPaste, Undo2, Redo2 } from 'lucide-react';
 import { parseClipboardTable } from '../../lib/clipboardTable';
 import * as SheetFmt from '../../lib/sheetFormatting';
@@ -213,6 +215,9 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [history, setHistory] = useState<WorkbookSnapshot[]>([]);
+  const [aiDiff, setAiDiff] = useState<{
+    cells: Array<{ address: string; before: string; after: string }>;
+  } | null>(null);
   const [future, setFuture] = useState<WorkbookSnapshot[]>([]);
   /** Перечитывание файла после правок в настоящем Excel. */
   const [reloadToken, setReloadToken] = useState(0);
@@ -418,6 +423,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       setSheets(parsed);
       setHistory([]);
       setFuture([]);
+      setAiDiff(null);
     } catch (err) {
       setError(`Не удалось открыть таблицу: ${(err as Error).message}`);
     } finally {
@@ -728,6 +734,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
 
       metaRef.current = nextMeta;
       setMeta(nextMeta);
+      sheetsRef.current = next;
       syncWorkbook(next, sheetNamesRef.current);
       setSheets(next);
     },
@@ -2028,11 +2035,14 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     setSelected((s) => ({ ...s, col: Math.max(0, Math.min(s.col, (grid[0]?.length ?? 2) - 2)) }));
   };
 
-  const addSheet = () => {
+  const addSheet = (requestedName?: string) => {
     const existing = new Set(sheetNames);
-    let n = sheetNames.length + 1;
-    while (existing.has(`Лист ${n}`)) n++;
-    const name = `Лист ${n}`;
+    let name = requestedName?.trim() ?? '';
+    if (!name || existing.has(name)) {
+      let n = sheetNames.length + 1;
+      while (existing.has(`Лист ${n}`)) n++;
+      name = `Лист ${n}`;
+    }
     const newGrid: Grid = Array.from({ length: MIN_ROWS }, () => new Array(MIN_COLS).fill(''));
 
     const nextSheets = { ...sheetsRef.current, [name]: newGrid };
@@ -2041,9 +2051,12 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     setFuture([]);
     metaRef.current = nextMeta;
     setMeta(nextMeta);
-    syncWorkbook(nextSheets, [...sheetNames, name]);
+    sheetsRef.current = nextSheets;
+    const nextNames = [...sheetNames, name];
+    sheetNamesRef.current = nextNames;
+    syncWorkbook(nextSheets, nextNames);
     setSheets(nextSheets);
-    setSheetNames((prev) => [...prev, name]);
+    setSheetNames(nextNames);
     setActiveSheet(name);
     setSelected({ row: 0, col: 0 });
   };
@@ -2060,6 +2073,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     pushHistory();
     metaRef.current = nextMeta;
     setMeta(nextMeta);
+    sheetsRef.current = nextSheets;
+    sheetNamesRef.current = names;
     syncWorkbook(nextSheets, names);
     setSheets(nextSheets);
     setSheetNames(names);
@@ -2081,6 +2096,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     pushHistory();
     metaRef.current = nextMeta;
     setMeta(nextMeta);
+    sheetsRef.current = nextSheets;
+    sheetNamesRef.current = names;
     syncWorkbook(nextSheets, names);
     setSheets(nextSheets);
     setSheetNames(names);
@@ -2305,6 +2322,280 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     [activeSheet, applyBatch, onAIApply, parseTarget, sheets]
   );
 
+  /* ---------------- Мост для AI-инструментов таблицы ---------------- */
+
+  useEffect(() => {
+    return registerSheetController({
+      tabId: tab.id,
+      readSheet: (sheet, range, limit) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const grid = sheetsRef.current[target];
+        if (!grid) return null;
+
+        let start: CellCoord = { row: 0, col: 0 };
+        let end: CellCoord = { row: 0, col: 0 };
+        if (range) {
+          const parsed = parseTarget(`${target}!${range}`);
+          if (!parsed) return null;
+          start = parsed.range.start;
+          end = parsed.range.end;
+        } else {
+          let lastRow = 0;
+          let lastCol = 0;
+          for (let row = 0; row < grid.length; row += 1) {
+            for (let col = 0; col < (grid[row]?.length ?? 0); col += 1) {
+              if (String(grid[row][col] ?? '').trim()) {
+                lastRow = Math.max(lastRow, row);
+                lastCol = Math.max(lastCol, col);
+              }
+            }
+          }
+          end = { row: lastRow, col: lastCol };
+        }
+
+        const maxCells = Math.max(1, Math.min(limit ?? 400, 1200));
+        const rows: string[][] = [];
+        const cells: SheetReadResult['cells'] = [];
+        let truncated = false;
+
+        outer: for (let row = start.row; row <= end.row; row += 1) {
+          const values: string[] = [];
+          for (let col = start.col; col <= end.col; col += 1) {
+            if (cells.length >= maxCells) {
+              truncated = true;
+              break outer;
+            }
+            const raw = String(grid[row]?.[col] ?? '');
+            const display = computeCellDisplay(sheetsRef.current, target, row, col);
+            values.push(display);
+            cells.push({
+              address: `${columnName(col)}${row + 1}`,
+              value: raw,
+              formula: raw.startsWith('=') ? raw : '',
+              display,
+            });
+          }
+          rows.push(values);
+        }
+
+        return {
+          sheet: target,
+          sheetNames: sheetNamesRef.current,
+          range: rangeToA1(normalizeRange(start, end)),
+          rows,
+          cells,
+          truncated,
+        };
+      },
+      getSelection: () => {
+        const target = activeSheet;
+        const grid = sheetsRef.current[target];
+        if (!grid) return null;
+        const start = selectionRange.start;
+        const end = selectionRange.end;
+        const rows: string[][] = [];
+        const cells: SheetReadResult['cells'] = [];
+        for (let row = start.row; row <= end.row; row += 1) {
+          const values: string[] = [];
+          for (let col = start.col; col <= end.col; col += 1) {
+            const raw = String(grid[row]?.[col] ?? '');
+            const display = computeCellDisplay(sheetsRef.current, target, row, col);
+            values.push(display);
+            cells.push({
+              address: `${columnName(col)}${row + 1}`,
+              value: raw,
+              formula: raw.startsWith('=') ? raw : '',
+              display,
+            });
+          }
+          rows.push(values);
+        }
+        return {
+          sheet: target,
+          sheetNames: sheetNamesRef.current,
+          range: rangeToA1(normalizeRange(start, end)),
+          rows,
+          cells,
+          truncated: false,
+        };
+      },
+      writeCells: (sheet, updates, _transactionId) => {        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const valid = updates.filter((item) => item && item.address);
+        if (valid.length === 0) return { ok: false, message: 'Нет ячеек для записи' };
+        const changes = valid
+          .map((item) => {
+            const parsed = parseTarget(
+              item.address.includes('!') ? item.address : `${target}!${item.address}`
+            );
+            if (!parsed) return null;
+            const sheetName = sheetsRef.current[parsed.sheet] ? parsed.sheet : target;
+            const grid = sheetsRef.current[sheetName];
+            const { row, col } = parsed.range.start;
+            const before = String(grid?.[row]?.[col] ?? '');
+            const after = String(item.value ?? '');
+            return before === after
+              ? null
+              : {
+                  address: `${sheetName}!${columnName(col)}${row + 1}`,
+                  before,
+                  after,
+                };
+          })
+          .filter(
+            (item): item is { address: string; before: string; after: string } => Boolean(item)
+          );
+
+        let first: { value: CellCoord | null } = { value: null };
+        let written = 0;
+        applyBatch((draft) => {
+          for (const item of valid) {
+            const parsed = parseTarget(
+              item.address.includes('!') ? item.address : `${target}!${item.address}`
+            );
+            if (!parsed) continue;
+            const targetSheet = draft[parsed.sheet] ? parsed.sheet : target;
+            const grid = draft[targetSheet];
+            if (!grid) continue;
+            const { row, col } = parsed.range.start;
+            while (grid.length <= row) {
+              grid.push(new Array(grid[0]?.length ?? MIN_COLS).fill(''));
+            }
+            for (const line of grid) {
+              while (line.length <= col) line.push('');
+            }
+            grid[row][col] = normalizeFormula(String(item.value ?? ''));
+            if (!first.value) first.value = { row, col };
+            written += 1;
+          }
+        });
+
+        if (written === 0) return { ok: false, message: 'Не удалось разобрать адреса ячеек' };
+        setActiveSheet(target);
+        if (first.value) setSelected(first.value);
+        if (changes.length > 0) setAiDiff({ cells: changes });
+        return { ok: true, message: `Записано ячеек: ${written}`, changed: true };
+      },
+      addSheet: (name) => {
+        addSheet(name);
+        return { ok: true, message: name ? `Лист «${name}» добавлен` : 'Лист добавлен', changed: true };
+      },
+      renameSheet: (oldName, newName) => {
+        if (!sheetsRef.current[oldName]) {
+          return { ok: false, message: `Лист «${oldName}» не найден` };
+        }
+        if (!newName.trim() || sheetNamesRef.current.includes(newName.trim())) {
+          return { ok: false, message: `Имя «${newName}» пустое или уже занято` };
+        }
+        renameSheet(oldName, newName);
+        return { ok: true, message: `Лист переименован в «${newName.trim()}»`, changed: true };
+      },
+      deleteSheet: (name) => {
+        if (!sheetsRef.current[name]) return { ok: false, message: `Лист «${name}» не найден` };
+        if (sheetNamesRef.current.length <= 1) {
+          return { ok: false, message: 'Нельзя удалить единственный лист' };
+        }
+        removeSheet(name);
+        return { ok: true, message: `Лист «${name}» удалён`, changed: true };
+      },
+      setActiveSheet: (name) => {
+        if (!sheetsRef.current[name]) return { ok: false, message: `Лист «${name}» не найден` };
+        setActiveSheet(name);
+        return { ok: true, message: `Активный лист: «${name}»`, changed: false };
+      },
+      insertRows: (sheet, index, count) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const amount = Math.max(1, Math.min(count || 1, 200));
+        applyBatch((draft) => {
+          const grid = draft[target];
+          if (!grid) return;
+          const blank = new Array(grid[0]?.length ?? MIN_COLS).fill('');
+          for (let i = 0; i < amount; i += 1) {
+            grid.splice(Math.max(0, Math.min(index, grid.length)), 0, [...blank]);
+          }
+        });
+        return { ok: true, message: `Вставлено строк: ${amount}`, changed: true };
+      },
+      deleteRows: (sheet, index, count) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const grid = sheetsRef.current[target];
+        if (!grid) return { ok: false, message: `Лист «${target}» не найден` };
+        const start = Math.max(0, Math.min(index, Math.max(0, grid.length - 1)));
+        const amount = Math.max(1, Math.min(count || 1, grid.length - start));
+        if (grid.length - amount < 1) return { ok: false, message: 'Нельзя удалить все строки' };
+        applyBatch(
+          (draft) => {
+            draft[target]?.splice(start, amount);
+          },
+          (draftMeta) => {
+            for (let i = 0; i < amount; i += 1) {
+              const next = SheetFmt.removeRowFromMeta(draftMeta, target, start);
+              draftMeta[target] = next[target];
+            }
+          }
+        );
+        return { ok: true, message: `Удалено строк: ${amount}`, changed: true };
+      },
+      insertColumns: (sheet, index, count) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const amount = Math.max(1, Math.min(count || 1, 100));
+        applyBatch((draft) => {
+          const grid = draft[target];
+          if (!grid) return;
+          for (const row of grid) {
+            for (let i = 0; i < amount; i += 1) {
+              row.splice(Math.max(0, Math.min(index, row.length)), 0, '');
+            }
+          }
+        });
+        return { ok: true, message: `Вставлено столбцов: ${amount}`, changed: true };
+      },
+      deleteColumns: (sheet, index, count) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const grid = sheetsRef.current[target];
+        if (!grid) return { ok: false, message: `Лист «${target}» не найден` };
+        const width = grid[0]?.length ?? 0;
+        const start = Math.max(0, Math.min(index, Math.max(0, width - 1)));
+        const amount = Math.max(1, Math.min(count || 1, width - start));
+        if (width - amount < 1) return { ok: false, message: 'Нельзя удалить все столбцы' };
+        applyBatch(
+          (draft) => {
+            const current = draft[target];
+            if (!current) return;
+            draft[target] = current.map((row) => row.filter((_, col) => col < start || col >= start + amount));
+          },
+          (draftMeta) => {
+            for (let i = 0; i < amount; i += 1) {
+              const next = SheetFmt.removeColumnFromMeta(draftMeta, target, start);
+              draftMeta[target] = next[target];
+            }
+          }
+        );
+        return { ok: true, message: `Удалено столбцов: ${amount}`, changed: true };
+      },
+      mergeCells: (sheet, rangeText) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const range = SheetFmt.parseRange(rangeText);
+        if (!range) return { ok: false, message: `Не разобрать диапазон «${rangeText}»` };
+        commitMeta(SheetFmt.addMerge(metaRef.current, target, range));
+        return { ok: true, message: `Объединено: ${rangeText}`, changed: true };
+      },
+      unmergeCells: (sheet, rangeText) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const range = SheetFmt.parseRange(rangeText);
+        if (!range) return { ok: false, message: `Не разобрать диапазон «${rangeText}»` };
+        commitMeta(SheetFmt.removeMergesInRange(metaRef.current, target, range));
+        return { ok: true, message: `Объединение снято: ${rangeText}`, changed: true };
+      },
+      formatRange: (sheet, rangeText, patch) => {
+        const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
+        const range = SheetFmt.parseRange(rangeText);
+        if (!range) return { ok: false, message: `Не разобрать диапазон «${rangeText}»` };
+        commitMeta(SheetFmt.applyStyleToRange(metaRef.current, target, range, patch));
+        return { ok: true, message: `Формат применён: ${rangeText}`, changed: true };
+      },
+    });
+  }, [tab.id, activeSheet, addSheet, renameSheet, removeSheet, parseTarget, applyBatch, commitMeta, selectionRange]);
+
   /* ---------------- Запрос формулы у AI ---------------- */
 
   const requestFormula = () => {
@@ -2437,6 +2728,40 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           <div className="my-1 border-t border-ws" />
           <button className="block w-full rounded px-3 py-1.5 text-left text-ws-danger hover:bg-red-500/10" onClick={() => { deleteSelectionRows(); setCellMenu(null); }}>Удалить строки</button>
           <button className="block w-full rounded px-3 py-1.5 text-left text-ws-danger hover:bg-red-500/10" onClick={() => { deleteSelectionColumns(); setCellMenu(null); }}>Удалить столбцы</button>
+        </div>
+      )}
+      {aiDiff && aiDiff.cells.length > 0 && (
+        <div
+          data-ai-diff="1"
+          className="flex shrink-0 items-center gap-2 border-b border-blue-500/30 bg-blue-500/10 px-3 py-1 text-[11px] text-ws"
+        >
+          <span className="font-medium text-blue-400">AI изменил ячеек: {aiDiff.cells.length}</span>
+          <span className="flex-1 truncate text-ws-muted">
+            {aiDiff.cells
+              .slice(0, 6)
+              .map((cell) =>
+                cell.before
+                  ? `${cell.address}: ${cell.before} → ${cell.after || '(пусто)'}`
+                  : `${cell.address}: ${cell.after || '(пусто)'}`
+              )
+              .join(' · ')}
+          </span>
+          <button
+            onClick={() => {
+              undo();
+              setAiDiff(null);
+            }}
+            className="rounded border border-ws bg-ws-elevated px-1.5 py-0.5 text-[10px] hover:bg-ws-hover"
+          >
+            Отменить
+          </button>
+          <button
+            onClick={() => setAiDiff(null)}
+            title="Скрыть"
+            className="rounded px-1 text-ws-faint hover:bg-ws-hover hover:text-ws"
+          >
+            ×
+          </button>
         </div>
       )}
       {/* Панель инструментов */}
@@ -3343,7 +3668,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         </div>
 
         <button
-          onClick={addSheet}
+          onClick={() => addSheet()}
           title="Добавить лист"
           className="rounded p-1 text-ws-faint transition-colors hover:bg-ws-hover hover:text-ws"
         >

@@ -108,6 +108,18 @@ function isLowIntegrity(): boolean {
   return lowIntegrityLevel;
 }
 
+/** Реальная запись важнее метки токена: бывает, что low integrity не мешает. */
+function canWriteDocuments(): boolean {
+  try {
+    const probe = path.join(app.getPath('documents'), `.workspace-write-${process.pid}.tmp`);
+    fs.writeFileSync(probe, 'ok', 'utf8');
+    fs.unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const LOW_INTEGRITY_HINT =
   'Windows ограничила права этого процесса (низкий уровень целостности) — так бывает при запуске из отдельных папок. ' +
   'Запустите WorkSpace из обычного каталога, например C:\\WorkSpace\\WorkSpace.exe.';
@@ -264,7 +276,7 @@ app.whenReady().then(() => {
 
   // Молчаливая потеря данных хуже предупреждения: при низком уровне
   // целостности запись в Videos/Documents/Desktop невозможна вообще.
-  if (isLowIntegrity()) {
+  if (isLowIntegrity() && !canWriteDocuments()) {
     const options = {
       type: 'warning' as const,
       title: 'WorkSpace: ограниченные права',
@@ -905,6 +917,37 @@ ipcMain.handle(
       return { success: true };
     } catch (err) {
       return { success: false, error: (err as Error).message };
+    }
+  }
+);
+
+ipcMain.handle(
+  'pdf:export',
+  async (_event, html: string, suggestedName = 'document.pdf', targetPath?: string) => {
+    let win: BrowserWindow | null = null;
+    try {
+      win = new BrowserWindow({ show: false });
+      await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+      const pdf = await win.webContents.printToPDF({
+        printBackground: true,
+        pageSize: 'A4',
+      });
+      let output = targetPath || '';
+      if (!output) {
+        const result = await dialog.showSaveDialog({
+          title: 'Экспорт в PDF',
+          defaultPath: suggestedName,
+          filters: [{ name: 'PDF', extensions: ['pdf'] }],
+        });
+        if (result.canceled || !result.filePath) return { success: false, canceled: true };
+        output = result.filePath;
+      }
+      await fs.promises.writeFile(output, pdf);
+      return { success: true, path: output };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    } finally {
+      win?.destroy();
     }
   }
 );

@@ -6,6 +6,24 @@
  * реестр, а не через base64 вкладки, иначе каждая следующая правка читала бы
  * устаревший документ.
  */
+import type { PageSetup } from '../types';
+import type { DocxPackageInfo, HeaderFooterEdit } from '../lib/docx';
+
+/** Точное выделение в живом полотне: адресуется блоком и смещениями. */
+export interface DocumentSelection {
+  documentId: string;
+  blockId: string;
+  startOffset: number;
+  endOffset: number;
+  text: string;
+  html: string;
+}
+
+export interface DocumentEditResult {
+  ok: boolean;
+  message: string;
+  changed?: boolean;
+}
 
 export interface DocumentController {
   tabId: string;
@@ -16,6 +34,20 @@ export interface DocumentController {
    * transactionId объединяет серию правок одного ответа в один шаг отката.
    */
   writeHtml: (html: string, transactionId: string) => void;
+  /** Меняет поля, размер страницы и базовый шрифт .docx. */
+  applyPageSetup?: (page: PageSetup) => void;
+  /** Последнее непустое выделение в полотне (переживает уход фокуса в чат). */
+  getSelection?: () => DocumentSelection | null;
+  /** Восстанавливает HTML без записи в историю AI (откат транзакции). */
+  restoreHtml?: (html: string) => void;
+  /** Заменяет выделенный фрагмент, не перестраивая документ целиком. */
+  replaceSelection?: (html: string, transactionId: string) => DocumentEditResult;
+  /** Вставляет фрагмент в каретку (или в конец выделения). */
+  insertAtSelection?: (html: string, transactionId: string) => DocumentEditResult;
+  /** Части исходного .docx: колонтитулы, сноски, комментарии, стили, секции. */
+  getDocumentInfo?: () => Promise<DocxPackageInfo | null>;
+  /** Меняет или удаляет верхний/нижний колонтитул в пакете. */
+  setHeaderFooter?: (edit: HeaderFooterEdit) => Promise<DocumentEditResult>;
 }
 
 const controllers = new Map<string, DocumentController>();

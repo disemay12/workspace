@@ -36,11 +36,11 @@ import {
 import { AISettings, ChatAttachment, ChatMessage, ChatSession, OpenTab } from '../../types';
 import { aiService, ToolsUnsupportedError } from '../../services/aiService';
 import { buildDocumentSystemPrompt, buildDocumentTools, supportsNativeDocumentTools } from '../../services/aiTools';
-import { DOCUMENT_TAB_TYPES, type DocumentToolResult } from '../../lib/documentModel';
+import { AGENT_TAB_TYPES, DOCUMENT_TAB_TYPES, type DocumentToolResult } from '../../lib/documentModel';
 import { SYSTEM_PRESETS, PROVIDER_PRESETS } from '../../state/settings';
 import { cn, extractCodeBlocks, uid } from '../../lib/utils';
 import { renderRichMarkdown, renderMermaidBlocks } from '../../lib/markdown';
-import { stripAssistantNoise, stripEmoji } from '../../lib/aiDocument';
+import { extractDocumentContent, stripEmoji } from '../../lib/aiDocument';
 import {
   AIActionPayload,
   AppActionKind,
@@ -62,24 +62,138 @@ const DOC_WRITE_ACTIONS = new Set<string>([
 
 /** Просьба поработать с текстом документа, а не ответить на вопрос. */
 const EDIT_INTENT =
-  /(исправ|перепиш|перепис|оформ|сократ|приведи|сделай|структурир|отредакт|редактир|улучш|вычит|перевод|переведи|дополн|добавь|убери|замени|измени|обнови|сформат|выровняй)/i;
+  /(исправ|перепиш|перепис|оформ|сократ|приведи|сделай|структурир|отредакт|редактир|улучш|вычит|перевод|переведи|дополн|добавь|убери|замени|измени|обнови|сформат|выровняй|напиши|поменяй|переименуй|допиши)/i;
+
+/** Создание или дописывание текста в документ. */
+const CREATE_INTENT =
+  /(напиши|написать|составь|создай|сгенерируй|добавь|вставь|допиши|запиши|сочини|придумай)/i;
+
+/** Точечная правка: меняется конкретная строка/заголовок/фраза. */
+const PRECISE_EDIT_INTENT =
+  /(замени|поменяй|исправь|измени|поправь|переименуй|убери|удали)/i;
+
+const EDIT_TARGET_INTENT =
+  /(назван|заголов|подзаголов|строк|слов|фраз|дат|имя|имени|пункт|абзац|текст|номер|сумм|адрес|телефон)/i;
+
+/** Полная переработка документа. */
+const REWRITE_INTENT =
+  /(перепиш|переписать|сократ|улучш|приведи|оформ|сделай.{0,30}документ|полностью|целиком|ats|atc|атс|фильтр)/i;
+
+/** Резюме под ATS/ATC-фильтры. */
+const ATS_INTENT = /(ats|atc|атс|проход\w*\s+фильтр|фильтр\w*\s+(ats|atc|атс))/i;
+
+const PRECISE_REPLACE_ERROR =
+  'Точечная правка: используй find_replace или replace_block. replace_document запрещён, пока меняется одна строка/заголовок.';
+
+function isPreciseEditRequest(text: string): boolean {
+  const hasVerb = PRECISE_EDIT_INTENT.test(text);
+  const quoted = /[«"“][^»"”]+[»"”]/.test(text);
+  return hasVerb && (EDIT_TARGET_INTENT.test(text) || quoted);
+}
+
+function isCreateRequest(text: string): boolean {
+  return (
+    CREATE_INTENT.test(text) &&
+    !isPreciseEditRequest(text) &&
+    !/(перепиш|переписать|сократ)/i.test(text)
+  );
+}
+
+/** Действие целиком переписывает открытый документ. */
+function actionReplacesWholeDocument(action: AIActionPayload): boolean {
+  if (action.action === 'replace_document') return true;
+  if (action.action === 'document_apply') {
+    return action.operations.some((operation) => operation.tool === 'replace_document');
+  }
+  return false;
+}
+
+/** Есть действие документа, допустимое для текущего намерения. */
+function hasAllowedDocumentAction(answer: string, precise: boolean): boolean {
+  return parseAIActions(answer).some(
+    (action) =>
+      DOC_WRITE_ACTIONS.has(action.action) &&
+      (!precise || !actionReplacesWholeDocument(action))
+  );
+}
+
+/** Новый заголовок из просьбы «замени название на «…»». */
+function extractRequestedTitle(text: string): string | null {
+  const patterns = [
+    /(?:название|заголовок|подзаголовок)[^«"“\n]{0,40}[«"“]([^»"”]+)[»"”]/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    const value = match?.[1]?.trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+/** Первый заголовок из структуры get_document. */
+function firstHeading(structure: string): string | null {
+  for (const line of structure.split('\n')) {
+    const match = /^\s*b\d+\s+\[(h[1-6])\]\s*(.+)$/.exec(line);
+    if (match) return match[2].trim();
+  }
+  return null;
+}
+
+/**
+ * Мгновенные точные правки без обращения к модели: замена заголовка и
+ * «Замени «X» на «Y»». Модель для этого не нужна, а ожидание ответа —
+ * главная причина долгого «Думает».
+ */
+async function applyQuickDocumentEdit(
+  text: string,
+  tabId: string,
+  runTool: (
+    name: string,
+    args: Record<string, unknown>,
+    transactionId: string,
+    tabId?: string
+  ) => Promise<DocumentToolResult>
+): Promise<string | null> {
+  const transactionId = `quick_${Date.now()}`;
+
+  const quotedReplace =
+    /(?:замени|поменяй|исправь)\s+[«"“]([^»"”]+)[»"”]\s+на\s+[«"“]([^»"”]+)[»"”]/i.exec(
+      text
+    );
+  if (quotedReplace) {
+    const result = await runTool(
+      'find_replace',
+      { find: quotedReplace[1], replace: quotedReplace[2], all: false },
+      transactionId,
+      tabId
+    );
+    return result.ok ? `Заменил «${quotedReplace[1]}» на «${quotedReplace[2]}».` : null;
+  }
+
+  const title = extractRequestedTitle(text);
+  if (!title || !/(заголов|назван|подзаголов)/i.test(text)) return null;
+
+  const snapshot = await runTool('get_document', {}, transactionId, tabId);
+  if (!snapshot.ok) return null;
+  const current = firstHeading(snapshot.structure ?? '');
+  if (!current || current === title) return null;
+
+  const result = await runTool(
+    'find_replace',
+    { find: current, replace: title, all: false },
+    transactionId,
+    tabId
+  );
+  return result.ok ? `Заменил заголовок на «${title}».` : null;
+}
 
 /**
  * Убирает из ответа вступительную фразу-комментарий («Вот вариант текста…»),
- * чтобы она не попала в документ.
+ * служебные советы по оформлению и обёртку ```, чтобы в документ попал
+ * только его текст.
  */
 function buildDocumentBody(answer: string): string {
-  const lines = stripAssistantNoise(answer).split('\n');
-  const first = lines[0]?.trim() ?? '';
-  if (
-    lines.length > 1 &&
-    first.length < 160 &&
-    /^(вот|ниже|готово|конечно|разумеется|держите|представляю)\s/i.test(first)
-  ) {
-    lines.shift();
-    while (lines.length > 0 && !lines[0].trim()) lines.shift();
-  }
-  return lines.join('\n').trim();
+  return extractDocumentContent(answer);
 }
 
 interface Props {
@@ -130,6 +244,9 @@ interface Props {
   /** Выданы ли ассистенту права на запись в открытый документ. */
   docWriteAccess: boolean;
   onToggleDocWriteAccess: (value: boolean) => void;
+  /** Разрешена ли запись в дополнительные файлы workspace. */
+  extraWriteAccess: boolean;
+  onToggleExtraWriteAccess: (value: boolean) => void;
 }
 
 export const AIChatPanel: React.FC<Props> = ({
@@ -159,11 +276,17 @@ export const AIChatPanel: React.FC<Props> = ({
   onResolveActiveDocument,
   docWriteAccess,
   onToggleDocWriteAccess,
+  extraWriteAccess,
+  onToggleExtraWriteAccess,
 }) => {
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   /** Что делает агент прямо сейчас («Читаю документ…», «Правлю документ…»). */
   const [agentStatus, setAgentStatus] = useState('');
+  const [toolTrace, setToolTrace] = useState<string[]>([]);
+  const toolTraceRef = useRef<string[]>([]);
+  const [contextFiles, setContextFiles] = useState<string[]>([]);
+  const contextFilesRef = useRef<string[]>([]);
   const [attachFile, setAttachFile] = useState(true);
   const [attachSelection, setAttachSelection] = useState(false);
   const [selectionText, setSelectionText] = useState('');
@@ -216,6 +339,31 @@ export const AIChatPanel: React.FC<Props> = ({
 
   /* ---------- Отправка сообщения ---------- */
 
+  /** Обёртка инструментов: собирает видимый след вызовов агента. */
+  const callDocumentTool = useCallback(
+    async (
+      name: string,
+      args: Record<string, unknown>,
+      transactionId: string,
+      tabId?: string
+    ) => {
+      if (!toolTraceRef.current.includes(name)) {
+        toolTraceRef.current = [...toolTraceRef.current, name];
+        setToolTrace(toolTraceRef.current);
+      }
+      if (name === 'read_document') {
+        const rawPath = String(args.path ?? args.file ?? '').trim();
+        const fileName = rawPath.split(/[\\/]/).filter(Boolean).pop() ?? '';
+        if (fileName && !contextFilesRef.current.includes(fileName)) {
+          contextFilesRef.current = [...contextFilesRef.current, fileName];
+          setContextFiles(contextFilesRef.current);
+        }
+      }
+      return onDocumentTool(name, args, transactionId, tabId);
+    },
+    [onDocumentTool]
+  );
+
   const submit = useCallback(
     async (
       rawText: string,
@@ -225,6 +373,11 @@ export const AIChatPanel: React.FC<Props> = ({
     ) => {
       const text = rawText.trim();
       if (!text || isStreaming) return;
+
+      toolTraceRef.current = [];
+      setToolTrace([]);
+      contextFilesRef.current = [];
+      setContextFiles([]);
 
       if (!isConfigured) {
         onOpenSettings();
@@ -254,6 +407,37 @@ export const AIChatPanel: React.FC<Props> = ({
       // Актуальная история на момент отправки
       const base = sessionId === activeSessionId ? messages : [];
       const nextMessages = [...base, userMessage, assistantMessage];
+
+      // Точные замены заголовка/цитаты выполняем локально, без запроса к
+      // модели: это мгновенно и гарантирует, что изменится только указанный
+      // фрагмент.
+      if (
+        mode === 'chat' &&
+        activeTab &&
+        DOCUMENT_TAB_TYPES.has(activeTab.type) &&
+        docWriteAccess
+      ) {
+        const quick = await applyQuickDocumentEdit(text, activeTab.id, callDocumentTool);
+        if (quick) {
+          onUpdateMessages(sessionId, [
+            ...base,
+            userMessage,
+            {
+              id: assistantId,
+              role: 'assistant',
+              content: quick,
+              timestamp: Date.now(),
+              toolsUsed: true,
+              preciseEdit: true,
+              toolTrace: [...toolTraceRef.current],
+              contextFiles: [...contextFilesRef.current],
+            },
+          ]);
+          setInput('');
+          return;
+        }
+      }
+
       onUpdateMessages(sessionId, nextMessages);
       setInput('');
       setIsStreaming(true);
@@ -324,7 +508,7 @@ export const AIChatPanel: React.FC<Props> = ({
       };
 
       const useDocumentAgent =
-        mode === 'chat' && Boolean(activeTab && DOCUMENT_TAB_TYPES.has(activeTab.type));
+        mode === 'chat' && Boolean(activeTab && AGENT_TAB_TYPES.has(activeTab.type));
       const transactionId = uid('doctx');
 
       // Переписывание целого документа не влезает в 4096 токенов:
@@ -348,12 +532,21 @@ export const AIChatPanel: React.FC<Props> = ({
         },
       };
 
+      /** Документ уже правлен инструментами: текст отчёта вставлять нельзя. */
+      let toolsUsed = false;
+      /** Хотя бы один инструмент реально изменил документ. */
+      let documentTouched = false;
+      const preciseRequest = isPreciseEditRequest(text);
+      const createRequest = isCreateRequest(text);
+      const rewriteRequest =
+        !preciseRequest && !createRequest && REWRITE_INTENT.test(text);
+      const atsRequest = ATS_INTENT.test(text);
+      const nativeToolsSupported = supportsNativeDocumentTools(settings.provider);
+      let usedFallback = !nativeToolsSupported;
+
       try {
         if (useDocumentAgent && activeTab) {
           const tools = buildDocumentTools(docWriteAccess, activeTab.type);
-          // Открытый документ агент читает инструментом get_document:
-          // дублировать его текст во вложении бессмысленно и дорого.
-          const agentMessage: ChatMessage = { ...apiUserMessage, attachedFile: undefined };
           const fallbackPrompt = buildDocumentSystemPrompt({
             name: activeTab.name,
             type: activeTab.type,
@@ -368,9 +561,33 @@ export const AIChatPanel: React.FC<Props> = ({
             return document ? { ...apiUserMessage, attachedFile: document } : apiUserMessage;
           };
 
+          // Полная переработка и ATS не требуют отдельного get_document:
+          // текст уже приложен, модель сразу переписывает документ. Это
+          // убирает лишний круг ожидания.
+          const agentMessage: ChatMessage = rewriteRequest
+            ? await fallbackMessage()
+            : { ...apiUserMessage, attachedFile: undefined };
+
+          /**
+           * Общая точка вызова инструментов: при точечной правке полная
+           * замена документа отклоняется, чтобы модель перешла на
+           * find_replace/replace_block, а не переписывала весь файл.
+           */
+          const callTool = async (
+            name: string,
+            args: Record<string, unknown>
+          ): Promise<DocumentToolResult> => {
+            if (preciseRequest && name === 'replace_document') {
+              return { ok: false, message: PRECISE_REPLACE_ERROR };
+            }
+            const result = await callDocumentTool(name, args, transactionId, activeTab.id);
+            if (result.ok && name !== 'get_document') documentTouched = true;
+            return result;
+          };
+
           setAgentStatus('Готовлю запрос…');
 
-          if (supportsNativeDocumentTools(settings.provider)) {
+          if (nativeToolsSupported) {
             try {
               const result = await aiService.runDocumentAgent({
                 messages: [...base, agentMessage],
@@ -384,11 +601,11 @@ export const AIChatPanel: React.FC<Props> = ({
                 tools,
                 signal: controller.signal,
                 onStatus: setAgentStatus,
-                onToolCall: (name, args) =>
-                  onDocumentTool(name, args, transactionId, activeTab.id),
+                onToolCall: callTool,
               });
 
               buffer = result.text.trim();
+              toolsUsed = documentTouched;
               if (!buffer) {
                 buffer =
                   result.toolCalls > 0
@@ -399,6 +616,7 @@ export const AIChatPanel: React.FC<Props> = ({
             } catch (error) {
               // Шлюз/модель не принимает tools — те же операции текстовым блоком.
               if (!(error instanceof ToolsUnsupportedError)) throw error;
+              usedFallback = true;
               setAgentStatus('Модель без function calling — работаю через текстовые действия…');
               await aiService.streamChat(
                 [...base, await fallbackMessage()],
@@ -420,6 +638,133 @@ export const AIChatPanel: React.FC<Props> = ({
               fallbackPrompt
             );
           }
+
+          /* -------- Принудительное выполнение правки -------- */
+          const hasAction = hasAllowedDocumentAction(buffer, preciseRequest);
+          const firstAnswer = buffer;
+          if (
+            (createRequest || preciseRequest || rewriteRequest) &&
+            !documentTouched &&
+            !hasAction &&
+            docWriteAccess
+          ) {
+            setAgentStatus('Повторяю правку документа…');
+
+            const previous: ChatMessage = {
+              id: uid('msg'),
+              role: 'assistant',
+              content: buffer,
+              timestamp: Date.now(),
+            };
+            const nudge: ChatMessage = {
+              id: uid('msg'),
+              role: 'user',
+              content: preciseRequest
+                ? 'Ты не внёс изменения в открытый документ. Не отвечай текстом — вызови find_replace (find — точный старый фрагмент) или replace_block. replace_document при точечной правке запрещён.'
+                : atsRequest
+                  ? 'Ты не внёс изменения в открытый документ. Перепиши резюме под ATS/ATC: плоский одноколоночный текст, стандартные заголовки «Опыт работы», «Навыки», «Образование», ключевые слова, без таблиц и колонок. Не возвращай копию — вызови replace_document с изменённым текстом.'
+                  : rewriteRequest
+                    ? 'Ты не внёс изменения в открытый документ. Не отвечай текстом — вызови подходящий инструмент документа и выполни правку.'
+                    : 'Ты не внёс текст в открытый документ. Не отвечай текстом — вызови replace_document для нового текста или insert_after для добавления.',
+              timestamp: Date.now(),
+            };
+
+            const strictPrompt =
+              buildDocumentSystemPrompt({
+                name: activeTab.name,
+                type: activeTab.type,
+                writeAccess: docWriteAccess,
+              }) +
+              '\n\nВАЖНО: предыдущая попытка не изменила документ. В этом ответе обязательно вызови инструмент документа, а не пиши текст в чат.' +
+              (atsRequest
+                ? ' Перепиши резюме под ATS: плоский текст, стандартные заголовки, ключевые слова, без таблиц и колонок; не возвращай копию.'
+                : '');
+
+            try {
+              if (!usedFallback) {
+                const retry = await aiService.runDocumentAgent({
+                  messages: [...base, agentMessage, previous, nudge],
+                  settings: requestSettings,
+                  appContext,
+                  systemPromptExtra: strictPrompt,
+                  tools,
+                  signal: controller.signal,
+                  onStatus: setAgentStatus,
+                  onToolCall: callTool,
+                });
+                buffer = retry.text.trim() || buffer;
+                toolsUsed = documentTouched;
+              }
+            } catch (error) {
+              if ((error as Error)?.name === 'AbortError') throw error;
+              if (error instanceof ToolsUnsupportedError) usedFallback = true;
+            }
+
+            if (usedFallback) {
+              try {
+                await aiService.streamChat(
+                  [...base, await fallbackMessage(), previous, nudge],
+                  requestSettings,
+                  streamCallbacks,
+                  controller.signal,
+                  appContext,
+                  fallbackPrompt +
+                    (atsRequest
+                      ? '\n\nВАЖНО: предыдущая попытка не изменила документ. Верни workspace-action document_apply с replace_document и текстом, переписанным под ATS (без таблиц и колонок), а не копию.'
+                      : '\n\nВАЖНО: предыдущая попытка не изменила документ. Верни workspace-action document_apply с операциями find_replace/replace_block, а не текст в чат.')
+                );
+              } catch (error) {
+                if ((error as Error)?.name === 'AbortError') throw error;
+              }
+            }
+
+            const retryAction = hasAllowedDocumentAction(buffer, preciseRequest);
+            if (!documentTouched && !retryAction) {
+              if (preciseRequest) {
+                // Детерминированный запасной путь для смены заголовка:
+                // модель не вызвала инструмент — меняем только h1.
+                const title = extractRequestedTitle(text);
+                if (title) {
+                  const snapshot = await callDocumentTool(
+                    'get_document',
+                    {},
+                    transactionId,
+                    activeTab.id
+                  );
+                  const currentTitle = snapshot.ok ? firstHeading(snapshot.structure ?? '') : null;
+                  if (currentTitle && currentTitle !== title) {
+                    const replaced = await callDocumentTool(
+                      'find_replace',
+                      { find: currentTitle, replace: title, all: false },
+                      transactionId,
+                      activeTab.id
+                    );
+                    if (replaced.ok) {
+                      documentTouched = true;
+                      buffer = `Заменил заголовок на «${title}».`;
+                    }
+                  }
+                }
+                if (!documentTouched) {
+                  buffer = `${buffer.trim()}\n\n_Правка не применена: модель не вызвала инструмент. Повторите запрос._`;
+                }
+              } else if (createRequest) {
+                const candidates = [buffer, firstAnswer]
+                  .map((answer) => extractDocumentContent(answer))
+                  .filter((body) => body.trim().length >= 60)
+                  .sort((a, b) => b.length - a.length);
+                const body = candidates[0];
+                if (body) {
+                  onInsertIntoEditor(body);
+                  documentTouched = true;
+                  toolsUsed = true;
+                  buffer = 'Текст добавлен в документ.';
+                }
+              }
+            }
+
+            toolsUsed = toolsUsed || documentTouched || hasAllowedDocumentAction(buffer, preciseRequest);
+          }
         } else {
           await aiService.streamChat(
             [...base, apiUserMessage],
@@ -433,7 +778,17 @@ export const AIChatPanel: React.FC<Props> = ({
         onUpdateMessages(
           sessionId,
           nextMessages.map((m) =>
-            m.id === assistantId ? { ...m, content: buffer, streaming: false } : m
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: buffer,
+                  streaming: false,
+                  toolsUsed,
+                  preciseEdit: preciseRequest,
+                  toolTrace: [...toolTraceRef.current],
+                  contextFiles: [...contextFilesRef.current],
+                }
+              : m
           )
         );
 
@@ -446,7 +801,16 @@ export const AIChatPanel: React.FC<Props> = ({
           onUpdateMessages(
             sessionId,
             nextMessages.map((m) =>
-              m.id === assistantId ? { ...m, content: buffer, streaming: false } : m
+              m.id === assistantId
+                ? {
+                    ...m,
+                    content: buffer,
+                    streaming: false,
+                    toolsUsed,
+                    preciseEdit: preciseRequest,
+                    toolTrace: [...toolTraceRef.current],
+                  }
+                : m
             )
           );
         } else {
@@ -460,6 +824,9 @@ export const AIChatPanel: React.FC<Props> = ({
                     content: buffer,
                     streaming: false,
                     error: message,
+                    preciseEdit: preciseRequest,
+                    toolTrace: [...toolTraceRef.current],
+                    contextFiles: [...contextFilesRef.current],
                   }
                 : m
             )
@@ -479,7 +846,8 @@ export const AIChatPanel: React.FC<Props> = ({
       settings,
       activeTab,
       docWriteAccess,
-      onDocumentTool,
+      callDocumentTool,
+      onInsertIntoEditor,
       onCreateSession,
       onUpdateMessages,
       onOpenSettings,
@@ -532,6 +900,17 @@ export const AIChatPanel: React.FC<Props> = ({
       parseAIActions(msg.content).forEach((act, idx) => {
         const key = `${msg.id}_${idx}`;
         if (executedActionsRef.current.has(key)) return;
+        if (msg.preciseEdit && actionReplacesWholeDocument(act)) {
+          executedActionsRef.current.add(key);
+          setActionStates((prev) => ({
+            ...prev,
+            [key]: {
+              status: 'error',
+              error: 'Точечная правка: полная замена документа запрещена',
+            },
+          }));
+          return;
+        }
         if (requiresConfirmation(act)) return;
         if (DOC_WRITE_ACTIONS.has(act.action) && !docWriteAccess) return;
         pending.push({ action: act, key });
@@ -862,6 +1241,16 @@ export const AIChatPanel: React.FC<Props> = ({
             agentStatus={
               isStreaming && msg.id === messages[messages.length - 1]?.id ? agentStatus : ''
             }
+            toolTrace={
+              isStreaming && msg.id === messages[messages.length - 1]?.id
+                ? toolTrace
+                : msg.toolTrace
+            }
+            contextFiles={
+              isStreaming && msg.id === messages[messages.length - 1]?.id
+                ? contextFiles
+                : msg.contextFiles
+            }
             onCopy={() =>
               copyMessage(
                 msg.id,
@@ -877,7 +1266,7 @@ export const AIChatPanel: React.FC<Props> = ({
               onApplyToDocument(text);
             }}
             hasActiveTab={Boolean(activeTab)}
-            documentTab={Boolean(activeTab && DOCUMENT_TAB_TYPES.has(activeTab.type))}
+            documentTab={Boolean(activeTab && AGENT_TAB_TYPES.has(activeTab.type))}
             actionStates={actionStates}
             onExecuteAction={(action, key) => {
               // Ручной запуск действия — это и есть согласие на запись:
@@ -953,6 +1342,24 @@ export const AIChatPanel: React.FC<Props> = ({
                 {docWriteAccess ? 'Права записи выданы' : 'Предоставить права на запись'}
               </button>
             )}
+
+            <button
+              onClick={() => onToggleExtraWriteAccess(!extraWriteAccess)}
+              title={
+                extraWriteAccess
+                  ? 'Ассистент может записывать в другие файлы workspace. Нажмите, чтобы вернуть режим только чтения.'
+                  : 'Дополнительные файлы доступны только для чтения. Нажмите, чтобы разрешить запись.'
+              }
+              className={cn(
+                'flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors',
+                extraWriteAccess
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                  : 'border-ws text-ws-faint hover:text-ws'
+              )}
+            >
+              {extraWriteAccess ? <ShieldCheck size={10} /> : <ShieldAlert size={10} />}
+              {extraWriteAccess ? 'Доп. файлы: запись' : 'Доп. файлы: чтение'}
+            </button>
           </div>
         )}
 
@@ -1538,6 +1945,10 @@ const MessageBubble: React.FC<{
   isCopied: boolean;
   /** Текущий шаг агента, пока ответ ещё пуст. */
   agentStatus?: string;
+  /** Инструменты, которые уже вызваны в этом ответе. */
+  toolTrace?: string[];
+  /** Файлы, прочитанные ассистентом ради ответа. */
+  contextFiles?: string[];
   onCopy: () => void;
   onInsert: (text: string) => void;
   onReplace: (text: string) => void;
@@ -1555,6 +1966,8 @@ const MessageBubble: React.FC<{
   message,
   isCopied,
   agentStatus,
+  toolTrace,
+  contextFiles,
   onCopy,
   onInsert,
   onReplace,
@@ -1590,8 +2003,11 @@ const MessageBubble: React.FC<{
   );
 
   const mdTables = useMemo(
-    () => (!isUser && actions.length === 0 ? detectMarkdownTables(message.content) : []),
-    [isUser, actions.length, message.content]
+    () =>
+      !isUser && !documentTab && actions.length === 0
+        ? detectMarkdownTables(message.content)
+        : [],
+    [isUser, documentTab, actions.length, message.content]
   );
 
   const displayContent = useMemo(() => {
@@ -1601,6 +2017,26 @@ const MessageBubble: React.FC<{
     }
     return answerText;
   }, [isUser, message.content, answerText, actions.length]);
+
+  /** Чистый текст документа: без вступления, советов и обёртки ```. */
+  const documentBody = useMemo(
+    () => (isUser || !documentTab ? '' : buildDocumentBody(answerText)),
+    [isUser, documentTab, answerText]
+  );
+
+  /** Документ уже изменён инструментами — отчёт в чате нельзя вставлять/заменять. */
+  const editsDocument = useMemo(
+    () =>
+      !isUser &&
+      (Boolean(message.toolsUsed) ||
+        actions.some(
+          (action) =>
+            action.action === 'document_apply' ||
+            action.action === 'replace_document' ||
+            action.action === 'insert_into_editor'
+        )),
+    [isUser, message.toolsUsed, actions]
+  );
 
   if (isUser) {
     return (
@@ -1644,6 +2080,34 @@ const MessageBubble: React.FC<{
               {agentStatus || 'Думает…'}
             </span>
           ) : null}
+
+          {!isUser && toolTrace && toolTrace.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {toolTrace.map((name) => (
+                <span
+                  key={name}
+                  data-tool-trace={name}
+                  className="rounded border border-ws bg-ws-elevated px-1 py-0.5 font-mono text-[9px] text-ws-faint"
+                >
+                  {name}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {!isUser && contextFiles && contextFiles.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {contextFiles.map((name) => (
+                <span
+                  key={name}
+                  data-context-file={name}
+                  className="rounded border border-ws bg-ws-elevated px-1 py-0.5 font-mono text-[9px] text-ws-muted"
+                >
+                  {name}
+                </span>
+              ))}
+            </div>
+          )}
 
           {/* Карточки действий AI */}
           {actions.map((act, idx) => {
@@ -1723,7 +2187,7 @@ const MessageBubble: React.FC<{
               {isCopied ? 'Скопировано' : 'Копировать'}
             </button>
 
-            {codeBlocks.length > 0 && hasActiveTab && (
+            {codeBlocks.length > 0 && !documentTab && hasActiveTab && (
               <button
                 onClick={() => onInsert(codeBlocks[0].code)}
                 title="Вставить первый блок кода в позицию курсора"
@@ -1734,7 +2198,7 @@ const MessageBubble: React.FC<{
               </button>
             )}
 
-            {codeBlocks.length > 1 && hasActiveTab && (
+            {codeBlocks.length > 1 && !documentTab && hasActiveTab && (
               <button
                 onClick={() => onInsert(codeBlocks.map((b) => b.code).join('\n\n'))}
                 title={`Вставить все блоки кода (${codeBlocks.length})`}
@@ -1745,7 +2209,18 @@ const MessageBubble: React.FC<{
               </button>
             )}
 
-            {codeBlocks.length === 0 && answerText && hasActiveTab && (
+            {documentTab && documentBody && !editsDocument && hasActiveTab && (
+              <button
+                onClick={() => onInsert(documentBody)}
+                title="Вставить только текст документа в позицию курсора"
+                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ws-faint hover:bg-ws-hover hover:text-ws"
+              >
+                <CornerDownLeft size={10} />
+                Вставить в документ
+              </button>
+            )}
+
+            {codeBlocks.length === 0 && !documentTab && answerText && !editsDocument && hasActiveTab && (
               <button
                 onClick={() => onInsert(answerText)}
                 title="Вставить текст ответа в позицию курсора активного документа"
@@ -1756,11 +2231,9 @@ const MessageBubble: React.FC<{
               </button>
             )}
 
-            {hasActiveTab && answerText && (
+            {hasActiveTab && !editsDocument && (documentTab ? documentBody : answerText) && (
               <button
-                onClick={() =>
-                  onReplace(documentTab ? buildDocumentBody(answerText) : answerText)
-                }
+                onClick={() => onReplace(documentTab ? documentBody : answerText)}
                 title={
                   documentTab
                     ? 'Заменить содержимое документа только текстом ответа (без вступления и пояснений)'

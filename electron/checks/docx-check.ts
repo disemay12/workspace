@@ -256,27 +256,21 @@ function zipStored(files: { name: string; data: Buffer }[]): Buffer {
   return Buffer.concat([...locals, centralBuf, end]);
 }
 
-/** Достаёт текст из .docx без внешних библиотек: ищем <w:t> в распакованном XML. */
-function readDocxText(filePath: string): string {
+/**
+ * Достаёт текст из .docx через полноценный разбор ZIP.
+ *
+ * Раньше здесь искался первый байтовый offset «word/document.xml» в архиве,
+ * но эта строка встречается ещё и внутри [Content_Types].xml. Заголовок,
+ * прочитанный по такому смещению, даёт мусорные размеры и zlib падает с
+ * «invalid distance too far back».
+ */
+async function readDocxText(filePath: string): Promise<string> {
+  const JSZip = require('jszip');
   const buf = fs.readFileSync(filePath);
-  // Находим local header для word/document.xml и читаем его данные.
-  const needle = Buffer.from('word/document.xml', 'utf-8');
-  const idx = buf.indexOf(needle);
-  if (idx === -1) return '';
-  const headerStart = idx - 30;
-  if (headerStart < 0) return '';
-  const method = buf.readUInt16LE(headerStart + 8);
-  const compSize = buf.readUInt32LE(headerStart + 18);
-  const dataStart = idx + needle.length;
-  const data = buf.subarray(dataStart, dataStart + compSize);
-  let xml: string;
-  if (method === 0) {
-    xml = data.toString('utf-8');
-  } else {
-    // deflate-raw
-    const zlib = require('zlib');
-    xml = zlib.inflateRawSync(data).toString('utf-8');
-  }
+  const zip = await JSZip.loadAsync(buf);
+  const doc = zip.file('word/document.xml');
+  if (!doc) return '';
+  const xml: string = await doc.async('string');
   const matches = xml.match(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g) || [];
   return matches
     .map((m) => m.replace(/<[^>]+>/g, ''))
@@ -288,6 +282,8 @@ function readDocxText(filePath: string): string {
 }
 
 async function main() {
+  const flush = () => fs.writeFileSync(OUT, JSON.stringify({ results, errors }, null, 2), 'utf-8');
+  flush();
   if (!fs.existsSync(SANDBOX)) fs.mkdirSync(SANDBOX, { recursive: true });
 
   // Чистим прошлые артефакты прогона
@@ -313,8 +309,9 @@ async function main() {
   results.fileBeforeOpen = {
     exists: fs.existsSync(target),
     size: fs.statSync(target).size,
-    text: readDocxText(target),
+    text: await readDocxText(target),
   };
+  flush();
 
   registerIPC();
 
@@ -335,6 +332,8 @@ async function main() {
 
   await win.loadFile(path.join(ROOT, 'dist', 'index.html'));
   await sleep(2500);
+  results.stage = 'app-loaded';
+  flush();
 
   // Запоминаем, какой именно base64 приложение получает при чтении файла,
   // и подкладываем парсер из бандла, чтобы вызвать его напрямую.
@@ -347,8 +346,6 @@ async function main() {
     })()
   `);
 
-  // Прямая проверка шагов парсера в настоящем DOM приложения: видно, на каком
-  // именно шаге текст теряется.
   results.parserSteps = await win.webContents.executeJavaScript(`
     (async () => {
       const out = {};
@@ -405,6 +402,8 @@ async function main() {
       return out;
     })()
   `);
+  results.stage = 'parser-probe';
+  flush();
 
   // Перехватываем ошибку разбора прямо в рендерере: WordEditor показывает её
   // в баннере, но если падает промис — текст теряется молча.
@@ -452,6 +451,8 @@ async function main() {
     })()
   `);
   await sleep(3000);
+  results.stage = 'file-clicked';
+  flush();
 
   results.docxLogAfterOpen = await win.webContents.executeJavaScript(
     `window.__docxLog ? window.__docxLog.slice(0, 25) : null`
@@ -524,26 +525,52 @@ async function main() {
 
   results.fileAfterSave = {
     size: fs.existsSync(target) ? fs.statSync(target).size : 0,
-    text: fs.existsSync(target) ? readDocxText(target) : '',
+    text: fs.existsSync(target) ? await readDocxText(target) : '',
     tmpLeftover: fs.existsSync(target + '.ws-tmp'),
   };
 
-  // Переоткрываем: закрываем вкладку и открываем файл заново
-  await win.webContents.executeJavaScript(`
+  // Переоткрываем приложение и файл с диска: редактор должен показать
+  // сохранённую правку, а не только записать её в пакет.
+  await win.webContents.reload();
+  await sleep(3000);
+  const reopenClicked = await win.webContents.executeJavaScript(`
     (() => {
-      const tab = [...document.querySelectorAll('*')]
-        .filter((el) => el.textContent?.trim() === ${JSON.stringify(DOC_NAME)});
-      return !!tab.length;
+      const nodes = [...document.querySelectorAll('div')]
+        .filter((d) => d.textContent?.trim() === ${JSON.stringify(DOC_NAME)});
+      if (!nodes.length) return false;
+      const clickable = nodes.find((d) => d.className.includes('cursor-pointer')) || nodes[0];
+      clickable.click();
+      return true;
     })()
   `);
-  await sleep(500);
+  await sleep(3500);
+  const reopenState = await win.webContents.executeJavaScript(`
+    (() => {
+      const canvas = document.querySelector('[contenteditable=true]');
+      return {
+        hasCanvas: !!canvas,
+        text: canvas ? canvas.innerText : '',
+        html: canvas ? canvas.innerHTML : '',
+      };
+    })()
+  `);
+  results.reopen = {
+    clicked: Boolean(reopenClicked),
+    hasCanvas: reopenState.hasCanvas,
+    hasEdit: reopenState.text.includes(EDIT_MARK),
+    text: reopenState.text,
+  };
+
+  const seedOk = ARGV_DOCX
+    ? results.editorAfterOpen.canvasText.trim().length > 0
+    : SEED_LINES.every((line) => results.editorAfterOpen.canvasText.includes(line));
 
   results.summary = {
+    openedWithText: seedOk,
     savedTextContainsEdit: results.fileAfterSave.text.includes(EDIT_MARK),
-    editorShowedSourceText:
-      results.editorAfterOpen.canvasText.includes('ывапывап') ||
-      results.editorAfterOpen.canvasText.trim().length > 0,
+    reopenedWithEdit: results.reopen.hasEdit,
     consoleErrors: errors.slice(0, 20),
+    passed: seedOk && results.fileAfterSave.text.includes(EDIT_MARK) && results.reopen.hasEdit,
   };
 
   fs.writeFileSync(OUT, JSON.stringify(results, null, 2), 'utf-8');

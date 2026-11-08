@@ -24,6 +24,7 @@ import {
   Download,
   Command,
   ChevronRight,
+  History as HistoryIcon,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { IconButton } from '../ui';
@@ -73,6 +74,14 @@ export const RichTextEditor: React.FC<Props> = ({
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashAnchor, setSlashAnchor] = useState<{ top: number; left: number } | null>(null);
   const [scrollSync, setScrollSync] = useState(true);
+  const [mdHistoryOpen, setMdHistoryOpen] = useState(false);
+  const [, setMdHistoryTick] = useState(0);
+  const mdHistoryRef = useRef<Array<{ id: string; timestamp: number; before: string; after: string }>>([]);
+  const mdCursorRef = useRef(-1);
+  const mdLastContentRef = useRef(tab.content);
+  const mdPendingBeforeRef = useRef<string | null>(null);
+  const mdHistoryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mdRestoringRef = useRef(false);
 
   const changeViewMode = useCallback(
     (mode: ViewMode) => {
@@ -88,6 +97,82 @@ export const RichTextEditor: React.FC<Props> = ({
     setViewMode(tab.viewMode || 'split');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id]);
+
+  /* ---------------- История изменений Markdown ---------------- */
+
+  useEffect(() => {
+    mdHistoryRef.current = [];
+    mdCursorRef.current = -1;
+    mdLastContentRef.current = tab.content;
+    mdPendingBeforeRef.current = null;
+    setMdHistoryTick((value) => value + 1);
+  }, [tab.id]);
+
+  useEffect(() => {
+    if (mdRestoringRef.current) {
+      mdRestoringRef.current = false;
+      mdLastContentRef.current = tab.content;
+      mdPendingBeforeRef.current = null;
+      return;
+    }
+    if (tab.content === mdLastContentRef.current) return;
+    if (mdPendingBeforeRef.current === null) {
+      mdPendingBeforeRef.current = mdLastContentRef.current;
+    }
+    mdLastContentRef.current = tab.content;
+    if (mdHistoryTimerRef.current) clearTimeout(mdHistoryTimerRef.current);
+    const after = tab.content;
+    mdHistoryTimerRef.current = setTimeout(() => {
+      const before = mdPendingBeforeRef.current;
+      mdPendingBeforeRef.current = null;
+      if (before === null || before === after) return;
+      const entries = mdHistoryRef.current.slice(0, mdCursorRef.current + 1);
+      entries.push({ id: `mh_${Date.now()}`, timestamp: Date.now(), before, after });
+      if (entries.length > 30) entries.splice(0, entries.length - 30);
+      mdHistoryRef.current = entries;
+      mdCursorRef.current = entries.length - 1;
+      setMdHistoryTick((value) => value + 1);
+    }, 650);
+    return () => {
+      if (mdHistoryTimerRef.current) clearTimeout(mdHistoryTimerRef.current);
+    };
+  }, [tab.content]);
+
+  const applyMdHistory = useCallback(
+    (content: string) => {
+      mdRestoringRef.current = true;
+      onChange(content);
+    },
+    [onChange]
+  );
+
+  const mdUndo = useCallback(() => {
+    const entries = mdHistoryRef.current;
+    if (mdCursorRef.current < 0) return;
+    const entry = entries[mdCursorRef.current];
+    mdCursorRef.current -= 1;
+    applyMdHistory(entry.before);
+    setMdHistoryTick((value) => value + 1);
+  }, [applyMdHistory]);
+
+  const mdRedo = useCallback(() => {
+    const entries = mdHistoryRef.current;
+    if (mdCursorRef.current + 1 >= entries.length) return;
+    mdCursorRef.current += 1;
+    applyMdHistory(entries[mdCursorRef.current].after);
+    setMdHistoryTick((value) => value + 1);
+  }, [applyMdHistory]);
+
+  const mdDiff = useCallback((before: string, after: string) => {
+    const beforeLines = before.split('\n');
+    const afterLines = after.split('\n');
+    const beforeSet = new Set(beforeLines);
+    const afterSet = new Set(afterLines);
+    return {
+      added: afterLines.filter((line) => !beforeSet.has(line)).length,
+      removed: beforeLines.filter((line) => !afterSet.has(line)).length,
+    };
+  }, []);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
@@ -503,6 +588,16 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
           </div>
 
           <button
+            onClick={() => setMdHistoryOpen((value) => !value)}
+            data-md-history-toggle="1"
+            title="История изменений Markdown"
+            className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-[11px] text-ws-muted transition-colors hover:border-ws-accent hover:text-ws-accent"
+          >
+            <HistoryIcon size={11} />
+            История
+          </button>
+
+          <button
             onClick={onSave}
             disabled={!tab.isDirty}
             title="Сохранить (Ctrl+S)"
@@ -516,6 +611,73 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
           </button>
         </div>
       </div>
+
+      {mdHistoryOpen && (
+        <div
+          data-md-history-panel="1"
+          className="shrink-0 border-b border-ws bg-ws-surface px-3 py-2 text-[11px]"
+        >
+          <div className="mb-1 flex items-center gap-2">
+            <HistoryIcon size={12} className="text-blue-400" />
+            <span className="flex-1 font-medium text-ws">
+              История Markdown · {mdHistoryRef.current.length}
+            </span>
+            <button
+              onClick={mdUndo}
+              disabled={mdCursorRef.current < 0}
+              className="rounded border border-ws bg-ws-elevated px-1.5 py-0.5 text-[10px] disabled:opacity-40"
+            >
+              Отменить
+            </button>
+            <button
+              onClick={mdRedo}
+              disabled={mdCursorRef.current + 1 >= mdHistoryRef.current.length}
+              className="rounded border border-ws bg-ws-elevated px-1.5 py-0.5 text-[10px] disabled:opacity-40"
+            >
+              Повторить
+            </button>
+            <button
+              onClick={() => setMdHistoryOpen(false)}
+              className="rounded px-1 text-ws-faint hover:bg-ws-hover hover:text-ws"
+            >
+              ×
+            </button>
+          </div>
+          {mdHistoryRef.current.length === 0 ? (
+            <div className="text-ws-faint">Изменений пока нет.</div>
+          ) : (
+            <div className="max-h-32 overflow-y-auto">
+              {mdHistoryRef.current.map((entry, index) => {
+                const diff = mdDiff(entry.before, entry.after);
+                const preview = entry.after.replace(/\s+/g, ' ').slice(0, 80);
+                return (
+                  <button
+                    key={entry.id}
+                    onClick={() => {
+                      mdCursorRef.current = index;
+                      applyMdHistory(entry.after);
+                      setMdHistoryTick((value) => value + 1);
+                    }}
+                    className={cn(
+                      'flex w-full items-center gap-2 rounded px-1.5 py-0.5 text-left text-[10px] hover:bg-ws-hover',
+                      index === mdCursorRef.current && 'bg-ws-accent-soft text-ws-accent'
+                    )}
+                  >
+                    <span className="font-mono text-ws-faint">
+                      {new Date(entry.timestamp).toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </span>
+                    <span className="text-ws-faint">+{diff.added} −{diff.removed}</span>
+                    <span className="truncate">{preview}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Область редактирования */}
       <div className="relative flex min-h-0 flex-1">

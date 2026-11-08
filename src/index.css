@@ -202,6 +202,14 @@
 .doc-canvas:focus {
   outline: none;
 }
+/* Кратковременная подсветка блоков, изменённых ассистентом: CSS Highlight API. */
+::highlight(ws-ai-changed) {
+  background-color: rgb(59 130 246 / 0.22);
+}
+::highlight(ws-find) {
+  background-color: #fde68a;
+  color: #111827;
+}
 .doc-canvas h1 {
   font-size: 1.7rem;
   font-weight: 700;
@@ -338,3 +346,7 @@
   max-width: 100%;
   border-radius: 6px;
 }
+
+[data-comment-text] { background: rgba(250, 204, 21, 0.16); border-bottom: 1px dashed #ca8a04; }
+sup[data-footnote-ref] { font-size: 0.7em; vertical-align: super; color: #2563eb; cursor: help; }
+[data-field='TOC'] { white-space: pre-wrap; }
