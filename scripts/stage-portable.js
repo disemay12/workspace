@@ -47,6 +47,7 @@ const keep = new Set([
   'imgbb.js',
   'secrets.js',
   'contextMenu.js',
+  'updater.js',
 ]);
 
 for (const entry of fs.readdirSync(path.join(srcRoot, 'dist-electron'), { withFileTypes: true })) {

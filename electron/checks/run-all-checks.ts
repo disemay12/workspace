@@ -92,6 +92,7 @@ run('compile: check scripts', () => {
     'ai-check.js',
     'insert-check.js',
     'doc-agent-check.js',
+    'conversion-check.js',
   ];
   for (const f of needed) {
     if (!fs.existsSync(path.join(ROOT, 'dist-electron', f))) {
@@ -141,6 +142,7 @@ const suites = [
   ['AI: стриминг и Ctrl+K', 'ai-check.js', 'ai-check.json'],
   ['AI: вставка кода в редактор', 'insert-check.js', 'insert-check.json'],
   ['AI: агентные правки .docx', 'doc-agent-check.js', 'doc-agent-check.json'],
+  ['Конвертация форматов и ширины Excel', 'conversion-check.js', 'conversion-check.json'],
 ];
 
 // Сквозные проверки с реальным API подключаются только при наличии ключа,

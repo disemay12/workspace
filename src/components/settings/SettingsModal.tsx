@@ -39,6 +39,7 @@ interface Props {
   modelsCache?: Record<string, string[]>;
   initialTab?: Tab;
   onNotify?: (message: string) => void;
+  onBeforeUpdate?: () => Promise<boolean>;
 }
 
 type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system';
@@ -66,8 +67,13 @@ export const SettingsModal: React.FC<Props> = ({
   modelsCache,
   initialTab = 'provider',
   onNotify,
+  onBeforeUpdate,
 }) => {
   const [tab, setTab] = useState<Tab>(initialTab);
+
+  useEffect(() => {
+    if (open) setTab(initialTab);
+  }, [open, initialTab]);
   const [keyVisible, setKeyVisible] = useState(false);
   const [keyDraft, setKeyDraft] = useState(settings.apiKey);
   const [testing, setTesting] = useState(false);
@@ -722,7 +728,7 @@ export const SettingsModal: React.FC<Props> = ({
       )}
 
       {tab === 'integrations' && <IntegrationsSettings onNotify={onNotify || (() => undefined)} />}
-      {tab === 'system' && <SystemSettings onNotify={onNotify} />}
+      {tab === 'system' && <SystemSettings onNotify={onNotify} onBeforeUpdate={onBeforeUpdate} />}
     </Modal>
   );
 };

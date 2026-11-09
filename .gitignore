@@ -20,8 +20,8 @@ dist-electron/
 release/
 build/
 out/
-WorkSpace/
-WorkSpace-Portable/
+/WorkSpace/
+/WorkSpace-Portable/
 WorkSpace-Portable.zip
 WorkSpace-Portable.7z
 BuildersWorkspace/

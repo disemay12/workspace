@@ -109,6 +109,8 @@ const electronAPI = {
     filters?: { name: string; extensions: string[] }[],
     defaultDir?: string
   ): Promise<string | null> => ipcRenderer.invoke('fs:saveFileDialog', defaultName, filters, defaultDir),
+  pathExists: (targetPath: string): Promise<boolean> =>
+    ipcRenderer.invoke('fs:pathExists', targetPath),
   exportPdf: (
     html: string,
     suggestedName?: string,
@@ -393,6 +395,63 @@ const electronAPI = {
     modelsCache?: Record<string, string[]>;
     apiKey?: string;
   }): Promise<{ success: boolean }> => ipcRenderer.invoke('aiSettings:save', patch),
+
+  /* ---------- Обновления с GitHub ---------- */
+  getAppVersion: (): Promise<string> => ipcRenderer.invoke('update:getVersion'),
+  checkForUpdates: (): Promise<{
+    success: boolean;
+    supported?: boolean;
+    currentVersion: string;
+    latestVersion?: string;
+    available?: boolean;
+    assetName?: string;
+    assetUrl?: string;
+    assetDigest?: string;
+    size?: number;
+    publishedAt?: string;
+    releaseNotes?: string;
+    htmlUrl?: string;
+    error?: string;
+  }> => ipcRenderer.invoke('update:check'),
+  downloadUpdate: (payload: {
+    version: string;
+    assetUrl: string;
+    assetName: string;
+    size?: number;
+    digest?: string;
+  }): Promise<{
+    success: boolean;
+    zipPath?: string;
+    extractDir?: string;
+    version?: string;
+    error?: string;
+  }> => ipcRenderer.invoke('update:download', payload),
+  installUpdate: (payload: {
+    zipPath: string;
+    extractDir: string;
+    version: string;
+  }): Promise<{ success: boolean; started?: boolean; error?: string }> =>
+    ipcRenderer.invoke('update:install', payload),
+  onUpdateProgress: (
+    cb: (data: {
+      phase: 'download' | 'extract' | 'install';
+      received: number;
+      total: number;
+      percent: number;
+    }) => void
+  ): (() => void) => {
+    const listener = (
+      _e: unknown,
+      data: {
+        phase: 'download' | 'extract' | 'install';
+        received: number;
+        total: number;
+        percent: number;
+      }
+    ) => cb(data);
+    ipcRenderer.on('update:progress', listener);
+    return () => ipcRenderer.removeListener('update:progress', listener);
+  },
 
   /* ---------- Отслеживание изменений на диске (Watcher) ---------- */
   onWorkspaceChanged: (

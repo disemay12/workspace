@@ -5,6 +5,8 @@ import type { PptxEditResult, PptxImageOptions, PptxModel } from '../lib/pptx';
 
 export interface PptxController {
   tabId: string;
+  /** Текущий пакет .pptx после сохранения отложенных правок. */
+  getContent: () => Promise<string>;
   readModel: () => Promise<PptxModel>;
   getSelection: () => { slide: number; shapeId: string; text: string; paragraphs: string[] } | null;
   setText: (slide: number, shapeId: string, paragraphs: string[]) => Promise<PptxEditResult>;

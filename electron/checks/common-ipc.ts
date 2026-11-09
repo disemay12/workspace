@@ -181,4 +181,17 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
   }));
 
   handle('secrets:importKey', () => ({ success: false, error: 'Недоступно в проверочном сценарии' }));
+
+  /* ---------- Обновления ---------- */
+  // В проверках сети нет: интерфейс должен получить понятный ответ без запроса.
+  handle('fs:pathExists', () => false);
+  handle('update:getVersion', () => '0.0.0-check');
+  handle('update:check', () => ({
+    success: true,
+    supported: false,
+    currentVersion: '0.0.0-check',
+    error: 'Проверка обновлений недоступна в проверочном сценарии',
+  }));
+  handle('update:download', () => ({ success: false, error: 'Недоступно в проверочном сценарии' }));
+  handle('update:install', () => ({ success: false, error: 'Недоступно в проверочном сценарии' }));
 }

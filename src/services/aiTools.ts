@@ -1600,26 +1600,91 @@ const MARKDOWN_TOOLS: ToolDefinition[] = [
     },
   },
 ];
+
+/** Сохранение в другом формате и конвертация файлов — доступны всегда. */
+const FILE_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'save_as',
+      description:
+        'Сохраняет открытый документ под новым именем или в другом формате. ' +
+        'Используй, когда просят «сохрани как», «сделай docx/xlsx», «пересохрани CSV в Excel». ' +
+        'Форматы: xlsx, csv, tsv, docx, md, txt, html, pdf. Не переписывай содержимое вручную.',
+      parameters: {
+        type: 'object',
+        properties: {
+          format: {
+            type: 'string',
+            description: 'Целевой формат: xlsx, csv, tsv, docx, md, txt, html или pdf.',
+          },
+          path: {
+            type: 'string',
+            description:
+              'Файл или папка назначения внутри workspace. Без path — рядом с исходным файлом.',
+          },
+          name: { type: 'string', description: 'Новое имя файла без папки.' },
+        },
+        required: ['format'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'convert_file',
+      description:
+        'Конвертирует любой файл workspace: Markdown/текст/HTML в DOCX, CSV/TSV в XLSX, ' +
+        'DOCX/XLSX/PPTX в Markdown/текст/HTML/PDF, Markdown-таблицу в XLSX. ' +
+        'Создаёт новый файл, исходный не меняет.',
+      parameters: {
+        type: 'object',
+        properties: {
+          source: { type: 'string', description: 'Исходный файл внутри workspace.' },
+          target: { type: 'string', description: 'Целевой файл или папка.' },
+          format: {
+            type: 'string',
+            description: 'Формат результата: xlsx, csv, tsv, docx, md, txt, html, pdf.',
+          },
+        },
+        required: ['source'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+function withFileTools(tools: ToolDefinition[]): ToolDefinition[] {
+  return [...tools, ...FILE_TOOLS];
+}
+
 export function buildDocumentTools(writeAccess: boolean, tabType: FileType | string): ToolDefinition[] {
   if (tabType === 'excel') {
     return writeAccess
-      ? EXCEL_TOOLS
-      : EXCEL_TOOLS.filter((tool) =>
-          ['excel_read', 'excel_get_selection'].includes(tool.function.name)
+      ? withFileTools(EXCEL_TOOLS)
+      : withFileTools(
+          EXCEL_TOOLS.filter((tool) =>
+            ['excel_read', 'excel_get_selection'].includes(tool.function.name)
+          )
         );
   }
   if (tabType === 'powerpoint') {
     return writeAccess
-      ? PPTX_TOOLS
-      : PPTX_TOOLS.filter((tool) =>
-          ['pptx_read', 'pptx_get_selection'].includes(tool.function.name)
+      ? withFileTools(PPTX_TOOLS)
+      : withFileTools(
+          PPTX_TOOLS.filter((tool) =>
+            ['pptx_read', 'pptx_get_selection'].includes(tool.function.name)
+          )
         );
   }
   if (tabType === 'markdown' || tabType === 'richtext' || tabType === 'text') {
     return writeAccess
-      ? MARKDOWN_TOOLS
-      : MARKDOWN_TOOLS.filter((tool) =>
-          ['md_read', 'search_document', 'read_document'].includes(tool.function.name)
+      ? withFileTools(MARKDOWN_TOOLS)
+      : withFileTools(
+          MARKDOWN_TOOLS.filter((tool) =>
+            ['md_read', 'search_document', 'read_document'].includes(tool.function.name)
+          )
         );
   }
   const readOnly = [
@@ -1633,11 +1698,15 @@ export function buildDocumentTools(writeAccess: boolean, tabType: FileType | str
     'table_read',
     'read_document',
   ];
-  if (!writeAccess) return ALL_TOOLS.filter((tool) => readOnly.includes(tool.function.name));
-  if (tabType === 'word') return ALL_TOOLS;
-  return ALL_TOOLS.filter((tool) =>
-    ['get_document', 'replace_document', 'find_replace', 'search_document', 'read_document'].includes(
-      tool.function.name
+  if (!writeAccess) {
+    return withFileTools(ALL_TOOLS.filter((tool) => readOnly.includes(tool.function.name)));
+  }
+  if (tabType === 'word') return withFileTools(ALL_TOOLS);
+  return withFileTools(
+    ALL_TOOLS.filter((tool) =>
+      ['get_document', 'replace_document', 'find_replace', 'search_document', 'read_document'].includes(
+        tool.function.name
+      )
     )
   );
 }

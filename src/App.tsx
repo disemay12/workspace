@@ -10,6 +10,8 @@ import {
   Maximize2,
   Save,
   Pencil,
+  Download,
+  Eye,
 } from 'lucide-react';
 
 import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment, FileType } from './types';
@@ -20,10 +22,11 @@ import { useWorkspace } from './state/workspace';
 import { useAISettings, useChatSessions } from './state/settings';
 import { useTheme } from './hooks/useTheme';
 import { useLocalStorage } from './hooks/useLocalStorage';
-import { cn, baseName, extName, joinPath, uid } from './lib/utils';
+import { cn, baseName, dirName, extName, joinPath, uid } from './lib/utils';
 import { docxText, pptxText, tabToDocumentText, htmlToPlainText } from './lib/documentText';
 import { extractLegacyDocText } from './lib/legacyDoc';
 import { docxBase64ToHtml, htmlToDocxBase64 } from './lib/docx';
+import { applyAutoFitColumns } from './lib/xlsxColumns';
 import { resolveWorkspacePath as resolvePathInsideWorkspace } from './lib/workspacePath';
 import { resolveImageSource } from './lib/imageSource';
 import {
@@ -55,6 +58,7 @@ import {
 
 import { TitleBar } from './components/workspace/TitleBar';
 import { FileTree } from './components/workspace/FileTree';
+import { SaveAsDialog } from './components/workspace/SaveAsDialog';
 import { QuickOpenModal } from './components/workspace/QuickOpenModal';
 import { GlobalSearchPanel } from './components/workspace/GlobalSearchPanel';
 import { SettingsModal } from './components/settings/SettingsModal';
@@ -83,6 +87,13 @@ import {
   normalizeTableValue,
   sanitizeFileName,
 } from './services/aiActions';
+import {
+  type ConversionFormat,
+  defaultTargetName,
+  guessFormat,
+  normalizeConversionFormat,
+} from './services/documentConversion';
+import type { UpdateCheckResult } from './types';
 
 /** Форматы, в которые приложение умеет записывать правки ИИ. */
 const EDITABLE_TYPES = new Set<FileType>(['word', 'excel', 'markdown', 'richtext', 'text', 'code']);
@@ -162,6 +173,11 @@ const App: React.FC = () => {
   const [searchPanelOpen, setSearchPanelOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('provider');
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
+  const [saveAsTabId, setSaveAsTabId] = useState('');
+  const [saveAsBusy, setSaveAsBusy] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   /** Команда, отправленная AI в терминал: выполняется после монтирования панели. */
   const [terminalCommand, setTerminalCommand] = useState<{ id: string; command: string } | null>(null);
   const [inlineTarget, setInlineTarget] = useState<InlineEditTarget | null>(null);
@@ -275,6 +291,25 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isElectron]);
 
+  /* ---- Тихая проверка обновлений при запуске ---- */
+  useEffect(() => {
+    if (!isElectron || !window.electronAPI?.checkForUpdates) return;
+    const check = window.electronAPI.checkForUpdates;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const info = await check();
+        if (!cancelled && info?.success && info.available) setUpdateInfo(info);
+      } catch {
+        // Нет сети или GitHub недоступен — приложение работает как обычно.
+      }
+    }, 4000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [isElectron]);
+
   /* ============================================================
      Горячие клавиши (Этап 6.3)
      ============================================================ */
@@ -307,14 +342,24 @@ const App: React.FC = () => {
       }
 
       // Ctrl+S — сохранить активную вкладку
-      if (e.key === 's' && !e.shiftKey) {
+      if (e.key === 's' && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         if (ws.activeTabId) void ws.saveTab(ws.activeTabId);
         return;
       }
 
-      // Ctrl+Shift+S — сохранить всё
-      if (e.key === 'S' && e.shiftKey) {
+      // Ctrl+Shift+S — сохранить как (с конвертацией формата)
+      if ((e.key === 's' || e.key === 'S') && e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        if (ws.activeTabId) {
+          setSaveAsTabId(ws.activeTabId);
+          setSaveAsOpen(true);
+        }
+        return;
+      }
+
+      // Ctrl+Alt+S — сохранить все
+      if (e.key === 's' && e.altKey) {
         e.preventDefault();
         void ws.saveAll().then(({ saved, failed }) => {
           if (failed.length === 0) {
@@ -755,6 +800,94 @@ const App: React.FC = () => {
   );
 
   /**
+   * Живое содержимое вкладки для экспорта: Word/Excel/PowerPoint держат
+   * актуальные правки в своих редакторах, а не в tab.content.
+   */
+  const resolveLiveTabContent = useCallback(async (tab: OpenTab): Promise<string> => {
+    if (tab.type === 'word') {
+      const controller = getDocumentController(tab.id);
+      if (controller?.serialize) {
+        try {
+          return await controller.serialize();
+        } catch {
+          return tab.content;
+        }
+      }
+    }
+    if (tab.type === 'excel') {
+      const controller = getSheetController(tab.id);
+      if (controller?.serialize) {
+        try {
+          return await controller.serialize();
+        } catch {
+          return tab.content;
+        }
+      }
+    }
+    if (tab.type === 'powerpoint') {
+      const controller = getPptxController(tab.id);
+      if (controller?.getContent) {
+        try {
+          return await controller.getContent();
+        } catch {
+          return tab.content;
+        }
+      }
+    }
+    return tab.content;
+  }, []);
+
+  const openSaveAs = useCallback(
+    (tabId?: string) => {
+      const id = tabId || ws.activeTabId;
+      if (!id) return;
+      setSaveAsTabId(id);
+      setSaveAsOpen(true);
+    },
+    [ws.activeTabId]
+  );
+
+  /** Сохраняет открытую вкладку в новый файл; использует живой редактор. */
+  const exportTabAs = useCallback(
+    async (
+      tab: OpenTab,
+      targetPath: string,
+      format: ConversionFormat
+    ): Promise<AppActionResult> => {
+      const content = await resolveLiveTabContent(tab);
+      const activeSheet =
+        tab.type === 'excel' ? getSheetController(tab.id)?.getActiveSheet?.() : undefined;
+      const ok = await wsRef.current.saveTabAs(
+        tab.id,
+        targetPath,
+        format,
+        content,
+        activeSheet
+      );
+      return ok
+        ? { ok: true, message: `Сохранено: ${baseName(targetPath)}`, path: targetPath }
+        : { ok: false, message: `Не удалось сохранить: ${baseName(targetPath)}` };
+    },
+    [resolveLiveTabContent]
+  );
+
+  /** Колбэк диалога «Сохранить как». */
+  const handleSaveAs = useCallback(
+    async (targetPath: string, format: ConversionFormat): Promise<boolean> => {
+      const tab = wsRef.current.tabs.find((item) => item.id === saveAsTabId);
+      if (!tab) return false;
+      setSaveAsBusy(true);
+      try {
+        const result = await exportTabAs(tab, targetPath, format);
+        return result.ok;
+      } finally {
+        setSaveAsBusy(false);
+      }
+    },
+    [saveAsTabId, exportTabAs]
+  );
+
+  /**
    * Исполнитель инструментов документа для агентного цикла.
    * Читает живое полотно через docBridge, пишет через него же, чтобы правки
    * сразу были видны в редакторе, а не только в base64 вкладки.
@@ -770,6 +903,88 @@ const App: React.FC = () => {
       const tab = tabId
         ? current.tabs.find((item) => item.id === tabId)
         : current.activeTab;
+
+      if (name === 'convert_file') {
+        const rawSource = String(args.source ?? args.path ?? args.file ?? '').trim();
+        if (!rawSource) {
+          return { ok: false, message: 'Укажите исходный файл для конвертации' };
+        }
+        const sourcePath = await resolveWorkspacePath(rawSource);
+        const rawTarget = String(args.target ?? args.output ?? args.to ?? '').trim();
+        const rawFormat = String(args.format ?? args.as ?? '').trim();
+        const format =
+          normalizeConversionFormat(rawFormat) || (rawTarget ? guessFormat(rawTarget) : null);
+        if (!format) {
+          return { ok: false, message: 'Укажите формат: docx, xlsx, csv, md, txt, html или pdf' };
+        }
+        const ext = extName(sourcePath) || 'файл';
+        const targetPath = rawTarget
+          ? await resolveWorkspacePath(rawTarget)
+          : await fileSystemService.uniquePath(
+              dirName(sourcePath),
+              defaultTargetName(baseName(sourcePath), format)
+            );
+        const result = await current.convertFile(sourcePath, targetPath, format);
+        return {
+          ok: result.ok,
+          message:
+            result.message ||
+            (result.ok
+              ? `Конвертировано: ${baseName(sourcePath)} → ${baseName(targetPath)}`
+              : `Не удалось конвертировать .${ext}`),
+          changed: false,
+          meta: { path: targetPath, format },
+        };
+      }
+
+      if (name === 'save_as') {
+        if (!tab) return { ok: false, message: 'Нет открытого документа для сохранения' };
+        const rawFormat = String(args.format ?? args.as ?? '').trim();
+        const rawTarget = String(args.path ?? args.target ?? '').trim();
+        const format =
+          normalizeConversionFormat(rawFormat) || (rawTarget ? guessFormat(rawTarget) : null);
+        if (!format) {
+          return {
+            ok: false,
+            message:
+              'Укажите формат сохранения: xlsx, csv, tsv, docx, md, txt, html или pdf',
+          };
+        }
+        let targetPath = '';
+        if (rawTarget) {
+          const resolved = await resolveWorkspacePath(rawTarget);
+          const targetExt = extName(resolved);
+          // path может быть папкой: тогда имя берём из name/исходного файла.
+          targetPath =
+            targetExt && normalizeConversionFormat(targetExt)
+              ? resolved
+              : joinPath(
+                  resolved,
+                  String(args.name ?? '').trim() || defaultTargetName(tab.name, format)
+                );
+        } else {
+          targetPath = joinPath(
+            dirName(tab.path),
+            String(args.name ?? '').trim() || defaultTargetName(tab.name, format)
+          );
+        }
+        if (extName(targetPath) !== format) {
+          targetPath = targetPath.replace(/\.[^./\\]+$/, '') + `.${format}`;
+        }
+        if (!rawTarget) {
+          targetPath = await fileSystemService.uniquePath(
+            dirName(targetPath),
+            baseName(targetPath)
+          );
+        }
+        const result = await exportTabAs(tab, targetPath, format);
+        return {
+          ok: result.ok,
+          message: result.message,
+          changed: false,
+          meta: { path: targetPath, format },
+        };
+      }
 
       if (!tab || !AGENT_TAB_TYPES.has(tab.type)) {
         return { ok: false, message: 'Документ закрыт или недоступен для правки' };
@@ -1510,7 +1725,7 @@ const App: React.FC = () => {
         };
       }
     },
-    []
+    [resolveWorkspacePath, exportTabAs]
   );
 
   const handleAIRunAction = useCallback(
@@ -1594,7 +1809,9 @@ const App: React.FC = () => {
             try {
               const existing = await fileSystemService.readFile(targetPath, 'base64');
               const workbook = XLSX.read(existing.content, { type: 'base64' });
-              workbook.Sheets[sheetName] = XLSX.utils.aoa_to_sheet([columns, ...rows]);
+              const sheet = XLSX.utils.aoa_to_sheet([columns, ...rows]);
+              applyAutoFitColumns(sheet, [columns, ...rows], { headerRows: 1 });
+              workbook.Sheets[sheetName] = sheet;
               if (!workbook.SheetNames.includes(sheetName)) workbook.SheetNames.push(sheetName);
               base64 = XLSX.write(workbook, { bookType: 'xlsx', type: 'base64' });
             } catch {
@@ -1639,7 +1856,7 @@ const App: React.FC = () => {
                   action.rows || [],
                   action.sheetName || 'Лист 1'
                 );
-            const created = await ws.createFile(dir, name, content, isCsv ? 'utf-8' : 'base64');
+            const created = await ws.createFile(dir, name, content, isCsv ? 'utf-8-bom' : 'base64');
             return created
               ? { ok: true, message: `Создана таблица: ${name}`, path: created }
               : fail(`Не удалось создать таблицу: ${name}`);
@@ -1677,7 +1894,7 @@ const App: React.FC = () => {
                   : [...(action.columns?.length ? [action.columns] : []), ...tableRows];
               const sheet = XLSX.utils.aoa_to_sheet(base as unknown[][]);
               const csv = XLSX.utils.sheet_to_csv(sheet);
-              await fileSystemService.writeFile(targetPath, csv, 'utf-8');
+              await fileSystemService.writeFile(targetPath, csv, 'utf-8-bom');
               const openTab = ws.tabs.find((item) => item.path === targetPath);
               if (openTab) ws.patchTab(openTab.id, { content: csv, initialContent: csv, isDirty: false, reloadKey: Date.now() });
               else await ws.openFile(targetPath);
@@ -1711,6 +1928,9 @@ const App: React.FC = () => {
                 ? [...nonEmpty, ...tableRows]
                 : [...(action.columns?.length ? [action.columns] : []), ...tableRows];
             workbook.Sheets[sheetName] = XLSX.utils.aoa_to_sheet(base as unknown[][]);
+            applyAutoFitColumns(workbook.Sheets[sheetName], base as unknown[][], {
+              headerRows: action.mode === 'append' ? 0 : 1,
+            });
             const content = XLSX.write(workbook, {
               bookType: ext === 'xlsm' ? 'xlsm' : 'xlsx',
               type: 'base64',
@@ -1753,7 +1973,12 @@ const App: React.FC = () => {
           case 'create_file': {
             const name = sanitizeFileName(action.name || 'Файл', '.txt');
             const dir = await resolveWorkspacePath(action.path);
-            const created = await ws.createFile(dir, name, action.content || '', 'utf-8');
+            const created = await ws.createFile(
+              dir,
+              name,
+              action.content || '',
+              /\.(csv|tsv)$/i.test(name) ? 'utf-8-bom' : 'utf-8'
+            );
             return created
               ? { ok: true, message: `Создан файл: ${name}`, path: created }
               : fail(`Не удалось создать файл: ${name}`);
@@ -1911,6 +2136,40 @@ const App: React.FC = () => {
             return saved
               ? { ok: true, message: `Сохранено: ${ws.activeTab?.name || 'файл'}` }
               : fail('Не удалось сохранить файл');
+          }
+
+          case 'save_as': {
+            const result = await runDocumentTool('save_as', {
+              format: action.format,
+              path: action.path,
+              target: action.target,
+              name: action.name,
+            });
+            return {
+              ok: result.ok,
+              message: result.message,
+              path:
+                result.meta && typeof result.meta.path === 'string'
+                  ? result.meta.path
+                  : undefined,
+            };
+          }
+
+          case 'convert_file': {
+            const result = await runDocumentTool('convert_file', {
+              source: action.source,
+              path: action.source,
+              target: action.target,
+              format: action.format,
+            });
+            return {
+              ok: result.ok,
+              message: result.message,
+              path:
+                result.meta && typeof result.meta.path === 'string'
+                  ? result.meta.path
+                  : undefined,
+            };
           }
 
           case 'notify': {
@@ -2147,6 +2406,8 @@ const App: React.FC = () => {
     if (action === 'open') {
       if (item.isDirectory) void ws.toggleDirectory(item.path);
       else void ws.openFile(item.path);
+    } else if (action === 'preview') {
+      if (!item.isDirectory) void ws.openFile(item.path, 'primary', false, true);
     } else if (action === 'new-file') {
       setNewFileDialog({
         open: true,
@@ -2286,26 +2547,32 @@ const App: React.FC = () => {
         ws.patchTab(tab.id, { viewMode }),
     };
 
+    let editor: React.ReactNode;
     switch (tab.type) {
       case 'markdown':
       case 'richtext':
-        return <RichTextEditor {...common} />;
+        editor = <RichTextEditor {...common} />;
+        break;
       case 'excel':
-        return <ExcelEditor {...common} onAIApply={handleAIApply} />;
+        editor = <ExcelEditor {...common} onAIApply={handleAIApply} />;
+        break;
       case 'word':
-        return <WordEditor {...common} />;
+        editor = <WordEditor {...common} />;
+        break;
       case 'powerpoint':
-        return <PowerPointEditor {...common} />;
+        editor = <PowerPointEditor {...common} />;
+        break;
       case 'pdf':
-        return (
+        editor = (
           <embed
             src={'media://local/?path=' + encodeURIComponent(tab.path)}
             type="application/pdf"
             className="h-full w-full"
           />
         );
+        break;
       case 'video':
-        return (
+        editor = (
           <VideoEditor
             tab={tab}
             onNotify={ws.flash}
@@ -2313,10 +2580,12 @@ const App: React.FC = () => {
             onCloseTab={() => ws.closeTab(tab.id)}
           />
         );
+        break;
       case 'binary':
-        return <BinaryViewer tab={tab} onNotify={ws.flash} />;
+        editor = <BinaryViewer tab={tab} onNotify={ws.flash} />;
+        break;
       case 'image':
-        return (
+        editor = (
           <ImageViewer
             tab={tab}
             onChange={(content) => ws.updateTabContent(tab.id, content)}
@@ -2324,8 +2593,9 @@ const App: React.FC = () => {
             onNotify={ws.flash}
           />
         );
+        break;
       default:
-        return (
+        editor = (
           <MonacoEditorWrapper
             {...common}
             onRegisterContext={registerEditorContext}
@@ -2335,6 +2605,20 @@ const App: React.FC = () => {
           />
         );
     }
+
+    // Предпросмотр: редактор рисует реальный документ, но взаимодействие
+    // заблокировано. Двойной клик по файлу или кнопка «Редактировать»
+    // снимает блокировку с этой же вкладки.
+    const locked =
+      Boolean(tab.isPreview) &&
+      ['word', 'excel', 'powerpoint', 'markdown', 'richtext', 'text', 'code'].includes(
+        tab.type
+      );
+    return (
+      <div className="h-full" inert={locked || undefined}>
+        {editor}
+      </div>
+    );
   };
 
   const dirtyPaths = useMemo(
@@ -2354,10 +2638,15 @@ const App: React.FC = () => {
           setNewFileDialog({ open: true, parentDir: ws.rootPath, kind: 'file', name: '' })
         }
         onSave={() => ws.activeTabId && void ws.saveTab(ws.activeTabId)}
+        onSaveAs={() => openSaveAs()}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         onToggleAIPanel={() => setAiPanelOpen((v) => !v)}
         onToggleSplit={() => ws.setSplitEnabled(!ws.splitEnabled)}
         onOpenSettings={() => setSettingsOpen(true)}
+        onCheckUpdates={() => {
+          setSettingsTab('system');
+          setSettingsOpen(true);
+        }}
         onQuickOpen={() => setQuickOpenOpen(true)}
         sidebarOpen={sidebarOpen}
         aiPanelOpen={aiPanelOpen}
@@ -2368,6 +2657,34 @@ const App: React.FC = () => {
         onToggleTheme={toggleTheme}
         isElectron={isElectron}
       />
+
+      {updateInfo?.available && !updateDismissed && (
+        <div className="flex items-center gap-2 border-b border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-[11px] text-ws">
+          <Download size={13} className="shrink-0 text-sky-400" />
+          <span className="min-w-0 flex-1 truncate">
+            Доступна новая версия WorkSpace {updateInfo.latestVersion}
+            {updateInfo.currentVersion ? ` (установлена ${updateInfo.currentVersion})` : ''}.
+            Ключи и настройки сохранятся.
+          </span>
+          <button
+            onClick={() => {
+              setSettingsTab('system');
+              setSettingsOpen(true);
+              setUpdateDismissed(true);
+            }}
+            className="shrink-0 rounded bg-sky-600 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-sky-500"
+          >
+            Обновить
+          </button>
+          <button
+            onClick={() => setUpdateDismissed(true)}
+            title="Скрыть"
+            className="shrink-0 rounded p-0.5 text-ws-faint hover:bg-ws-hover hover:text-ws"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
 
       {bootError && (
         <div className="flex items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-ws-warning">
@@ -2427,6 +2744,7 @@ const App: React.FC = () => {
                 dirtyPaths={dirtyPaths}
                 onToggleDir={(p) => void ws.toggleDirectory(p)}
                 onOpenFile={(p) => void ws.openFile(p)}
+                onPreviewFile={(p) => void ws.openFile(p, 'primary', false, true)}
                 onRefresh={() => void ws.refreshTree()}
                 onNewFile={(parentDir) =>
                   setNewFileDialog({
@@ -2477,6 +2795,7 @@ const App: React.FC = () => {
                   )}
                 >
                   {isActive && <span className="absolute-none" />}
+                  {tab.isPreview && <Eye size={11} className="shrink-0 text-sky-400" />}
                   <span className="truncate">{tab.name}</span>
                   {tab.isDirty && (
                     <span className="text-[14px] leading-none text-ws-warning">•</span>
@@ -2513,6 +2832,26 @@ const App: React.FC = () => {
               </button>
             </div>
           </div>
+
+          {/* Предпросмотр: один клик по файлу — временная вкладка без правки */}
+          {ws.activeTab?.isPreview && (
+            <div
+              data-preview-banner="1"
+              className="flex h-8 shrink-0 items-center gap-2 border-b border-sky-500/30 bg-sky-500/10 px-3 text-[11px] text-ws-muted"
+            >
+              <Eye size={13} className="shrink-0 text-sky-400" />
+              <span className="min-w-0 flex-1 truncate">
+                Предпросмотр: <span className="text-ws">{ws.activeTab.name}</span> — только
+                чтение
+              </span>
+              <button
+                onClick={() => void ws.openFile(ws.activeTab!.path)}
+                className="shrink-0 rounded border border-ws bg-ws-surface px-2 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+              >
+                Редактировать
+              </button>
+            </div>
+          )}
 
           {/* Редакторы (обычный или разделённый режим) */}
           <div className="min-h-0 flex-1">
@@ -2678,8 +3017,13 @@ const App: React.FC = () => {
                 },
                 {
                   label: 'Сохранить все файлы',
-                  hint: '',
+                  hint: 'Ctrl+Alt+S',
                   run: () => void ws.saveAll(),
+                },
+                {
+                  label: 'Сохранить как… (сменить формат)',
+                  hint: 'Ctrl+Shift+S',
+                  run: () => openSaveAs(),
                 },
                 {
                   label: 'Быстрый переход к файлу',
@@ -2729,6 +3073,14 @@ const App: React.FC = () => {
                   hint: '',
                   run: () => setSettingsOpen(true),
                 },
+                {
+                  label: 'Проверить обновление',
+                  hint: '',
+                  run: () => {
+                    setSettingsTab('system');
+                    setSettingsOpen(true);
+                  },
+                },
               ]
                 .filter((item) =>
                   item.label.toLowerCase().includes(commandQuery.trim().toLowerCase())
@@ -2760,6 +3112,15 @@ const App: React.FC = () => {
         onOpenFile={(p) => void ws.openFile(p)}
       />
 
+      <SaveAsDialog
+        open={saveAsOpen}
+        tab={ws.tabs.find((tab) => tab.id === saveAsTabId) ?? null}
+        busy={saveAsBusy}
+        onClose={() => setSaveAsOpen(false)}
+        onSave={handleSaveAs}
+        onNotify={ws.flash}
+      />
+
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -2772,6 +3133,14 @@ const App: React.FC = () => {
         modelsCache={ai.modelsCache}
         initialTab={settingsTab}
         onNotify={ws.flash}
+        onBeforeUpdate={async () => {
+          const { failed } = await ws.saveAll();
+          if (failed.length > 0) {
+            ws.flash(`Не удалось сохранить: ${failed.join(', ')} — обновление отменено`);
+            return false;
+          }
+          return true;
+        }}
       />
 
       <InlineCopilot
@@ -3113,6 +3482,8 @@ const EmptyWorkspace: React.FC<{
     { keys: 'Ctrl+P', label: 'Быстрый переход к файлу' },
     { keys: 'Ctrl+N', label: 'Новый файл' },
     { keys: 'Ctrl+S', label: 'Сохранить' },
+    { keys: 'Ctrl+Shift+S', label: 'Сохранить как (сменить формат)' },
+    { keys: 'Ctrl+Alt+S', label: 'Сохранить всё' },
     { keys: 'Ctrl+K', label: 'AI-правка выделенного текста' },
     { keys: 'Ctrl+B', label: 'Скрыть/показать проводник' },
     { keys: 'Ctrl+Shift+F', label: 'Поиск по всем файлам' },

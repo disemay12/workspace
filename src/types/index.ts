@@ -35,8 +35,10 @@ export interface OpenTab {
   /** Снимок содержимого на момент последнего сохранения — база для проверки dirty. */
   initialContent: string;
   isDirty: boolean;
-  /** 'utf-8' | 'windows-1251' | ... | 'base64' */
+  /** 'utf-8' | 'utf-8-bom' | 'windows-1251' | ... | 'base64' */
   encoding: string;
+  /** Вкладка открыта одиночным кликом: показывает содержимое без права правки. */
+  isPreview?: boolean;
   viewMode?: 'visual' | 'source' | 'split';
   /** Внешнее обновление содержимого: заставляет редактор перечитать книгу. */
   reloadKey?: number;
@@ -61,6 +63,41 @@ export interface PageSetup {
   fontSizePt?: number;
   /** Множитель межстрочного интервала: 1 — одинарный, 1.5 — полуторный. */
   lineSpacing?: number;
+}
+
+/* ============================================================
+   Обновления
+   ============================================================ */
+
+export interface UpdateCheckResult {
+  success: boolean;
+  supported?: boolean;
+  currentVersion: string;
+  latestVersion?: string;
+  available?: boolean;
+  assetName?: string;
+  assetUrl?: string;
+  assetDigest?: string;
+  size?: number;
+  publishedAt?: string;
+  releaseNotes?: string;
+  htmlUrl?: string;
+  error?: string;
+}
+
+export interface UpdateProgress {
+  phase: 'download' | 'extract' | 'install';
+  received: number;
+  total: number;
+  percent: number;
+}
+
+export interface UpdateDownloadResult {
+  success: boolean;
+  zipPath?: string;
+  extractDir?: string;
+  version?: string;
+  error?: string;
 }
 
 /* ============================================================
@@ -237,6 +274,8 @@ declare global {
       openFolderDialog: () => Promise<string | null>;
       openFileDialog: (filters?: { name: string; extensions: string[] }[]) => Promise<string | null>;
       saveFileDialog: (defaultName: string, filters?: { name: string; extensions: string[] }[], defaultDir?: string) => Promise<string | null>;
+      /** Существует ли путь — для предупреждения о перезаписи в «Сохранить как». */
+      pathExists?: (targetPath: string) => Promise<boolean>;
       exportPdf: (html: string, suggestedName?: string, targetPath?: string) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
       uniquePath: (dirPath: string, fileName: string) => Promise<string>;
       showInExplorer: (filePath: string) => Promise<{ success: boolean; error?: string }>;
@@ -304,6 +343,23 @@ declare global {
         keyErrors?: string[];
       }>;
       saveAiSettings?: (patch: Partial<AISettings> & { apiKey?: string }) => Promise<{ success: boolean }>;
+
+      /* ---------- Обновления с GitHub ---------- */
+      getAppVersion?: () => Promise<string>;
+      checkForUpdates?: () => Promise<UpdateCheckResult>;
+      downloadUpdate?: (info: {
+        version: string;
+        assetUrl: string;
+        assetName: string;
+        size?: number;
+        digest?: string;
+      }) => Promise<UpdateDownloadResult>;
+      installUpdate?: (payload: {
+        zipPath: string;
+        extractDir: string;
+        version: string;
+      }) => Promise<{ success: boolean; started?: boolean; error?: string }>;
+      onUpdateProgress?: (cb: (data: UpdateProgress) => void) => () => void;
 
       /** Метаданные файла secrets.local.ps1 — без самого ключа. */
       describeSecrets: () => Promise<{

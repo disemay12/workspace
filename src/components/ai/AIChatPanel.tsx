@@ -26,6 +26,8 @@ import {
   FolderPlus,
   Pencil,
   Save,
+  Download,
+  RefreshCw,
   Terminal,
   Bell,
   MousePointerClick,
@@ -1546,6 +1548,18 @@ const ACTION_META: Record<
     box: 'border-ws bg-ws-surface',
     iconBox: 'bg-emerald-500/15 text-emerald-400',
   },
+  save_as: {
+    label: 'Сохранить как',
+    icon: <Download size={15} />,
+    box: 'border-sky-500/30 bg-sky-500/10',
+    iconBox: 'bg-sky-500/20 text-sky-400',
+  },
+  convert_file: {
+    label: 'Конвертировать файл',
+    icon: <RefreshCw size={15} />,
+    box: 'border-sky-500/30 bg-sky-500/10',
+    iconBox: 'bg-sky-500/20 text-sky-400',
+  },
   notify: {
     label: 'Уведомление',
     icon: <Bell size={15} />,
@@ -1602,6 +1616,10 @@ function describeAction(action: AIActionPayload): string {
       return action.path || action.name || 'Текущая вкладка';
     case 'save':
       return action.all ? 'Все изменённые файлы' : 'Текущий файл';
+    case 'save_as':
+      return `${action.path || action.name || 'Рядом с исходным'} · ${action.format || 'формат'}`;
+    case 'convert_file':
+      return `${action.source || 'Файл'} → ${action.target || action.format || 'новый формат'}`;
     case 'notify':
       return action.message;
     case 'run_command':

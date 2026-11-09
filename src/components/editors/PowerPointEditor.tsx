@@ -191,6 +191,10 @@ export const PowerPointEditor: React.FC<Props> = ({ tab, onChange, onSave }) => 
   useEffect(() => {
     return registerPptxController({
       tabId: tab.id,
+      getContent: async () => {
+        await flush();
+        return base64Ref.current;
+      },
       readModel: async () => {
         await flush();
         return parsePptx(base64Ref.current);

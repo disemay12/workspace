@@ -1,6 +1,7 @@
 import * as XLSX from 'xlsx';
 import { htmlToDocxBase64 } from '../lib/docx';
 import { markdownToDocumentHtml, stripAssistantNoise } from '../lib/aiDocument';
+import { applyAutoFitColumns } from '../lib/xlsxColumns';
 
 /* ============================================================
    Типы действий AI по управлению программой WorkSpace
@@ -27,6 +28,8 @@ export type AppActionKind =
   | 'select_tab'
   | 'close_tab'
   | 'save'
+  | 'save_as'
+  | 'convert_file'
   | 'notify'
   | 'run_command';
 
@@ -159,6 +162,25 @@ export interface AISavePayload {
   all?: boolean;
 }
 
+/** Сохранить открытый документ под новым именем или в другом формате. */
+export interface AISaveAsPayload {
+  action: 'save_as';
+  /** Целевой файл или папка. Без пути — рядом с исходным. */
+  path?: string;
+  target?: string;
+  name?: string;
+  /** xlsx, csv, tsv, docx, md, txt, html, pdf. */
+  format?: string;
+}
+
+/** Конвертировать любой файл рабочей папки. */
+export interface AIConvertFilePayload {
+  action: 'convert_file';
+  source?: string;
+  target?: string;
+  format?: string;
+}
+
 export interface AINotifyPayload {
   action: 'notify';
   message: string;
@@ -189,6 +211,8 @@ export type AIActionPayload =
   | AISelectTabPayload
   | AICloseTabPayload
   | AISavePayload
+  | AISaveAsPayload
+  | AIConvertFilePayload
   | AINotifyPayload
   | AIRunCommandPayload;
 
@@ -290,6 +314,15 @@ const ACTION_ALIASES: Record<string, AppActionKind> = {
   save: 'save',
   save_file: 'save',
   save_all: 'save',
+  save_as: 'save_as',
+  saveas: 'save_as',
+  export_as: 'save_as',
+  save_copy: 'save_as',
+  export_copy: 'save_as',
+  convert_file: 'convert_file',
+  convert: 'convert_file',
+  transform_file: 'convert_file',
+  export_file: 'convert_file',
   notify: 'notify',
   message: 'notify',
   run_command: 'run_command',
@@ -352,7 +385,7 @@ function parseActionTolerant(raw: string): unknown {
     /"action"\s*:\s*"([^"]+)"/.exec(raw)?.[1];
   if (!action) return null;
   const body: Record<string, unknown> = { action };
-  for (const key of ['path', 'file', 'source', 'target', 'sheetName', 'sheet', 'name', 'title', 'mode']) {
+  for (const key of ['path', 'file', 'source', 'target', 'sheetName', 'sheet', 'name', 'title', 'mode', 'format']) {
     const match = new RegExp(`"${key}"\\s*:\\s*"([^"]*)"`).exec(raw);
     if (match) body[key] = match[1];
   }
@@ -637,6 +670,26 @@ function normalizeAction(input: unknown): AIActionPayload | null {
 
     case 'save':
       return { action: 'save', all: body.all === true || body.scope === 'all' };
+
+    case 'save_as': {
+      const format = asString(body.format) || asString(body.as) || asString(body.ext);
+      const target = asString(body.target) || asString(body.output) || asString(body.to);
+      if (!format && !target && !name) return null;
+      return { action: 'save_as', path, name, target, format };
+    }
+
+    case 'convert_file': {
+      const source =
+        asString(body.source) ||
+        asString(body.from) ||
+        asString(body.input) ||
+        asString(body.file) ||
+        path;
+      const target = asString(body.target) || asString(body.output) || asString(body.to);
+      const format = asString(body.format) || asString(body.as) || asString(body.ext);
+      if (!source) return null;
+      return { action: 'convert_file', source, target, format };
+    }
 
     case 'notify': {
       const message = asString(body.message) ?? content;
@@ -949,16 +1002,9 @@ export function generateExcelBase64(
     });
   });
 
-  // Автоматическая ширина колонок
-  const colWidths = (columns.length > 0 ? columns : (rows[0] || [])).map((col, cIdx) => {
-    let maxLen = String(col ?? '').length;
-    for (const r of rows) {
-      const val = String(r[cIdx] ?? '');
-      if (val.length > maxLen) maxLen = val.length;
-    }
-    return { wch: Math.min(Math.max(maxLen + 3, 10), 40) };
-  });
-  ws['!cols'] = colWidths;
+  // Автоматическая ширина колонок по содержимому. Excel открывает файл
+  // с текстом внутри ячеек, а не с обрезанными стандартными 8,43 символа.
+  applyAutoFitColumns(ws, aoa, { headerRows: columns.length > 0 ? 1 : 0 });
 
   XLSX.utils.book_append_sheet(wb, ws, sheetName || 'Лист 1');
   return XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });

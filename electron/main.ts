@@ -15,6 +15,7 @@ import { docBufferToText } from './docText';
 import { setWatchRoot } from './watcher';
 import { registerTerminal } from './terminal';
 import { registerContextMenuIpc } from './contextMenu';
+import { registerUpdater } from './updater';
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -269,6 +270,12 @@ app.whenReady().then(() => {
   registerContextMenuIpc();
   registerVideo();
   registerTerminal(() => mainWindow);
+  registerUpdater({
+    quitForUpdate: () => {
+      allowClose = true;
+      app.quit();
+    },
+  });
   // Файл секретов создаётся сразу: в релизе его нет, пользователь должен
   // увидеть готовый шаблон в профиле, а не «файл не найден».
   secretsImporter.ensure();
@@ -676,6 +683,15 @@ ipcMain.handle(
   }
 );
 
+ipcMain.handle('fs:pathExists', async (_event, targetPath: string) => {
+  try {
+    await fs.promises.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+});
+
 /** Свободный путь в папке: name.mp4 → name (2).mp4 → name (3).mp4 … */
 ipcMain.handle('fs:uniquePath', async (_event, dirPath: string, fileName: string) => {
   const ext = path.extname(fileName);
@@ -785,21 +801,23 @@ ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8
     if (encoding === 'base64') {
       return { success: true, content: buffer.toString('base64'), isBinary: true };
     }
-    if (encoding && encoding.toLowerCase() !== 'utf-8' && iconv.encodingExists(encoding)) {
-      return { success: true, content: iconv.decode(buffer, encoding), isBinary: false };
+    if (encoding && encoding.toLowerCase() !== 'utf-8' && encoding.toLowerCase() !== 'utf-8-bom' && iconv.encodingExists(encoding)) {
+      return { success: true, content: iconv.decode(buffer, encoding).replace(/^\uFEFF/, ''), isBinary: false };
     }
     // Определяем BOM UTF-16 — иначе файл прочитается как «кракозябры»
     if (buffer.length >= 2) {
       const b0 = buffer[0];
       const b1 = buffer[1];
       if (b0 === 0xff && b1 === 0xfe) {
-        return { success: true, content: iconv.decode(buffer, 'utf-16le'), isBinary: false };
+        return { success: true, content: iconv.decode(buffer, 'utf-16le').replace(/^\uFEFF/, ''), isBinary: false };
       }
       if (b0 === 0xfe && b1 === 0xff) {
-        return { success: true, content: iconv.decode(buffer, 'utf-16be'), isBinary: false };
+        return { success: true, content: iconv.decode(buffer, 'utf-16be').replace(/^\uFEFF/, ''), isBinary: false };
       }
     }
-    return { success: true, content: buffer.toString('utf-8'), isBinary: false };
+    // UTF-8 BOM Excel ставит сам при экспорте CSV. В содержимом редактора
+    // он не нужен: иначе первая ячейка начинается с невидимого символа.
+    return { success: true, content: buffer.toString('utf-8').replace(/^\uFEFF/, ''), isBinary: false };
   } catch (err) {
     return { success: false, error: (err as Error).message };
   }
@@ -848,9 +866,11 @@ ipcMain.handle(
       const payload =
         encoding === 'base64'
           ? Buffer.from(content, 'base64')
-          : encoding && encoding.toLowerCase() !== 'utf-8' && iconv.encodingExists(encoding)
-            ? iconv.encode(content, encoding)
-            : content;
+          : encoding === 'utf-8-bom'
+            ? Buffer.from(`\uFEFF${content}`, 'utf8')
+            : encoding && encoding.toLowerCase() !== 'utf-8' && iconv.encodingExists(encoding)
+              ? iconv.encode(content, encoding)
+              : content;
 
       const writeWithRetry = async (target: string): Promise<void> => {
         let lastError: unknown;
@@ -965,7 +985,9 @@ ipcMain.handle(
 
       const payload = isBase64
         ? Buffer.from(initialContent.replace(/\s+/g, ''), 'base64')
-        : initialContent;
+        : encoding === 'utf-8-bom'
+          ? Buffer.from(`\uFEFF${initialContent}`, 'utf8')
+          : initialContent;
 
       await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
       try {

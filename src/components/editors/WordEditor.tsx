@@ -828,6 +828,11 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
     return registerDocumentController({
       tabId: tab.id,
       readHtml: () => editorRef.current?.innerHTML ?? '',
+      serialize: async () => {
+        const root = editorRef.current;
+        if (!root) return tab.content;
+        return await serializeDocx(root.innerHTML, pageSetupRef.current);
+      },
       writeHtml: (html, transactionId) => {
         const root = editorRef.current;
         if (!root) return;

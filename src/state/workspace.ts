@@ -6,6 +6,11 @@ import { generateDocxBase64, generateExcelBase64 } from '../services/aiActions';
 import { htmlToDocxBase64 } from '../lib/docx';
 import { BLANK_PPTX_BASE64 } from '../lib/pptxTemplate';
 import { docxPathFor, extractLegacyDocText, plainTextToHtml } from '../lib/legacyDoc';
+import {
+  type ConversionFormat,
+  convertDocument,
+  readFileSource,
+} from '../services/documentConversion';
 
 /** Типы файлов, содержимое которых читается как base64 (бинарные офисные форматы). */
 const BINARY_TYPES: FileType[] = ['word', 'powerpoint', 'image'];
@@ -32,6 +37,9 @@ export function useWorkspace() {
   // Ref для доступа к актуальным вкладкам внутри асинхронных колбэков
   const tabsRef = useRef<OpenTab[]>([]);
   tabsRef.current = tabs;
+  /** Открытия файлов в процессе: защита от двойного клика и гонок. */
+  const pendingOpenRef = useRef<Map<string, Promise<string | null>>>(new Map());
+  const previewOpenSeqRef = useRef(0);
 
   const flash = useCallback((message: string) => {
     setStatusMessage(message);
@@ -149,7 +157,14 @@ export function useWorkspace() {
         return { content: res.content, encoding: 'base64' as const, isBinary: true };
       }
       const res = await fileSystemService.readFile(filePath, 'utf-8');
-      return { content: res.content, encoding: 'utf-8' as const, isBinary: false };
+      // CSV/TSV сохраняем как UTF-8 с BOM: иначе русский Excel открывает
+      // файл в ANSI и показывает «кракозябры».
+      const csvLike = ext === 'csv' || ext === 'tsv';
+      return {
+        content: res.content,
+        encoding: csvLike ? 'utf-8-bom' : 'utf-8',
+        isBinary: false,
+      };
     },
     []
   );
@@ -198,10 +213,32 @@ export function useWorkspace() {
     async (
       filePath: string,
       targetPane: 'primary' | 'secondary' = 'primary',
-      forceNewTab = false
+      forceNewTab = false,
+      preview = false
     ) => {
-      const existing = tabsRef.current.find((t) => t.path === filePath);
+      const samePath = (a: string, b: string) =>
+        a.toLowerCase().replace(/\\/g, '/') === b.toLowerCase().replace(/\\/g, '/');
+      const existing = tabsRef.current.find((t) => samePath(t.path, filePath));
       if (existing && !forceNewTab) {
+        if (!preview && existing.isPreview) {
+          // Двойной клик по файлу из предпросмотра превращает ту же вкладку
+          // в обычную редактируемую.
+          setTabs((prev) =>
+            prev.map((t) => (t.id === existing.id ? { ...t, isPreview: false } : t))
+          );
+        }
+        if (preview) {
+          const staleIds = new Set(
+            tabsRef.current
+              .filter((t) => t.isPreview && !t.isDirty && t.id !== existing.id)
+              .map((t) => t.id)
+          );
+          if (staleIds.size > 0) {
+            setTabs((prev) => prev.filter((t) => !staleIds.has(t.id)));
+            setActiveTabId((cur) => (staleIds.has(cur) ? existing.id : cur));
+            setSecondaryTabId((cur) => (staleIds.has(cur) ? '' : cur));
+          }
+        }
         if (targetPane === 'secondary') {
           setSecondaryTabId(existing.id);
           setSplitEnabled(true);
@@ -211,57 +248,109 @@ export function useWorkspace() {
         return existing.id;
       }
 
-      const ext = extName(filePath);
-      const type = getFileType(ext);
-
-      if (type === 'video' || type === 'pdf' || type === 'binary') {
-        const tab: OpenTab = {
-          id: uid('tab'),
-          path: filePath,
-          name: baseName(filePath),
-          extension: ext,
-          type,
-          content: '',
-          initialContent: '',
-          isDirty: false,
-          encoding: 'path',
-        };
-        setTabs((prev) => [...prev, tab]);
-        if (targetPane === 'secondary') {
-          setSecondaryTabId(tab.id);
-          setSplitEnabled(true);
-        } else {
-          setActiveTabId(tab.id);
+      const key = filePath.toLowerCase().replace(/\\/g, '/');
+      const pending = pendingOpenRef.current.get(key);
+      if (pending) {
+        const id = await pending;
+        if (id) {
+          if (!preview) {
+            setTabs((prev) =>
+              prev.map((t) => (t.id === id ? { ...t, isPreview: false } : t))
+            );
+          }
+          if (targetPane === 'secondary') {
+            setSecondaryTabId(id);
+            setSplitEnabled(true);
+          } else {
+            setActiveTabId(id);
+          }
         }
-        return tab.id;
+        return id;
       }
 
-      try {
-        const { content, encoding } = await readTabContent(filePath, type, ext);
-        const tab: OpenTab = {
-          id: uid('tab'),
-          path: filePath,
-          name: baseName(filePath),
-          extension: ext,
-          type,
-          content,
-          initialContent: content,
-          isDirty: false,
-          encoding,
-          viewMode: type === 'markdown' || type === 'richtext' ? 'visual' : undefined,
-        };
-
-        setTabs((prev) => [...prev, tab]);
-        if (targetPane === 'secondary') {
-          setSecondaryTabId(tab.id);
-          setSplitEnabled(true);
-        } else {
-          setActiveTabId(tab.id);
+      const previewToken = preview ? ++previewOpenSeqRef.current : 0;
+      const openPromise = (async (): Promise<string | null> => {
+        // Один клик по другому файлу закрывает предыдущий предпросмотр,
+        // чтобы дерево не плодило десятки временных вкладок.
+        if (preview && !forceNewTab) {
+          const staleIds = new Set(
+            tabsRef.current
+              .filter((t) => t.isPreview && !t.isDirty && !samePath(t.path, filePath))
+              .map((t) => t.id)
+          );
+          if (staleIds.size > 0) {
+            setTabs((prev) => prev.filter((t) => !staleIds.has(t.id)));
+            setActiveTabId((cur) => (staleIds.has(cur) ? '' : cur));
+            setSecondaryTabId((cur) => (staleIds.has(cur) ? '' : cur));
+          }
         }
-        return tab.id;
-      } catch (err) {
-        flash(`Ошибка открытия файла: ${(err as Error).message}`);
-        return null;
+
+        const ext = extName(filePath);
+        const type = getFileType(ext);
+
+        if (type === 'video' || type === 'pdf' || type === 'binary') {
+          if (preview && previewToken !== previewOpenSeqRef.current) return null;
+          const tab: OpenTab = {
+            id: uid('tab'),
+            path: filePath,
+            name: baseName(filePath),
+            extension: ext,
+            type,
+            content: '',
+            initialContent: '',
+            isDirty: false,
+            encoding: 'path',
+            isPreview: preview,
+          };
+          setTabs((prev) => [...prev, tab]);
+          if (targetPane === 'secondary') {
+            setSecondaryTabId(tab.id);
+            setSplitEnabled(true);
+          } else {
+            setActiveTabId(tab.id);
+          }
+          return tab.id;
+        }
+
+        try {
+          const { content, encoding } = await readTabContent(filePath, type, ext);
+          // Пока читали файл, пользователь кликнул другой — этот предпросмотр не нужен.
+          if (preview && previewToken !== previewOpenSeqRef.current) return null;
+          const tab: OpenTab = {
+            id: uid('tab'),
+            path: filePath,
+            name: baseName(filePath),
+            extension: ext,
+            type,
+            content,
+            initialContent: content,
+            isDirty: false,
+            encoding,
+            isPreview: preview,
+            viewMode: type === 'markdown' || type === 'richtext' ? 'visual' : undefined,
+          };
+
+          setTabs((prev) => [...prev, tab]);
+          if (targetPane === 'secondary') {
+            setSecondaryTabId(tab.id);
+            setSplitEnabled(true);
+          } else {
+            setActiveTabId(tab.id);
+          }
+          return tab.id;
+        } catch (err) {
+          flash(`Ошибка открытия файла: ${(err as Error).message}`);
+          return null;
+        }
+      })();
+
+      pendingOpenRef.current.set(key, openPromise);
+      try {
+        return await openPromise;
+      } finally {
+        if (pendingOpenRef.current.get(key) === openPromise) {
+          pendingOpenRef.current.delete(key);
+        }
       }
     },
     [flash, readTabContent]
@@ -304,6 +393,10 @@ export function useWorkspace() {
     async (tabId: string): Promise<boolean> => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab) return false;
+      if (tab.isPreview) {
+        flash('Это предпросмотр. Откройте файл двойным кликом или кнопкой «Редактировать»');
+        return false;
+      }
       if (tab.encoding === 'path') {
         flash('Этот файл открыт только для просмотра');
         return false;
@@ -346,23 +439,134 @@ export function useWorkspace() {
     [flash, refreshTree]
   );
 
-  /** Сохранение файла под новым именем/расширением (Экспорт как…). */
+  /**
+   * Сохранение под новым именем/в другом формате.
+   * contentOverride передаёт живое содержимое редактора (Word/Excel/PPT),
+   * если оно ещё не успело попасть в tab.content.
+   */
   const saveTabAs = useCallback(
-    async (tabId: string, suggestedName: string): Promise<boolean> => {
+    async (
+      tabId: string,
+      targetPath: string,
+      format: ConversionFormat,
+      contentOverride?: string,
+      activeSheet?: string
+    ): Promise<boolean> => {
       const tab = tabsRef.current.find((t) => t.id === tabId);
       if (!tab) return false;
-      const target = await fileSystemService.saveFileDialog(suggestedName);
-      if (!target) return false;
+      // Имя могло быть введено вручную с другим расширением: формат важнее
+      // суффикса, иначе Excel откроет .csv с содержимым xlsx.
+      const expectedExt = format === 'md' ? 'md' : format;
+      if (extName(targetPath) !== expectedExt) {
+        targetPath = targetPath.replace(/\.[^./\\]+$/, '') + `.${expectedExt}`;
+      }
       try {
-        await fileSystemService.writeFile(target, tab.content, tab.encoding);
-        flash(`Экспортировано: ${baseName(target)}`);
+        const result = await convertDocument(
+          {
+            path: tab.path,
+            name: tab.name,
+            extension: tab.extension,
+            type: tab.type,
+            content: contentOverride ?? tab.content,
+            encoding: tab.encoding,
+            activeSheet,
+          },
+          format
+        );
+
+        if (result.kind === 'pdf') {
+          const exported = await window.electronAPI?.exportPdf(
+            result.html,
+            baseName(targetPath),
+            targetPath
+          );
+          if (!exported?.success) {
+            throw new Error(exported?.error || 'Не удалось создать PDF');
+          }
+        } else {
+          await fileSystemService.writeFile(targetPath, result.content, result.encoding);
+        }
+
+        await refreshTree();
+        const targetExt = extName(targetPath);
+        const targetName = baseName(targetPath);
+        const existing = tabsRef.current.find(
+          (t) => t.path.toLowerCase() === targetPath.toLowerCase()
+        );
+        const nextContent =
+          result.kind === 'data' ? result.content : existing?.content ?? '';
+        if (existing) {
+          patchTab(existing.id, {
+            path: targetPath,
+            name: targetName,
+            extension: targetExt,
+            type: getFileType(targetExt),
+            content: nextContent,
+            initialContent: nextContent,
+            isDirty: false,
+            reloadKey: Date.now(),
+            isPreview: false,
+            encoding:
+              result.kind === 'data' ? result.encoding : existing.encoding,
+          });
+          setActiveTabId(existing.id);
+        } else {
+          await openFile(targetPath);
+        }
+        flash(
+          `Сохранено как ${targetName}${result.note ? ` — ${result.note}` : ''}`
+        );
         return true;
       } catch (err) {
-        flash(`Ошибка экспорта: ${(err as Error).message}`);
+        flash(`Ошибка сохранения как: ${(err as Error).message}`);
         return false;
       }
     },
-    [flash]
+    [flash, refreshTree, patchTab, openFile]
+  );
+
+  /** Конвертация произвольного файла рабочей папки (для AI-агента). */
+  const convertFile = useCallback(
+    async (
+      sourcePath: string,
+      targetPath: string,
+      format: ConversionFormat
+    ): Promise<{ ok: boolean; message: string; path?: string }> => {
+      try {
+        const source = await readFileSource(sourcePath);
+        const result = await convertDocument(source, format);
+        if (result.kind === 'pdf') {
+          const exported = await window.electronAPI?.exportPdf(
+            result.html,
+            baseName(targetPath),
+            targetPath
+          );
+          if (!exported?.success) {
+            return {
+              ok: false,
+              message: exported?.error || 'Не удалось создать PDF',
+            };
+          }
+        } else {
+          await fileSystemService.writeFile(targetPath, result.content, result.encoding);
+        }
+        await refreshTree();
+        await openFile(targetPath);
+        return {
+          ok: true,
+          message: `Конвертировано: ${baseName(sourcePath)} → ${baseName(targetPath)}${
+            result.note ? ` (${result.note})` : ''
+          }`,
+          path: targetPath,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          message: `Не удалось конвертировать ${baseName(sourcePath)}: ${(err as Error).message}`,
+        };
+      }
+    },
+    [refreshTree, openFile]
   );
 
   /**
@@ -572,6 +776,7 @@ export function useWorkspace() {
     patchTab,
     saveTab,
     saveTabAs,
+    convertFile,
     saveAll,
     setActiveTabId,
     setSecondaryTabId,

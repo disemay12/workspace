@@ -29,6 +29,9 @@ export interface SheetEditResult {
 
 export interface SheetController {
   tabId: string;
+  /** Актуальное содержимое книги: base64 для xlsx, CSV для csv/tsv. */
+  serialize?: () => Promise<string>;
+  getActiveSheet?: () => string;
   readSheet: (sheet?: string, range?: string, limit?: number) => SheetReadResult | null;
   getSelection: () => SheetReadResult | null;
   writeCells: (

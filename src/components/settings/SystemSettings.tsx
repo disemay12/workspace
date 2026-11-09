@@ -12,14 +12,18 @@ import {
   FileCode2,
   ExternalLink,
   Pin,
+  Download,
 } from 'lucide-react';
 import { Button } from '../ui';
+import type { UpdateCheckResult, UpdateProgress } from '../../types';
 
 interface Props {
   onNotify?: (message: string) => void;
+  /** Сохраняет несохранённые файлы перед перезапуском. false — отменить. */
+  onBeforeUpdate?: () => Promise<boolean>;
 }
 
-export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
+export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) => {
   const [installed, setInstalled] = useState(false);
   const [exePath, setExePath] = useState('');
   const [loading, setLoading] = useState(true);
@@ -32,6 +36,12 @@ export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
   const [shortcutInstalled, setShortcutInstalled] = useState(false);
   const [shortcutPath, setShortcutPath] = useState('');
   const [shortcutBusy, setShortcutBusy] = useState(false);
+  const [appVersion, setAppVersion] = useState('');
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
+  const [updateError, setUpdateError] = useState('');
 
   const refreshStatus = async () => {
     if (!window.electronAPI?.getContextMenuStatus) {
@@ -72,6 +82,82 @@ export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
       })
       .catch(() => setShortcutInstalled(false));
   }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.getAppVersion) return;
+    void window.electronAPI
+      .getAppVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(''));
+  }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.onUpdateProgress) return;
+    return window.electronAPI.onUpdateProgress((progress) => {
+      setUpdateProgress(progress);
+    });
+  }, []);
+
+  const checkUpdate = async () => {
+    if (!window.electronAPI?.checkForUpdates) {
+      setUpdateError('Проверка обновлений доступна только в настольной версии');
+      return;
+    }
+    setUpdateChecking(true);
+    setUpdateError('');
+    try {
+      const info = await window.electronAPI.checkForUpdates();
+      setUpdateInfo(info);
+      if (info.error && !info.available) setUpdateError(info.error);
+    } catch (error) {
+      setUpdateError((error as Error).message);
+    } finally {
+      setUpdateChecking(false);
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!updateInfo?.latestVersion || !updateInfo.assetUrl || !updateInfo.assetName) {
+      setUpdateError('Не удалось определить файл обновления');
+      return;
+    }
+    if (onBeforeUpdate && !(await onBeforeUpdate())) return;
+    setUpdateBusy(true);
+    setUpdateError('');
+    setUpdateProgress({ phase: 'download', received: 0, total: updateInfo.size ?? 0, percent: 0 });
+    try {
+      const downloaded = await window.electronAPI?.downloadUpdate?.({
+        version: updateInfo.latestVersion,
+        assetUrl: updateInfo.assetUrl,
+        assetName: updateInfo.assetName,
+        size: updateInfo.size,
+        digest: updateInfo.assetDigest,
+      });
+      if (!downloaded?.success || !downloaded.zipPath || !downloaded.extractDir) {
+        throw new Error(downloaded?.error || 'Не удалось скачать обновление');
+      }
+      setUpdateProgress({ phase: 'install', received: 1, total: 1, percent: 100 });
+      const installed = await window.electronAPI?.installUpdate?.({
+        zipPath: downloaded.zipPath,
+        extractDir: downloaded.extractDir,
+        version: updateInfo.latestVersion,
+      });
+      if (!installed?.success) {
+        throw new Error(installed?.error || 'Не удалось запустить обновление');
+      }
+      onNotify?.('WorkSpace обновляется и сейчас перезапустится. Ключи и настройки сохранены.');
+    } catch (error) {
+      setUpdateError((error as Error).message);
+      setUpdateBusy(false);
+    }
+  };
+
+  const phaseLabel =
+    updateProgress?.phase === 'extract'
+      ? 'Распаковка…'
+      : updateProgress?.phase === 'install'
+        ? 'Перезапуск…'
+        : `Скачивание… ${Math.round(updateProgress?.percent ?? 0)}%`;
 
   const createShortcut = async () => {
     if (!window.electronAPI?.createDesktopShortcut) return;
@@ -164,6 +250,83 @@ export const SystemSettings: React.FC<Props> = ({ onNotify }) => {
 
   return (
     <div className="space-y-4">
+      {/* Обновления с GitHub */}
+      <div className="rounded-lg border border-ws bg-ws-elevated p-3.5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <Download size={16} className="mt-0.5 shrink-0 text-ws-accent" />
+            <div className="space-y-1">
+              <div className="text-xs font-semibold text-ws">Обновления</div>
+              <p className="text-[11px] leading-relaxed text-ws-muted">
+                Обновление скачивается с GitHub Releases и заменяет папку программы
+                на месте — без новых папок версий. API-ключи, настройки и сессия в
+                %APPDATA%\WorkSpace сохраняются; перед обновлением создаётся резервная
+                копия.
+              </p>
+              <p className="text-[10px] text-ws-faint">
+                Установлена версия: <span className="font-mono text-ws">{appVersion || '…'}</span>
+              </p>
+              {updateInfo?.available && (
+                <div className="rounded border border-sky-500/30 bg-sky-500/10 p-2 text-[10px] text-ws-muted">
+                  <div className="font-medium text-ws">
+                    Доступна версия {updateInfo.latestVersion}
+                    {updateInfo.size
+                      ? ` · ${(updateInfo.size / 1024 / 1024).toFixed(1)} МБ`
+                      : ''}
+                  </div>
+                  {updateInfo.releaseNotes && (
+                    <pre className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap font-sans text-[10px] text-ws-muted">
+                      {updateInfo.releaseNotes}
+                    </pre>
+                  )}
+                </div>
+              )}
+              {updateProgress && updateBusy && (
+                <div className="space-y-1">
+                  <div className="h-1.5 overflow-hidden rounded bg-ws-surface">
+                    <div
+                      className="h-full bg-ws-accent transition-[width]"
+                      style={{ width: `${Math.max(2, updateProgress.percent)}%` }}
+                    />
+                  </div>
+                  <p className="text-[10px] text-ws-muted">{phaseLabel}</p>
+                </div>
+              )}
+              {updateError && (
+                <p className="text-[10px] text-ws-danger">{updateError}</p>
+              )}
+              {updateInfo && !updateInfo.available && updateInfo.success && !updateError && (
+                <p className="text-[10px] text-emerald-400">
+                  Установлена последняя версия.
+                </p>
+              )}
+            </div>
+          </div>
+          <div className="flex shrink-0 flex-col items-end gap-1.5">
+            <Button
+              variant="secondary"
+              disabled={updateChecking || updateBusy}
+              onClick={() => void checkUpdate()}
+              className="gap-1.5"
+            >
+              {updateChecking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+              Проверить обновление
+            </Button>
+            {updateInfo?.available && (
+              <Button
+                variant="primary"
+                disabled={updateBusy}
+                onClick={() => void installUpdate()}
+                className="gap-1.5"
+              >
+                {updateBusy ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+                {updateBusy ? 'Обновление…' : 'Скачать и обновить'}
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* Поверх всех окон */}
       <div className="flex items-start justify-between gap-3 rounded-lg border border-ws bg-ws-elevated p-3.5">
         <div className="flex items-start gap-2.5">

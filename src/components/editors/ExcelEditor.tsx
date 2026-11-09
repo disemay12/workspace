@@ -51,6 +51,7 @@ import { Button, Input, Modal, Spinner } from '../ui';
 import { SheetChart, ChartSeries } from './SheetChart';
 import { injectChartsIntoXlsx } from '../../lib/xlsxCharts';
 import { injectStylesIntoXlsx } from '../../lib/xlsxStyles';
+import { applyAutoFitColumns } from '../../lib/xlsxColumns';
 import { detectMarkdownTables, normalizeTableValue } from '../../services/aiActions';
 import {
   columnName,
@@ -367,6 +368,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           : XLSX.read(tab.content, {
               type: 'base64',
               bookVBA: tab.extension === 'xlsm',
+              cellStyles: true,
             });
 
       vbaRawRef.current = (workbook as { vbaraw?: ArrayBuffer | Uint8Array }).vbaraw ?? null;
@@ -542,7 +544,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   /* ---------------- Синхронизация с содержимым вкладки ---------------- */
 
   const syncWorkbook = useCallback(
-    async (nextSheets: Workbook, names: string[]) => {
+    async (nextSheets: Workbook, names: string[]): Promise<string | null> => {
       const seq = ++syncSeqRef.current;
       try {
         const wb = XLSX.utils.book_new();
@@ -597,16 +599,33 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
             }
           }
 
-          // Ширины, высоты и объединения пишутся нативными средствами SheetJS
+          // Ширины: даже если пользователь не тянул колонки, Excel должен
+          // открыть файл с текстом внутри ячеек, а не с обрезанными 8,43.
           const sheetMeta = metaRef.current[name];
+          const displayGrid = trimmed.map((row, rowIndex) =>
+            row.map((cell, colIndex) => {
+              const address = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+              const style = metaRef.current[name]?.cells[address];
+              if (typeof cell === 'string' && cell.startsWith('=')) {
+                return SheetFmt.formatCellValue(
+                  computeCellDisplay(nextSheets, name, rowIndex, colIndex, formulaContext),
+                  style?.numberFormat
+                );
+              }
+              return SheetFmt.formatCellValue(String(cell ?? ''), style?.numberFormat);
+            })
+          );
+          applyAutoFitColumns(sheet, displayGrid, {
+            explicitPx: sheetMeta?.colWidths,
+            headerRows: 1,
+            isWrapped: (rowIndex, colIndex) =>
+              Boolean(
+                metaRef.current[name]?.cells[
+                  XLSX.utils.encode_cell({ r: rowIndex, c: colIndex })
+                ]?.wrap
+              ),
+          });
           if (sheetMeta) {
-            const colIndexes = Object.keys(sheetMeta.colWidths).map(Number);
-            if (colIndexes.length > 0) {
-              const maxCol = Math.max(...colIndexes);
-              sheet['!cols'] = Array.from({ length: maxCol + 1 }, (_, index) => ({
-                wpx: sheetMeta.colWidths[index] ?? SheetFmt.DEFAULT_COL_WIDTH,
-              }));
-            }
             const rowIndexes = Object.keys(sheetMeta.rowHeights).map(Number);
             if (rowIndexes.length > 0) {
               const maxRow = Math.max(...rowIndexes);
@@ -671,8 +690,10 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         }
 
         if (seq === syncSeqRef.current) onChange(content);
+        return content;
       } catch (err) {
         console.error('Ошибка синхронизации книги', err);
+        return null;
       }
     },
     [activeSheet, isCsv, onChange, tab.extension]
@@ -2374,6 +2395,9 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   useEffect(() => {
     return registerSheetController({
       tabId: tab.id,
+      serialize: async () =>
+        (await syncWorkbook(sheetsRef.current, sheetNamesRef.current)) ?? tab.content,
+      getActiveSheet: () => activeSheet,
       readSheet: (sheet, range, limit) => {
         const target = sheet && sheetsRef.current[sheet] ? sheet : activeSheet;
         const grid = sheetsRef.current[target];
@@ -2641,7 +2665,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         return { ok: true, message: `Формат применён: ${rangeText}`, changed: true };
       },
     });
-  }, [tab.id, activeSheet, addSheet, renameSheet, removeSheet, parseTarget, applyBatch, commitMeta, selectionRange]);
+  }, [tab.id, activeSheet, addSheet, renameSheet, removeSheet, parseTarget, applyBatch, commitMeta, selectionRange, syncWorkbook]);
 
   /* ---------------- Запрос формулы у AI ---------------- */
 
@@ -2907,6 +2931,26 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           >
             <RefreshCw size={11} />
             Обновить
+          </button>
+
+          <button
+            onClick={() => void openInExcel()}
+            disabled={excelBusy || isCsv}
+            title="Открыть в настоящем Excel"
+            className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-ws-muted transition-colors hover:border-emerald-500 hover:text-emerald-400 disabled:opacity-40"
+          >
+            <ExternalLink size={11} />
+            Excel
+          </button>
+
+          <button
+            onClick={() => void runExcelMacro()}
+            disabled={excelBusy || tab.extension !== 'xlsm'}
+            title="Выполнить VBA-макрос в Excel"
+            className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-ws-muted transition-colors hover:border-amber-500 hover:text-amber-400 disabled:opacity-40"
+          >
+            <Play size={11} />
+            VBA
           </button>
 
           <div className="mx-1 h-3.5 w-px border-l border-ws" />

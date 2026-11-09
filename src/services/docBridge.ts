@@ -29,6 +29,8 @@ export interface DocumentController {
   tabId: string;
   /** Текущий HTML полотна (включая несохранённые правки). */
   readHtml: () => string;
+  /** Сериализует живое полотно в .docx (base64) для «Сохранить как». */
+  serialize?: () => Promise<string>;
   /**
    * Записывает HTML в полотно и запускает сериализацию в .docx.
    * transactionId объединяет серию правок одного ответа в один шаг отката.

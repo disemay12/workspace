@@ -9,6 +9,7 @@ import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
 import { emptySheetMeta, type WorkbookMeta } from '../../src/lib/sheetFormatting';
 import { injectStylesIntoXlsx } from '../../src/lib/xlsxStyles';
+import { applyAutoFitColumns, textWidthChars } from '../../src/lib/xlsxColumns';
 
 const failures: string[] = [];
 let passed = 0;
@@ -147,6 +148,40 @@ async function main() {
   check(
     'WorkSpace читает файл после патча',
     Boolean(XLSX.read(styledBase64, { type: 'base64' }).Sheets.S?.['A1']),
+    true
+  );
+
+  /* ---- Ширины колонок: текст должен помещаться в Excel ---- */
+  const wideMatrix = [
+    ['Товар', 'Описание', 'Цена'],
+    ['Яблоки', 'Очень длинное описание товара, которое не должно обрезаться', 120],
+    ['Груши', 'Коротко', 80],
+  ];
+  const wideWb = XLSX.utils.book_new();
+  const wideSheet = XLSX.utils.aoa_to_sheet(wideMatrix);
+  applyAutoFitColumns(wideSheet, wideMatrix, { headerRows: 1 });
+  XLSX.utils.book_append_sheet(wideWb, wideSheet, 'Ширины');
+  const wideBase64 = XLSX.write(wideWb, { bookType: 'xlsx', type: 'base64' });
+  const wideRead = XLSX.read(wideBase64, { type: 'base64', cellStyles: true });
+  const wideCols = wideRead.Sheets['Ширины']?.['!cols'] ?? [];
+  check('ширина колонки A записана', typeof wideCols[0]?.wch, 'number');
+  check(
+    'колонка «Описание» шире текста',
+    (wideCols[1]?.wch ?? 0) >= textWidthChars(wideMatrix[1][1] as string),
+    true
+  );
+  check(
+    'колонка «Цена» не раздута',
+    (wideCols[2]?.wch ?? 0) < 30,
+    true
+  );
+  const wideZip = await JSZip.loadAsync(wideBase64, { base64: true });
+  const wideXml = (await wideZip.file('xl/worksheets/sheet1.xml')?.async('string')) ?? '';
+  check('в XML есть тег cols', /<cols>/.test(wideXml), true);
+  check('в XML есть width', /<col[^>]*width="/.test(wideXml), true);
+  check(
+    'WorkSpace читает ширины обратно',
+    (XLSX.read(wideBase64, { type: 'base64', cellStyles: true }).Sheets['Ширины']?.['!cols']?.length ?? 0) > 0,
     true
   );
 
