@@ -7,7 +7,9 @@ import {
   computeCellDisplay,
   createContext,
   evaluateFormula,
+  fromExcelFormula,
   normalizeFormula,
+  toExcelFormula,
   Workbook,
   isError,
   FUNCTION_NAMES,
@@ -153,31 +155,130 @@ const cases: Case[] = [
 let passed = 0;
 const failures: string[] = [];
 
-for (const c of cases) {
-  const normalized = normalizeFormula(c.formula);
-  let actual: string;
-  try {
-    const value = evaluateFormula(normalized, createContext(book, 'Лист1'));
-    actual = isError(value)
-      ? value.__error
-      : value === null
-        ? ''
-        : typeof value === 'boolean'
-          ? value
-            ? 'TRUE'
-            : 'FALSE'
-          : String(value);
-    if (typeof value === 'number' && !Number.isInteger(value)) {
-      actual = String(Math.round(value * 1e6) / 1e6);
+/** Прогоняет набор кейсов в контексте книги; провалы копит в failures. */
+function checkCases(context: ReturnType<typeof createContext>, list: Case[], prefix = ''): void {
+  for (const c of list) {
+    const normalized = normalizeFormula(c.formula);
+    let actual: string;
+    try {
+      const value = evaluateFormula(normalized, context);
+      actual = isError(value)
+        ? value.__error
+        : value === null
+          ? ''
+          : typeof value === 'boolean'
+            ? value
+              ? 'TRUE'
+              : 'FALSE'
+            : String(value);
+      if (typeof value === 'number' && !Number.isInteger(value)) {
+        actual = String(Math.round(value * 1e6) / 1e6);
+      }
+    } catch (e) {
+      actual = `ИСКЛЮЧЕНИЕ: ${(e as Error).message}`;
     }
-  } catch (e) {
-    actual = `ИСКЛЮЧЕНИЕ: ${(e as Error).message}`;
+    if (actual === c.expected) {
+      passed++;
+    } else {
+      failures.push(`${prefix}${c.formula}\n     ожидалось: ${c.expected}\n     получено:   ${actual}`);
+    }
   }
-  if (actual === c.expected) {
-    passed++;
-  } else {
-    failures.push(`${c.formula}\n     ожидалось: ${c.expected}\n     получено:   ${actual}`);
+}
+
+checkCases(createContext(book, 'Лист1'), cases);
+
+/* ---------- Массивы, даты и функции из жалоб (#NAME?/#DIV/0!) ---------- */
+const arrayBook: Workbook = {
+  Данные: [[1, 2, '', 4, 5, 0, 7, 8, 9]],
+  Сводка: [['x']],
+};
+const arrayCtx = createContext(arrayBook, 'Сводка');
+
+const arrayCases: Case[] = [
+  // SUMPRODUCT должен видеть диапазон поэлементно, а не первую ячейку
+  { formula: '=SUMPRODUCT(Данные!A1:I1)', expected: '36' },
+  { formula: '=SUMPRODUCT(--(Данные!A1:I1<>""))', expected: '8' },
+  { formula: '=SUMPRODUCT(--ISNUMBER(Данные!A1:I1))', expected: '8' },
+  { formula: '=SUMPRODUCT(Данные!A1:I1*Данные!A1:I1)', expected: '240' },
+  { formula: '=SUM(--(Данные!A1:I1>0))', expected: '7' },
+  {
+    formula:
+      '=SUMPRODUCT(--ISNUMBER(Данные!A1:I1);Данные!A1:I1)/SUMPRODUCT(--ISNUMBER(Данные!A1:I1))',
+    expected: '4.5',
+  },
+  // DATEVALUE: раньше давал #NAME?, теперь это серийное число даты
+  { formula: '=DATEVALUE("05.01.2024")', expected: '45296' },
+  { formula: '=DATEVALUE("5 января 2024")', expected: '45296' },
+  { formula: '=DATEVALUE("2024-01-05")', expected: '45296' },
+  { formula: '=DATEVALUE("не дата")', expected: '#VALUE!' },
+  { formula: '=TIME(12;0;0)', expected: '0.5' },
+  { formula: '=EDATE(DATE(2024;1;31);1)', expected: '45351' },
+  { formula: '=EOMONTH(DATE(2024;1;15);0)', expected: '45322' },
+  { formula: '=WEEKNUM(DATE(2024;1;5))', expected: '1' },
+  { formula: '=IFS(FALSE;"a";TRUE;"b")', expected: 'b' },
+  // Excel не открывает файл с непарным списком аргументов ИФС — движок тоже бракует
+  { formula: '=IFS(TRUE;"a";"b")', expected: '#VALUE!' },
+  { formula: '=SWITCH(2;1;"один";2;"два";"иное")', expected: 'два' },
+  { formula: '=SUBTOTAL(9;Данные!A1:I1)', expected: '36' },
+  { formula: '=MAXIFS(Данные!A1:I1;Данные!A1:I1;">3")', expected: '9' },
+  { formula: '=MINIFS(Данные!A1:I1;Данные!A1:I1;">3")', expected: '4' },
+  { formula: '=AVERAGEIFS(Данные!A1:I1;Данные!A1:I1;">3")', expected: '6.6' },
+  // Неизвестная функция по-прежнему #NAME? — её и показывает кнопка исправления
+  { formula: '=НЕИЗВЕСТНАЯФУНКЦИЯ(1)', expected: '#NAME?' },
+];
+
+checkCases(arrayCtx, arrayCases, 'массивы: ');
+
+/* ---------- Совместимость с Excel: запись и чтение формул ---------- */
+/**
+ * Функции новее Excel 2007 обязаны уезжать в .xlsx с префиксом `_xlfn.`,
+ * иначе Excel не распознаёт имя и показывает #NAME?.
+ */
+const excelCases: [string, string][] = [
+  ['=ЕСЛИМН(1>0;"да";"нет")', '=_xlfn.IFS(1>0,"да","нет")'],
+  ['=МАКСЕСЛИМН(A1:A9;A1:A9;">3")', '=_xlfn.MAXIFS(A1:A9,A1:A9,">3")'],
+  ['=МИНЕСЛИМН(A1:A9;A1:A9;">3")', '=_xlfn.MINIFS(A1:A9,A1:A9,">3")'],
+  ['=ПЕРЕКЛЮЧ(2;1;"а";2;"б")', '=_xlfn.SWITCH(2,1,"а",2,"б")'],
+  ['=ОБЪЕДИНИТЬ(", ";ИСТИНА;A1:A2)', '=_xlfn.TEXTJOIN(", ",TRUE,A1:A2)'],
+  ['=ПРОСМОТРX(A1;A1:A9;A1:A9)', '=_xlfn.XLOOKUP(A1,A1:A9,A1:A9)'],
+  ['=СЦЕП("a";"b")', '=_xlfn.CONCAT("a","b")'],
+  ['=ДНИ(A2;A1)', '=_xlfn.DAYS(A2,A1)'],
+  // Функции Excel 2007 и старше — без префикса
+  ['=ДАТАЗНАЧ("05.01.2024")', '=DATEVALUE("05.01.2024")'],
+  ['=ВРЕМЯ(12;0;0)', '=TIME(12,0,0)'],
+  ['=ДАТАМЕС(ДАТА(2024;1;31);1)', '=EDATE(DATE(2024,1,31),1)'],
+  ['=КОНМЕСЯЦА(ДАТА(2024;1;15);0)', '=EOMONTH(DATE(2024,1,15),0)'],
+  ['=НОМНЕДЕЛИ(ДАТА(2024;1;5))', '=WEEKNUM(DATE(2024,1,5))'],
+  ['=ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;A1:A9)', '=SUBTOTAL(9,A1:A9)'],
+  ['=СРЗНАЧЕСЛИМН(A1:A9;A1:A9;">3")', '=AVERAGEIFS(A1:A9,A1:A9,">3")'],
+  ['=СУММ(A1:A2)', '=SUM(A1:A2)'],
+];
+
+const excelFailures: string[] = [];
+for (const [source, expected] of excelCases) {
+  const actual = toExcelFormula(source);
+  if (actual !== expected) {
+    excelFailures.push(`запись: ${source}\n     ожидалось: ${expected}\n     получено:   ${actual}`);
   }
+  // Обратное чтение файла обязано вернуть формулу в диалекте редактора
+  const roundTrip = fromExcelFormula(actual);
+  const reference = fromExcelFormula(expected);
+  if (roundTrip !== reference) {
+    excelFailures.push(
+      `чтение: ${actual}\n     ожидалось: ${reference}\n     получено:   ${roundTrip}`
+    );
+  }
+}
+
+// Движок обязан понимать формулы прямо из файла, с префиксом _xlfn.
+const prefixed = evaluateFormula('=_xlfn.IFS(TRUE;1;TRUE;2)', arrayCtx);
+if (isError(prefixed) || prefixed !== 1) {
+  excelFailures.push(`вычисление: =_xlfn.IFS(TRUE;1;TRUE;2) => ${isError(prefixed) ? prefixed.__error : prefixed}`);
+}
+if (normalizeFormula('=_xlfn.XLOOKUP(A1,A1:A2,A1:A2)') !== '=XLOOKUP(A1,A1:A2,A1:A2)') {
+  excelFailures.push(
+    `нормализация: ${normalizeFormula('=_xlfn.XLOOKUP(A1,A1:A2,A1:A2)')}`
+  );
 }
 
 /* ---------- Отображение ячеек листа ---------- */
@@ -211,6 +312,7 @@ console.log('='.repeat(72));
 console.log(`  Функций зарегистрировано: ${FUNCTION_NAMES.length}`);
 console.log(`  Проверок формул: ${cases.length}, пройдено: ${passed}`);
 console.log(`  Проверок отображения ячеек: ${sheetCases.length}, провалов: ${sheetFailures.length}`);
+console.log(`  Совместимость с Excel (.xlsx): ${excelCases.length}, провалов: ${excelFailures.length}`);
 console.log(`  Обнаружение циклов: ${circularOk ? 'работает' : 'НЕ РАБОТАЕТ'}`);
 
 if (failures.length > 0) {
@@ -223,8 +325,14 @@ if (sheetFailures.length > 0) {
   console.log('  ПРОВАЛЫ ОТОБРАЖЕНИЯ:');
   for (const f of sheetFailures) console.log(`   - ${f}`);
 }
+if (excelFailures.length > 0) {
+  console.log('-'.repeat(72));
+  console.log('  ПРОВАЛЫ СОВМЕСТИМОСТИ С EXCEL:');
+  for (const f of excelFailures) console.log(`   - ${f}`);
+}
 
-const totalFailures = failures.length + sheetFailures.length + (circularOk ? 0 : 1);
+const totalFailures =
+  failures.length + sheetFailures.length + excelFailures.length + (circularOk ? 0 : 1);
 console.log('='.repeat(72));
 console.log(totalFailures === 0 ? '  ИТОГ: ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ' : `  ИТОГ: ПРОВАЛОВ ${totalFailures}`);
 process.exit(totalFailures === 0 ? 0 : 1);

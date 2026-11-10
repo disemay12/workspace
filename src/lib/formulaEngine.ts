@@ -681,11 +681,9 @@ function resolveValues(node: Node, ctx: EvalContext): (CellPrimitive | FormulaEr
 /** Разворачивает узел в «плоский» список для агрегатных функций. */
 function flattenValues(node: Node, ctx: EvalContext): (CellPrimitive | FormulaError)[] {
   if (node.kind === 'range') return resolveValues(node, ctx);
-  const v = evalNode(node, ctx);
-  // Результат поэлементной арифметики над диапазонами (формула массива)
-  // разворачивается, чтобы SUM/AVERAGE увидели каждое значение.
-  if (Array.isArray(v)) return v as (CellPrimitive | FormulaError)[];
-  return [v];
+  // Сравнения и арифметика над диапазонами дают массив: разворачиваем его,
+  // чтобы СУММ(--(A1:A9>0)) считал элементы, а не первое значение.
+  return evalArrayNode(node, ctx);
 }
 
 /** Числовые значения для агрегатов — текст игнорируется (как в Excel). */
@@ -836,8 +834,28 @@ function makeCriteria(raw: unknown): (v: CellPrimitive | FormulaError) => boolea
   };
 }
 
-/** Разбор диапазона для функций работы с массивами. */
-function rangeBounds(node: Node): { c1: number; r1: number; c2: number; r2: number; sheet: string } | null {
+/**
+ * Пары «диапазон — критерий» для SUMIFS/AVERAGEIFS/MAXIFS/MINIFS.
+ * Аргументы идут парами начиная с индекса `from`.
+ */
+function buildCriteriaPairs(
+  args: Node[],
+  from: number,
+  ctx: EvalContext
+): { values: (CellPrimitive | FormulaError)[]; test: (v: CellPrimitive | FormulaError) => boolean }[] | FormulaError {
+  const pairs: {
+    values: (CellPrimitive | FormulaError)[];
+    test: (v: CellPrimitive | FormulaError) => boolean;
+  }[] = [];
+  for (let i = from; i + 1 < args.length; i += 2) {
+    const criteria = argValue(args, i + 1, ctx);
+    if (isError(criteria)) return criteria;
+    pairs.push({ values: argValues(args, i, ctx), test: makeCriteria(criteria) });
+  }
+  return pairs;
+}
+
+/** Разбор диапазона для функций работы с массивами. */function rangeBounds(node: Node): { c1: number; r1: number; c2: number; r2: number; sheet: string } | null {
   if (node.kind !== 'range') return null;
   return {
     sheet: node.start.sheet || node.end.sheet || '',
@@ -874,13 +892,9 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   SUMIFS: (args, ctx) => {
     const sumVals = argValues(args, 0, ctx);
+    const pairs = buildCriteriaPairs(args, 1, ctx);
+    if (isError(pairs)) return pairs;
     let total = 0;
-    const pairs: { values: (CellPrimitive | FormulaError)[]; test: (v: any) => boolean }[] = [];
-    for (let i = 1; i + 1 < args.length; i += 2) {
-      const criteriaRaw = argValue(args, i + 1, ctx);
-      if (isError(criteriaRaw)) return criteriaRaw;
-      pairs.push({ values: argValues(args, i, ctx), test: makeCriteria(criteriaRaw) });
-    }
     for (let i = 0; i < sumVals.length; i++) {
       if (isError(sumVals[i])) continue;
       if (pairs.every((p) => p.test(p.values[i]))) {
@@ -891,17 +905,70 @@ const FUNCTIONS: Record<string, FnImpl> = {
     return total;
   },
 
+  AVERAGEIFS: (args, ctx) => {
+    const values = argValues(args, 0, ctx);
+    const pairs = buildCriteriaPairs(args, 1, ctx);
+    if (isError(pairs)) return pairs;
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < values.length; i++) {
+      if (isError(values[i])) continue;
+      if (!pairs.every((p) => p.test(p.values[i]))) continue;
+      const n = toNumber(values[i]);
+      if (n === null) continue;
+      sum += n;
+      count += 1;
+    }
+    return count === 0 ? err(ERRORS.DIV0) : sum / count;
+  },
+
+  MAXIFS: (args, ctx) => {
+    const values = argValues(args, 0, ctx);
+    const pairs = buildCriteriaPairs(args, 1, ctx);
+    if (isError(pairs)) return pairs;
+    let best: number | null = null;
+    for (let i = 0; i < values.length; i++) {
+      if (isError(values[i])) continue;
+      if (!pairs.every((p) => p.test(p.values[i]))) continue;
+      const n = toNumber(values[i]);
+      if (n === null) continue;
+      if (best === null || n > best) best = n;
+    }
+    return best ?? 0;
+  },
+
+  MINIFS: (args, ctx) => {
+    const values = argValues(args, 0, ctx);
+    const pairs = buildCriteriaPairs(args, 1, ctx);
+    if (isError(pairs)) return pairs;
+    let best: number | null = null;
+    for (let i = 0; i < values.length; i++) {
+      if (isError(values[i])) continue;
+      if (!pairs.every((p) => p.test(p.values[i]))) continue;
+      const n = toNumber(values[i]);
+      if (n === null) continue;
+      if (best === null || n < best) best = n;
+    }
+    return best ?? 0;
+  },
+
   SUMPRODUCT: (args, ctx) => {
-    const arrays = args.map((_a, i) => argNums(args, i, ctx));
-    if (arrays.length === 0) return err(ERRORS.VALUE);
-    const len = Math.max(...arrays.map((a) => a.length));
+    if (args.length === 0) return err(ERRORS.VALUE);
+    // Аргументы — массивы: диапазоны, сравнения и --(…) над диапазонами.
+    const arrays = args.map((arg) => evalArrayNode(arg, ctx));
+    const length = Math.max(...arrays.map((values) => values.length));
     let total = 0;
-    for (let i = 0; i < len; i++) {
+    for (let i = 0; i < length; i++) {
       let product = 1;
-      for (const arr of arrays) product *= arr[i] ?? 0;
+      for (const values of arrays) {
+        const value = values.length === 1 ? values[0] : values[i];
+        if (isError(value)) return value;
+        // Текст и пустые ячейки внутри диапазона дают 0, как в Excel.
+        product *= typeof value === 'number' ? value : typeof value === 'boolean' ? (value ? 1 : 0) : 0;
+      }
       total += product;
     }
-    return total;
+    return Math.round(total * 1e10) / 1e10;
   },
 
   PRODUCT: (args, ctx) => {
@@ -1831,8 +1898,108 @@ const FUNCTIONS: Record<string, FnImpl> = {
     return Math.round(end - start);
   },
 
+  /** Текст с датой → серийное число. Время в тексте отбрасывается. */
+  DATEVALUE: (args, ctx) => {
+    const text = argText(args, 0, ctx, '');
+    if (isError(text)) return text;
+    const serial = parseDateText(text);
+    return serial === null ? err(ERRORS.VALUE) : serial;
+  },
+
+  TIME: (args, ctx) => {
+    const h = argNum(args, 0, ctx, 0);
+    if (isError(h)) return h;
+    const m = argNum(args, 1, ctx, 0);
+    if (isError(m)) return m;
+    const s = argNum(args, 2, ctx, 0);
+    if (isError(s)) return s;
+    const seconds = (((h * 3600 + m * 60 + s) % 86400) + 86400) % 86400;
+    return seconds / 86400;
+  },
+
+  /** Сдвиг даты на месяцы с сохранением дня (обрезается по концу месяца). */
+  EDATE: (args, ctx) => {
+    const start = argNum(args, 0, ctx, 0);
+    if (isError(start)) return start;
+    const months = argNum(args, 1, ctx, 0);
+    if (isError(months)) return months;
+    return serialFromDate(addMonths(dateFromSerial(start), Math.trunc(months)));
+  },
+
+  /** Последний день месяца со сдвигом на месяцы. */
+  EOMONTH: (args, ctx) => {
+    const start = argNum(args, 0, ctx, 0);
+    if (isError(start)) return start;
+    const months = argNum(args, 1, ctx, 0);
+    if (isError(months)) return months;
+    const shifted = addMonths(dateFromSerial(start), Math.trunc(months));
+    return serialFromDate(new Date(Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, 0)));
+  },
+
+  /** Номер недели по ISO 8601 (неделя начинается с понедельника). */
+  WEEKNUM: (args, ctx) => {
+    const serial = argNum(args, 0, ctx, 0);
+    if (isError(serial)) return serial;
+    return isoWeekNumber(serial);
+  },
+
   /* ---------- Прочее ---------- */
   NA: () => err(ERRORS.NA),
+
+  /** Первое истинное условие: ЕСЛИМН(усл1; знач1; усл2; знач2; …). */
+  IFS: (args, ctx) => {
+    // Excel отклоняет непарный список аргументов — иначе в файл уйдёт
+    // формула, которую он не откроет без «восстановления».
+    if (args.length === 0 || args.length % 2 !== 0) return err(ERRORS.VALUE);
+    for (let i = 0; i + 1 < args.length; i += 2) {
+      const condition = argValue(args, i, ctx);
+      if (isError(condition)) return condition;
+      const passed = toBool(condition);
+      if (isError(passed)) return passed;
+      if (passed) return argValue(args, i + 1, ctx);
+    }
+    return err(ERRORS.NA);
+  },
+
+  /** Значение по совпадению: ПЕРЕКЛЮЧ(выражение; вариант1; знач1; …; [иначе]). */
+  SWITCH: (args, ctx) => {
+    if (args.length < 3) return err(ERRORS.VALUE);
+    const subject = argValue(args, 0, ctx);
+    if (isError(subject)) return subject;
+    const rest = args.slice(1);
+    for (let i = 0; i + 1 < rest.length; i += 2) {
+      const candidate = argValue(rest, i, ctx);
+      if (isError(candidate)) return candidate;
+      if (compareValues(subject, candidate) === 0) return argValue(rest, i + 1, ctx);
+    }
+    // Нечётное число аргументов — последний задаёт значение по умолчанию
+    if (rest.length % 2 === 1) return argValue(rest, rest.length - 1, ctx);
+    return err(ERRORS.NA);
+  },
+
+  /** Итоги по коду функции (9 — сумма), как в Excel. */
+  SUBTOTAL: (args, ctx) => {
+    const code = argNum(args, 0, ctx, 0);
+    if (isError(code)) return code;
+    const base = Math.abs(Math.trunc(code)) % 100;
+    const map: Record<number, string> = {
+      1: 'AVERAGE',
+      2: 'COUNT',
+      3: 'COUNTA',
+      4: 'MAX',
+      5: 'MIN',
+      6: 'PRODUCT',
+      7: 'STDEV',
+      8: 'STDEVP',
+      9: 'SUM',
+      10: 'VAR',
+      11: 'VARP',
+    };
+    const name = map[base];
+    const impl = name ? FUNCTIONS[name] : undefined;
+    return impl ? impl(args.slice(1), ctx) : err(ERRORS.VALUE);
+  },
+
   ISERROR: (args, ctx) => isError(argValue(args, 0, ctx)),
   ISERR: (args, ctx) => {
     const v = argValue(args, 0, ctx);
@@ -1892,6 +2059,97 @@ function excelSerialFromDate(d: Date): number {
 
 function dateFromSerial(serial: number): Date {
   return new Date(EXCEL_EPOCH + Math.floor(serial) * 86400000);
+}
+
+/** Серийное число из календарной даты (UTC-полночь). */
+function serialFromDate(d: Date): number {
+  return Math.round(
+    (Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - EXCEL_EPOCH) / 86400000
+  );
+}
+
+/** Сдвиг даты на месяцы: день обрезается по концу целевого месяца (как EDATE). */
+function addMonths(d: Date, months: number): Date {
+  const day = d.getUTCDate();
+  const first = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + months, 1));
+  const lastDay = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+  first.setUTCDate(Math.min(day, lastDay));
+  return first;
+}
+
+/** Номер недели по ISO 8601: неделя с четвергом, начинается с понедельника. */
+function isoWeekNumber(serial: number): number {
+  const date = dateFromSerial(serial);
+  const weekday = (date.getUTCDay() + 6) % 7; // 0 — понедельник
+  const thursday = new Date(date.getTime() + (3 - weekday) * 86400000);
+  const yearStart = Date.UTC(thursday.getUTCFullYear(), 0, 1);
+  return Math.floor((thursday.getTime() - yearStart) / 86400000 / 7) + 1;
+}
+
+const RU_MONTH_FORMS: string[][] = [
+  ['январ', 'янв'],
+  ['феврал', 'фев'],
+  ['март', 'мар'],
+  ['апрел', 'апр'],
+  ['май', 'мая'],
+  ['июн'],
+  ['июл'],
+  ['август', 'авг'],
+  ['сентябр', 'сен'],
+  ['октябр', 'окт'],
+  ['ноябр', 'ноя'],
+  ['декабр', 'дек'],
+];
+
+/** Месяц по русскому названию: «5 января», «5 янв.», «5 май». */
+function monthFromRuName(token: string): number | null {
+  const value = token.toLowerCase().replace(/\.$/, '');
+  for (let i = 0; i < RU_MONTH_FORMS.length; i += 1) {
+    if (RU_MONTH_FORMS[i].some((form) => value.startsWith(form))) return i + 1;
+  }
+  return null;
+}
+
+/** Проверяет календарную дату и возвращает серийное число либо null. */
+function safeSerial(year: number, month: number, day: number): number | null {
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const utc = Date.UTC(year, month - 1, day);
+  const date = new Date(utc);
+  if (date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return Math.round((utc - EXCEL_EPOCH) / 86400000);
+}
+
+/**
+ * Разбор даты из текста для DATEVALUE.
+ * Поддерживает 05.01.2024, 5/1/2024, 2024-01-05, 5 января 2024 и хвост времени.
+ */
+function parseDateText(raw: string): number | null {
+  const text = raw.trim().replace(/\s+/g, ' ');
+  if (!text) return null;
+  // Время в конце строки на значение даты не влияет
+  const datePart = text.replace(/[ T]+\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\s*(AM|PM)?$/i, '').trim();
+
+  let match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(datePart);
+  if (match) return safeSerial(Number(match[1]), Number(match[2]), Number(match[3]));
+
+  // Русский порядок: сначала день, потом месяц
+  match = /^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})$/.exec(datePart);
+  if (match) {
+    const year = Number(match[3]) < 100 ? Number(match[3]) + 2000 : Number(match[3]);
+    return safeSerial(year, Number(match[2]), Number(match[1]));
+  }
+
+  // 5 января 2024 / 5 янв. 2024
+  match = /^(\d{1,2})\s+([А-Яа-яЁёA-Za-z]+)\.?,?\s+(\d{2,4})$/.exec(datePart);
+  if (match) {
+    const month = monthFromRuName(match[2]);
+    if (month === null) return null;
+    const year = Number(match[3]) < 100 ? Number(match[3]) + 2000 : Number(match[3]);
+    return safeSerial(year, month, Number(match[1]));
+  }
+
+  return null;
 }
 
 /* ---------- Форматирование TEXT ---------- */
@@ -2153,6 +2411,142 @@ export function evalNode(node: Node, ctx: EvalContext): CellPrimitive | FormulaE
 }
 
 /* ============================================================
+   Массивы: SUMPRODUCT и поэлементные выражения
+   ============================================================ */
+
+type Elem = CellPrimitive | FormulaError;
+
+/** Сравнение двух значений по оператору. */
+function compareByOperator(op: string, a: Elem, b: Elem): boolean {
+  const cmp = compareValues(a, b);
+  switch (op) {
+    case '=':
+      return cmp === 0;
+    case '<>':
+      return cmp !== 0;
+    case '<':
+      return cmp < 0;
+    case '>':
+      return cmp > 0;
+    case '<=':
+      return cmp <= 0;
+    default:
+      return cmp >= 0;
+  }
+}
+
+/** Поэлементное применение оператора к двум значениям. */
+function combineElements(op: string, a: Elem, b: Elem): Elem {
+  if (isError(a)) return a;
+  if (isError(b)) return b;
+  if (['=', '<>', '<', '>', '<=', '>='].includes(op)) return compareByOperator(op, a, b);
+  if (op === '&') return `${toText(a)}${toText(b)}`;
+
+  const an = toNumberStrict(a);
+  if (isError(an)) return an;
+  const bn = toNumberStrict(b);
+  if (isError(bn)) return bn;
+
+  switch (op) {
+    case '+':
+      return Math.round((an + bn) * 1e10) / 1e10;
+    case '-':
+      return Math.round((an - bn) * 1e10) / 1e10;
+    case '*':
+      return Math.round(an * bn * 1e10) / 1e10;
+    case '/':
+      return bn === 0 ? err(ERRORS.DIV0) : Math.round((an / bn) * 1e10) / 1e10;
+    case '^': {
+      const power = Math.pow(an, bn);
+      return Number.isFinite(power) ? power : err(ERRORS.NUM);
+    }
+    default:
+      return err(ERRORS.VALUE);
+  }
+}
+
+/** Функции, которые Excel применяет к каждому элементу массива. */
+const ELEMENT_WISE: Record<string, (value: Elem) => Elem> = {
+  ISNUMBER: (v) => typeof v === 'number',
+  ISTEXT: (v) => typeof v === 'string',
+  ISBLANK: (v) => v === null || v === undefined || v === '',
+  ISLOGICAL: (v) => typeof v === 'boolean',
+  ISERROR: (v) => isError(v),
+  ISERR: (v) => isError(v) && v.__error !== ERRORS.NA,
+  ISNA: (v) => isError(v) && v.__error === ERRORS.NA,
+  NOT: (v) => {
+    const b = toBool(v);
+    return isError(b) ? b : !b;
+  },
+  ABS: (v) => {
+    const n = toNumberStrict(v);
+    return isError(n) ? n : Math.abs(n);
+  },
+  N: (v) => (typeof v === 'number' ? v : typeof v === 'boolean' ? (v ? 1 : 0) : 0),
+};
+
+/**
+ * Значение узла как массив: диапазон разворачивается поэлементно, сравнения,
+ * унарные операторы и функции-предикаты применяются к каждому элементу.
+ * Нужно для SUMPRODUCT и формул массива вида СУММ(--(A1:A9>0)).
+ */
+function evalArrayNode(node: Node, ctx: EvalContext): Elem[] {
+  switch (node.kind) {
+    case 'range':
+      return resolveValues(node, ctx);
+
+    case 'unary': {
+      const values = evalArrayNode(node.operand, ctx);
+      return values.map((value) => {
+        const n = toNumberStrict(value);
+        if (isError(n)) return n;
+        return node.op === '-' ? -n : n;
+      });
+    }
+
+    case 'percent': {
+      const values = evalArrayNode(node.operand, ctx);
+      return values.map((value) => {
+        const n = toNumberStrict(value);
+        return isError(n) ? n : n / 100;
+      });
+    }
+
+    case 'binary': {
+      const left = evalArrayNode(node.left, ctx);
+      const right = evalArrayNode(node.right, ctx);
+      if (left.length !== 1 && right.length !== 1 && left.length !== right.length) {
+        return [err(ERRORS.VALUE)];
+      }
+      const length = Math.max(left.length, right.length);
+      const out: Elem[] = [];
+      for (let i = 0; i < length; i += 1) {
+        out.push(
+          combineElements(
+            node.op,
+            left.length === 1 ? left[0] : left[i],
+            right.length === 1 ? right[0] : right[i]
+          )
+        );
+      }
+      return out;
+    }
+
+    case 'call': {
+      const mapper = ELEMENT_WISE[node.name];
+      if (mapper && node.args.length === 1) {
+        const values = evalArrayNode(node.args[0], ctx);
+        if (values.length > 1) return values.map(mapper);
+      }
+      return [evalNode(node, ctx)];
+    }
+
+    default:
+      return [evalNode(node, ctx)];
+  }
+}
+
+/* ============================================================
    Публичный API
    ============================================================ */
 
@@ -2160,7 +2554,8 @@ export function evalNode(node: Node, ctx: EvalContext): CellPrimitive | FormulaE
 export function evaluateFormula(formula: string, ctx: EvalContext): CellPrimitive | FormulaError {
   let ast: Node;
   try {
-    ast = parseFormula(formula);
+    // Префикс _xlfn. из файлов Excel движок не разбирает — снимаем заранее
+    ast = parseFormula(stripModernPrefixes(formula));
   } catch {
     return err(ERRORS.NAME);
   }
@@ -2231,6 +2626,13 @@ export const RU_FUNCTION_ALIASES: Record<string, string> = {
   ОКРУГЛТ: 'MROUND',
   СРЗНАЧ: 'AVERAGE',
   СРЗНАЧЕСЛИ: 'AVERAGEIF',
+  СРЗНАЧЕСЛИМН: 'AVERAGEIFS',
+  МАКСЕСЛИМН: 'MAXIFS',
+  МИНЕСЛИМН: 'MINIFS',
+  ЕСЛИМН: 'IFS',
+  ПЕРЕКЛЮЧ: 'SWITCH',
+  ПРОМЕЖУТОЧНЫЕИТОГИ: 'SUBTOTAL',
+  'ПРОМЕЖУТОЧНЫЕ.ИТОГИ': 'SUBTOTAL',
   СЧЁТ: 'COUNT',
   СЧЕТ: 'COUNT',
   СЧЁТЗ: 'COUNTA',
@@ -2293,6 +2695,11 @@ export const RU_FUNCTION_ALIASES: Record<string, string> = {
   СЕГОДНЯ: 'TODAY',
   ТДАТА: 'NOW',
   ДАТА: 'DATE',
+  ДАТАЗНАЧ: 'DATEVALUE',
+  ВРЕМЯ: 'TIME',
+  ДАТАМЕС: 'EDATE',
+  КОНМЕСЯЦА: 'EOMONTH',
+  НОМНЕДЕЛИ: 'WEEKNUM',
   ГОД: 'YEAR',
   МЕСЯЦ: 'MONTH',
   ДЕНЬ: 'DAY',
@@ -2326,8 +2733,10 @@ export function canonicalFunctionName(name: string): string {
  * наравне с ','.
  */
 export function normalizeFormula(formula: string): string {
+  // В файлах Excel новые функции записаны с префиксом _xlfn. — движку он не нужен
+  const source = stripModernPrefixes(formula);
   // Имена функций (за ними следует скобка)
-  return formula.replace(
+  return source.replace(
     /([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_.]*)\s*\(/g,
     (match, name: string) => {
       const canonical = canonicalFunctionName(name);
@@ -2529,20 +2938,91 @@ function mapArgumentSeparators(
 }
 
 /**
- * Формула в том виде, в каком её хранит Excel в файле .xlsx:
- * английские имена функций и запятая между аргументами.
- * В редакторе при этом можно писать по-русски и через точку с запятой.
+ * Применяет правку к частям формулы вне строковых литералов.
+ * Кавычки внутри строк удваиваются, как в Excel.
  */
-export function toExcelFormula(formula: string): string {
-  const normalized = normalizeFormula(formula);
-  return mapArgumentSeparators(normalized, () => ',');
+function mapOutsideStrings(formula: string, fn: (chunk: string) => string): string {
+  let out = '';
+  let plain = '';
+  let i = 0;
+  while (i < formula.length) {
+    if (formula[i] !== '"') {
+      plain += formula[i];
+      i += 1;
+      continue;
+    }
+    let literal = '"';
+    i += 1;
+    while (i < formula.length) {
+      if (formula[i] === '"') {
+        if (formula[i + 1] === '"') {
+          literal += '""';
+          i += 2;
+          continue;
+        }
+        literal += '"';
+        i += 1;
+        break;
+      }
+      literal += formula[i];
+      i += 1;
+    }
+    out += fn(plain) + literal;
+    plain = '';
+  }
+  return out + fn(plain);
 }
 
 /**
- * Формула из файла Excel для редактора: запятые-разделители аргументов
- * возвращаются к точке с запятой, к которой привык русский Excel.
- * Содержимое строк и разделитель диапазона «:» не меняются.
+ * Функции, появившиеся после Excel 2007. В файле .xlsx их имя обязано иметь
+ * префикс `_xlfn.`, иначе Excel показывает #NAME? даже в свежих версиях.
+ */
+const MODERN_FUNCTIONS = new Set([
+  'CONCAT',
+  'DAYS',
+  'IFNA',
+  'IFS',
+  'MAXIFS',
+  'MINIFS',
+  'NUMBERVALUE',
+  'SWITCH',
+  'TEXTJOIN',
+  'XLOOKUP',
+  'XOR',
+]);
+
+/** Добавляет `_xlfn.` к именам новых функций. */
+function addModernPrefixes(formula: string): string {
+  return mapOutsideStrings(formula, (chunk) =>
+    chunk.replace(
+      /(^|[^A-Za-zА-Яа-яЁё0-9_.])([A-Z][A-Z0-9]*)\s*\(/g,
+      (match, lead: string, name: string) =>
+        MODERN_FUNCTIONS.has(name) ? `${lead}_xlfn.${name}(` : match
+    )
+  );
+}
+
+/** Убирает служебные префиксы Excel, чтобы формулу можно было вычислить. */
+function stripModernPrefixes(formula: string): string {
+  return mapOutsideStrings(formula, (chunk) => chunk.replace(/_xl(?:fn|ws)\./gi, ''));
+}
+
+/**
+ * Формула в том виде, в каком её хранит Excel в файле .xlsx:
+ * английские имена функций, запятая между аргументами и префикс `_xlfn.`
+ * у функций новее Excel 2007.
+ * В редакторе при этом можно писать по-русски и через точку с запятой.
+ */
+export function toExcelFormula(formula: string): string {
+  const normalized = normalizeFormula(stripModernPrefixes(formula));
+  return mapArgumentSeparators(addModernPrefixes(normalized), () => ',');
+}
+
+/**
+ * Формула из файла Excel для редактора: служебные префиксы убираются,
+ * запятая-разделитель аргументов возвращается к точке с запятой, к которой
+ * привык русский Excel. Содержимое строк и «:» не меняются.
  */
 export function fromExcelFormula(formula: string): string {
-  return mapArgumentSeparators(formula, () => ';');
+  return mapArgumentSeparators(stripModernPrefixes(formula), () => ';');
 }

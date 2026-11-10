@@ -57,6 +57,8 @@ import {
   columnName,
   computeCellDisplay,
   createContext,
+  canonicalFunctionName,
+  FUNCTION_NAMES,
   isError,
   normalizeFormula,
   repairFormula,
@@ -97,6 +99,20 @@ export interface AIAction {
 
 const MIN_ROWS = 60;
 const MIN_COLS = 16;
+
+/**
+ * Пояснение к ошибке, которую нельзя исправить правкой формулы:
+ * для #NAME? называем функции, которых нет в движке формул.
+ */
+function whyUnfixable(formula: string, shown: string): string {
+  if (!shown.startsWith('#NAME')) return '';
+  const unknown = new Set<string>();
+  for (const match of formula.matchAll(/([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_.]*)\s*\(/g)) {
+    if (!FUNCTION_NAMES.includes(canonicalFunctionName(match[1]))) unknown.add(match[1]);
+  }
+  if (unknown.size === 0) return '';
+  return ` (не поддерживается: ${[...unknown].join(', ')})`;
+}
 
 /** Извлекает табличные данные из ответа AI: Markdown, JSON values/rows или TSV. */
 function extractTableRows(text: string): string[][] {
@@ -2221,7 +2237,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
 
             const repair = repairFormula(raw);
             if (!repair) {
-              skipped.push(`${columnName(col)}${row + 1}: ${shown}`);
+              skipped.push(`${columnName(col)}${row + 1}: ${shown}${whyUnfixable(raw, shown)}`);
               continue;
             }
             line[col] = repair.formula;
@@ -2230,7 +2246,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
             if (after.startsWith('#')) {
               line[col] = raw;
               context.cache.clear();
-              skipped.push(`${columnName(col)}${row + 1}: ${shown}`);
+              skipped.push(`${columnName(col)}${row + 1}: ${shown}${whyUnfixable(raw, shown)}`);
               continue;
             }
             fixed++;
