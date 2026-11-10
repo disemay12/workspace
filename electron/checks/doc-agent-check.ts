@@ -240,6 +240,12 @@ function scenarioOf(messages) {
   if (/не внёс изменения|Ты не внёс текст/.test(text) && users.length > 1) {
     text = String(users[users.length - 2]?.content || '');
   }
+  // Агент сам просит модель выполнить обещанное действие — сценарий тот же.
+  if (/Не объявляй план и не пиши/.test(text) && users.length > 1) {
+    text = String(users[users.length - 2]?.content || '');
+  }
+  if (text.includes('Начни проверку с плана')) return 'promiseRetry';
+  if (text.includes('Что ты уже сделал')) return 'promiseMemory';
   if (text.includes('Измени заголовок на «Иван Петров»')) return 'quickTitle';
   if (text.includes('Замени строку с должностью')) return 'blockedLine';
   if (text.includes('Замени выделенное')) return 'selection';
@@ -307,6 +313,30 @@ function scriptedResponse(scenario, stepIndex, messages) {
   const lastRole = String(lastMessage?.role || '');
   const lastUser = [...messages].reverse().find((message) => message.role === 'user');
   const lastUserText = String(lastUser?.content || '');
+
+  if (scenario === 'promiseRetry') {
+    const toolMessages = messages.filter((message) => message.role === 'tool');
+    const nudged = messages.some(
+      (message) =>
+        message.role === 'user' && String(message.content || '').includes('Не объявляй план')
+    );
+    // Первый шаг — только обещание правки, без вызова инструмента.
+    if (!nudged && toolMessages.length === 0) {
+      return [contentChunk('Проблемы подтверждены. Начинаю править: заголовок и дату.')];
+    }
+    if (toolMessages.length === 0) {
+      return [toolCall('get_document', {}, 'promise-read')];
+    }
+    return [contentChunk('Готово: документ прочитан и правки внесены.')];
+  }
+
+  if (scenario === 'promiseMemory') {
+    const annotated = messages.some(
+      (message) =>
+        message.role === 'assistant' && String(message.content || '').includes('[Уже выполнено:')
+    );
+    return [contentChunk(annotated ? 'Помню: вызывал get_document.' : 'Не помню, что было выше.')];
+  }
 
   if (scenario === 'story') {
     return [
@@ -988,6 +1018,11 @@ function startMockServer(): Promise<any> {
           promptHasNoWrite: systemPrompt.includes('Права записи: НЕТ'),
           promptMentionsDocument: systemPrompt.includes('ОТКРЫТЫЙ ДОКУМЕНТ'),
           promptFallback: systemPrompt.includes('Function calling недоступен'),
+          // Ответы ассистента с прошлыми вызовами инструментов — проверка памяти.
+          historyAnnotations: messages.filter(
+            (message) =>
+              message.role === 'assistant' && String(message.content || '').includes('[Уже выполнено:')
+          ).length,
           toolContents: messages
             .filter((message) => message.role === 'tool')
             .slice(-6)
@@ -1692,6 +1727,32 @@ async function main() {
       idle: retrySend.idle,
       headingChanged: retryState.text.includes('Ключевые навыки'),
       bodyKept: retryState.text.includes('Опыт работы') && retryState.text.includes('Санкт-Петербург'),
+    });
+
+    /* ---------- 6d2. «Начинаю править» без вызова: агент продолжает работу ---------- */
+    const promiseSend = await send('Начни проверку с плана и исправь документ');
+    const promiseRequests = out.requests.filter((request) => request.scenario === 'promiseRetry');
+    const promisePageText = await js('return document.body.innerText');
+    step('promiseAutoContinue', {
+      sent: promiseSend.sent,
+      idle: promiseSend.idle,
+      continued: promiseRequests.length >= 2,
+      nudgeSent:
+        promiseRequests.length >= 2 &&
+        String(promiseRequests[1].lastUserContent).includes('Не объявляй план'),
+      toolCalled: promiseRequests.some((request) => request.lastRole === 'tool'),
+      finished: promisePageText.includes('правки внесены'),
+    });
+
+    /* ---------- 6d3. Следующее сообщение помнит выполненные вызовы ---------- */
+    const memorySend = await send('Что ты уже сделал в этом документе?');
+    const memoryRequests = out.requests.filter((request) => request.scenario === 'promiseMemory');
+    const memoryPageText = await js('return document.body.innerText');
+    step('toolHistoryInContext', {
+      sent: memorySend.sent,
+      idle: memorySend.idle,
+      annotated: memoryRequests.some((request) => request.historyAnnotations > 0),
+      remembered: memoryPageText.includes('Помню'),
     });
 
     /* ---------- 6e. ATS/ATC: копия не принимается, резюме переписывается ---------- */

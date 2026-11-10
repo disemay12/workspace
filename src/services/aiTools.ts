@@ -1739,6 +1739,22 @@ export interface DocumentPromptContext {
 
 /** Системный блок про открытый документ: права, инструменты, правила. */
 export function buildDocumentSystemPrompt(context: DocumentPromptContext): string {
+  return `${buildDocumentTypePrompt(context)}\n${DOCUMENT_COMPLETION_RULES}`;
+}
+
+/**
+ * Правила доведения работы до конца: короткий лимит шагов и ответы вида
+ * «начинаю править» оставляли задачу недоделанной.
+ */
+const DOCUMENT_COMPLETION_RULES = [
+  'РАБОТА ДО РЕЗУЛЬТАТА',
+  '- Задача выполнена, когда инструмент реально изменил файл. Не пиши «начинаю», «сейчас проверю», «приступаю» — сразу вызывай инструмент.',
+  '- Доводи шаг до конца: прочитал данные → внёс правки → проверил результат инструментом чтения, что изменения применились.',
+  '- Большую задачу (много строк, листов, абзацев) выполняй последовательными вызовами в одном ответе, пока не закончишь.',
+  '- Пометки «[Уже выполнено: …]» в истории диалога — это твои прошлые действия. Продолжай с этого места и не повторяй их.',
+].join('\n');
+
+function buildDocumentTypePrompt(context: DocumentPromptContext): string {
   const typeLabel = TYPE_LABEL[context.type] ?? context.type;
   const header = [
     'ОТКРЫТЫЙ ДОКУМЕНТ',

@@ -146,6 +146,14 @@ export interface ChatAttachment {
   truncated?: boolean;
 }
 
+/** Вызов инструмента агентом: что вызвал, какой аргумент и чем закончилось. */
+export interface ToolRun {
+  name: string;
+  ok: boolean;
+  /** Короткое описание аргументов: диапазон, адрес, лист, искомый текст. */
+  detail?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -162,6 +170,8 @@ export interface ChatMessage {
   toolsUsed?: boolean;
   /** Инструменты, вызванные при подготовке ответа. */
   toolTrace?: string[];
+  /** Что агент реально сделал в этом шаге — уходит в историю следующего запроса. */
+  toolRuns?: ToolRun[];
   /** Дополнительные файлы, прочитанные по ходу ответа. */
   contextFiles?: string[];
   /** Запрос был точечной правкой: полная замена документа запрещена. */

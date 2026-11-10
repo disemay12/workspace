@@ -1,4 +1,4 @@
-import { AISettings, ChatMessage } from '../types';
+import { AISettings, ChatMessage, ToolRun } from '../types';
 import { PROVIDER_PRESETS, normalizeSettings } from '../state/settings';
 import { uid } from '../lib/utils';
 import type { ToolDefinition } from './aiTools';
@@ -39,7 +39,33 @@ export interface DocumentAgentResult {
   text: string;
   iterations: number;
   toolCalls: number;
+  /** Что реально вызвано — уходит в историю диалога, чтобы следующий запрос знал о сделанном. */
+  toolRuns: ToolRun[];
 }
+
+/**
+ * Бюджет шагов агента. Один шаг — один ответ модели, поэтому короткий лимит
+ * обрывает работу на середине («Начинаю править…» и тишина).
+ */
+export const AGENT_STEPS_DEFAULT = 40;
+export const AGENT_STEPS_LIMIT = 80;
+/** Сколько раз просим модель выполнить обещанное вместо очередного плана. */
+const AGENT_NUDGE_LIMIT = 2;
+/** Подряд идущие шаги, где ни один инструмент не сработал, — повод остановиться. */
+const AGENT_IDLE_LIMIT = 3;
+
+/** Дословная просьба продолжить действие инструментом. */
+const AGENT_CONTINUE_NUDGE =
+  'Не объявляй план и не пиши «начинаю», «сейчас проверю» — сразу вызывай инструмент и выполняй действие. ' +
+  'Если работа уже завершена, коротко перечисли, что именно изменил.';
+
+/** Ответ обещает действие в будущем («начинаю править», «сейчас проверю»). */
+const ANNOUNCE_PATTERN =
+  /(начинаю|приступаю|приступлю|сейчас\s+(проверю|исправлю|сделаю|внесу|обновлю|изменю|заполню|посчитаю|найду|поправлю)|(проверю|исправлю|внесу|обновлю|изменю|заполню|поправлю)\b)/i;
+
+/** Ответ сообщает о выполненной работе — придираться не к чему. */
+const DONE_PATTERN =
+  /(готово|выполнено|сделано|выполнил|исправил|внёс|внес|обновил|изменил|заполнил|проверил|удалил|добавил|итог)/i;
 
 const isElectron = () => typeof window !== 'undefined' && Boolean(window.electronAPI);
 
@@ -110,6 +136,69 @@ function buildMessageText(message: ChatMessage): string {
     '```\n\n' +
     message.content
   );
+}
+
+/** Вложение было в прошлых запросах — его содержимое уже не повторяем. */
+function buildAttachmentReference(message: ChatMessage): string {
+  const { name, path } = message.attachedFile!;
+  return (
+    `[Файл ${name} приложен раньше: ${path}]\n` +
+    'Содержимое не дублируется — прочитай файл инструментом, если оно снова нужно.\n\n' +
+    message.content
+  );
+}
+
+/** Аргументы инструмента, которые полезно помнить в истории диалога. */
+function summarizeToolArgs(args: Record<string, unknown>): string {
+  const keys = ['range', 'address', 'sheet', 'slide', 'path', 'find', 'name', 'query', 'block_id'];
+  const parts: string[] = [];
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    parts.push(`${key}=${value.trim().slice(0, 48)}`);
+    if (parts.length === 2) break;
+  }
+  return parts.join(' ');
+}
+
+/** Строка «что вызывали и чем закончилось» для ответа ассистента. */
+function describeToolRuns(runs: ToolRun[]): string {
+  return runs
+    .map((run) => `${run.name}${run.detail ? ` ${run.detail}` : ''} — ${run.ok ? 'ок' : 'ошибка'}`)
+    .join('; ');
+}
+
+/**
+ * История для модели.
+ *
+ * Содержимое вложения отправляем только в последнем сообщении с файлом: иначе
+ * один прикреплённый файл уезжает в каждый следующий запрос и съедает окно
+ * контекста. К ответам ассистента дописываем список выполненных инструментов —
+ * без него модель после следующего сообщения не помнит, что уже сделала.
+ */
+function buildHistoryMessages(messages: ChatMessage[]): { role: string; content: string }[] {
+  const usable = messages.filter((message) => message.role !== 'system' && message.content.trim());
+  const lastAttachment = usable.reduce((acc, message, index) => (message.attachedFile ? index : acc), -1);
+
+  return usable.map((message, index) => {
+    const parts: string[] = [];
+    if (message.attachedFile) {
+      parts.push(index === lastAttachment ? buildMessageText(message) : buildAttachmentReference(message));
+    } else {
+      parts.push(message.content);
+    }
+    if (message.toolRuns?.length) {
+      parts.push(`[Уже выполнено: ${describeToolRuns(message.toolRuns)}]`);
+    }
+    return { role: message.role, content: parts.join('\n\n') };
+  });
+}
+
+/** Модель пообещала действие и завершила шаг, ничего не сделав. */
+function announcesWithoutActing(text: string): boolean {
+  const value = text.trim();
+  if (!value || value.length > 600) return false;
+  return ANNOUNCE_PATTERN.test(value) && !DONE_PATTERN.test(value);
 }
 
 /** Разбор SSE-потока на уровне JSON-событий. */
@@ -722,14 +811,18 @@ export const aiService = {
         role: 'system',
         content: composeSystemPrompt(effective, options.appContext, options.systemPromptExtra),
       },
-      ...options.messages
-        .filter((message) => message.role !== 'system' && message.content.trim())
-        .map((message) => ({ role: message.role, content: buildMessageText(message) })),
+      ...buildHistoryMessages(options.messages),
     ];
 
-    const maxIterations = Math.max(1, Math.min(options.maxIterations ?? 8, 16));
+    const maxIterations = Math.max(
+      1,
+      Math.min(options.maxIterations ?? AGENT_STEPS_DEFAULT, AGENT_STEPS_LIMIT)
+    );
     let lastText = '';
     let toolCallsCount = 0;
+    const toolRuns: ToolRun[] = [];
+    let nudges = 0;
+    let idleSteps = 0;
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       const textParts: string[] = [];
@@ -790,7 +883,16 @@ export const aiService = {
       if (text.trim()) lastText = text.trim();
 
       if (calls.size === 0) {
-        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount };
+        // Модель написала «начинаю править» и завершила шаг — задача осталась
+        // недоделанной. Возвращаем её к действию вместо остановки.
+        if (options.tools.length > 0 && nudges < AGENT_NUDGE_LIMIT && announcesWithoutActing(text)) {
+          nudges += 1;
+          options.onStatus?.('Выполняю действие…');
+          apiMessages.push({ role: 'assistant', content: text.trim() || null });
+          apiMessages.push({ role: 'user', content: AGENT_CONTINUE_NUDGE });
+          continue;
+        }
+        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount, toolRuns };
       }
 
       const toolCalls = [...calls.entries()]
@@ -803,7 +905,7 @@ export const aiService = {
         .filter((call) => call.function.name);
 
       if (toolCalls.length === 0) {
-        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount };
+        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount, toolRuns };
       }
 
       apiMessages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
@@ -822,6 +924,7 @@ export const aiService = {
             ok: false,
             message: `Аргументы инструмента ${call.function.name} — некорректный JSON. Вызови инструмент заново.`,
           };
+          toolRuns.push({ name: call.function.name, ok: false, detail: 'некорректный JSON' });
           apiMessages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -840,6 +943,13 @@ export const aiService = {
           };
         }
 
+        // Инструмент без поля ok считаем успешным: часть из них возвращает данные.
+        toolRuns.push({
+          name: call.function.name,
+          ok: (result as { ok?: boolean } | null)?.ok !== false,
+          detail: summarizeToolArgs(args),
+        });
+
         const serialized = JSON.stringify(result ?? { ok: true });
         apiMessages.push({
           role: 'tool',
@@ -847,12 +957,32 @@ export const aiService = {
           content: serialized.length > 24000 ? `${serialized.slice(0, 24000)}…` : serialized,
         });
       }
+
+      // Ни один вызов шага не удался — модель бьётся в одну и ту же ошибку.
+      const stepRuns = toolRuns.slice(-toolCalls.length);
+      idleSteps = stepRuns.some((run) => run.ok) ? 0 : idleSteps + 1;
+      if (idleSteps >= AGENT_IDLE_LIMIT) {
+        return {
+          text:
+            lastText ||
+            'Инструменты подряд возвращают ошибку — остановился, чтобы не зациклиться. Уточните, что именно нужно изменить.',
+          iterations: iteration + 1,
+          toolCalls: toolCallsCount,
+          toolRuns,
+        };
+      }
     }
 
+    const done = toolRuns.filter((run) => run.ok);
+    const tail = done.length > 0 ? `\n\n_Успел: ${describeToolRuns(done.slice(-6))}._` : '';
     return {
-      text: lastText || 'Достигнут лимит шагов работы с документом. Уточните задачу или продолжите отдельным сообщением.',
+      text:
+        (lastText ? `${lastText}\n\n` : '') +
+        `Остановился на лимите ${maxIterations} шагов — задача не завершена. ` +
+        `Напишите «продолжай», и я продолжу с этого места.${tail}`,
       iterations: maxIterations,
       toolCalls: toolCallsCount,
+      toolRuns,
     };
   },
 
@@ -875,7 +1005,7 @@ export const aiService = {
         model: settings.model || 'gpt-4o-mini',
         messages: [
           { role: 'system', content: composeSystemPrompt(settings, appContext, extraSystem) },
-          ...messages.map((m) => ({ role: m.role, content: buildMessageText(m) })),
+          ...buildHistoryMessages(messages),
         ],
         temperature: settings.temperature,
         max_tokens: settings.maxTokens,
@@ -909,9 +1039,9 @@ export const aiService = {
       {
         model: settings.model || 'claude-3-5-sonnet-20241022',
         system: composeSystemPrompt(settings, appContext, extraSystem),
-        messages: messages.map((m) => ({
+        messages: buildHistoryMessages(messages).map((m) => ({
           role: m.role === 'assistant' ? 'assistant' : 'user',
-          content: buildMessageText(m),
+          content: m.content,
         })),
         max_tokens: settings.maxTokens,
         temperature: settings.temperature,
@@ -943,9 +1073,9 @@ export const aiService = {
       endpoint,
       { 'Content-Type': 'application/json' },
       {
-        contents: messages.map((m) => ({
+        contents: buildHistoryMessages(messages).map((m) => ({
           role: m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: buildMessageText(m) }],
+          parts: [{ text: m.content }],
         })),
         systemInstruction: {
           parts: [{ text: composeSystemPrompt(settings, appContext, extraSystem) }],

@@ -35,7 +35,7 @@ import {
   ShieldCheck,
   ShieldAlert,
 } from 'lucide-react';
-import { AISettings, ChatAttachment, ChatMessage, ChatSession, OpenTab } from '../../types';
+import { AISettings, ChatAttachment, ChatMessage, ChatSession, OpenTab, ToolRun } from '../../types';
 import { aiService, ToolsUnsupportedError } from '../../services/aiService';
 import { buildDocumentSystemPrompt, buildDocumentTools, supportsNativeDocumentTools } from '../../services/aiTools';
 import { AGENT_TAB_TYPES, DOCUMENT_TAB_TYPES, type DocumentToolResult } from '../../lib/documentModel';
@@ -287,6 +287,8 @@ export const AIChatPanel: React.FC<Props> = ({
   const [agentStatus, setAgentStatus] = useState('');
   const [toolTrace, setToolTrace] = useState<string[]>([]);
   const toolTraceRef = useRef<string[]>([]);
+  /** Детальный след вызовов — сохраняется в истории для следующего запроса. */
+  const toolRunsRef = useRef<ToolRun[]>([]);
   const [contextFiles, setContextFiles] = useState<string[]>([]);
   const contextFilesRef = useRef<string[]>([]);
   const [attachFile, setAttachFile] = useState(true);
@@ -377,6 +379,7 @@ export const AIChatPanel: React.FC<Props> = ({
       if (!text || isStreaming) return;
 
       toolTraceRef.current = [];
+      toolRunsRef.current = [];
       setToolTrace([]);
       contextFilesRef.current = [];
       setContextFiles([]);
@@ -608,6 +611,7 @@ export const AIChatPanel: React.FC<Props> = ({
               });
 
               buffer = result.text.trim();
+              toolRunsRef.current.push(...result.toolRuns);
               toolsUsed = documentTouched;
               if (!buffer) {
                 buffer =
@@ -699,6 +703,7 @@ export const AIChatPanel: React.FC<Props> = ({
                   onToolCall: callTool,
                 });
                 buffer = retry.text.trim() || buffer;
+                toolRunsRef.current.push(...retry.toolRuns);
                 toolsUsed = documentTouched;
               }
             } catch (error) {
@@ -795,6 +800,7 @@ export const AIChatPanel: React.FC<Props> = ({
                   toolsUsed,
                   preciseEdit: preciseRequest,
                   toolTrace: [...toolTraceRef.current],
+                  toolRuns: [...toolRunsRef.current],
                   contextFiles: [...contextFilesRef.current],
                 }
               : m
@@ -818,6 +824,7 @@ export const AIChatPanel: React.FC<Props> = ({
                     toolsUsed,
                     preciseEdit: preciseRequest,
                     toolTrace: [...toolTraceRef.current],
+                    toolRuns: [...toolRunsRef.current],
                   }
                 : m
             )
@@ -835,6 +842,7 @@ export const AIChatPanel: React.FC<Props> = ({
                     error: message,
                     preciseEdit: preciseRequest,
                     toolTrace: [...toolTraceRef.current],
+                    toolRuns: [...toolRunsRef.current],
                     contextFiles: [...contextFilesRef.current],
                   }
                 : m
