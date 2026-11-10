@@ -29,6 +29,8 @@ export interface DocumentAgentOptions {
   onToolCall: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   onStatus?: (status: string) => void;
   signal?: AbortSignal;
+  /** id диалога — для провайдеров, которым нужна стабильная сессия (OpenCode). */
+  sessionId?: string;
   /** Страховка от бесконечного цикла: каждая итерация — один ответ модели. */
   maxIterations?: number;
 }
@@ -40,6 +42,43 @@ export interface DocumentAgentResult {
 }
 
 const isElectron = () => typeof window !== 'undefined' && Boolean(window.electronAPI);
+
+/** Стабильный hex-идентификатор сессии: OpenCode Console кеширует по нему промпты. */
+function hashSessionSeed(value: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x01000193;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+  }
+  return first.toString(16).padStart(8, '0') + second.toString(16).padStart(8, '0');
+}
+
+/** Вне чата (копилот, проверка связи) — одна сессия на запуск приложения. */
+const OPENCODE_RUN_SESSION = `ses_${hashSessionSeed(`${Date.now()}:${Math.random()}`)}`;
+
+/**
+ * Заголовки запроса к провайдеру.
+ *
+ * OpenCode Console требует стабильный `x-opencode-session` для маршрутизации
+ * диалога и prompt cache; Go-план без него не работает.
+ */
+function buildProviderHeaders(settings: AISettings, sessionId?: string): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (settings.apiKey.trim()) headers['Authorization'] = `Bearer ${settings.apiKey.trim()}`;
+  // OpenRouter требует идентификацию клиента
+  if (settings.provider === 'openrouter') {
+    headers['HTTP-Referer'] = 'https://workspace.local';
+    headers['X-Title'] = 'WorkSpace';
+  }
+  if (settings.provider === 'opencode') {
+    headers['x-opencode-session'] = sessionId
+      ? `ses_${hashSessionSeed(sessionId)}`
+      : OPENCODE_RUN_SESSION;
+  }
+  return headers;
+}
 
 /** Понятное описание сетевой ошибки либо ошибки API. */
 function describeError(err: unknown, providerLabel: string): Error {
@@ -453,7 +492,8 @@ export const aiService = {
     callbacks: StreamCallbacks,
     signal?: AbortSignal,
     appContext?: string,
-    extraSystem?: string
+    extraSystem?: string,
+    sessionId?: string
   ): Promise<void> {
     // Адрес и модель обязаны соответствовать провайдеру: иначе ключ Starimg
     // уходит на api.openai.com и приложение «перестаёт подключаться».
@@ -481,7 +521,15 @@ export const aiService = {
       } else if (effective.provider === 'gemini') {
         await this.streamGemini(clean, effective, callbacks, signal, appContext, extraSystem);
       } else {
-        await this.streamOpenAICompatible(clean, effective, callbacks, signal, appContext, extraSystem);
+        await this.streamOpenAICompatible(
+          clean,
+          effective,
+          callbacks,
+          signal,
+          appContext,
+          extraSystem,
+          sessionId
+        );
       }
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') return;
@@ -667,12 +715,7 @@ export const aiService = {
     const effective = normalizeSettings(options.settings);
     const endpoint = this.resolveEndpoint(effective);
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (effective.apiKey.trim()) headers['Authorization'] = `Bearer ${effective.apiKey.trim()}`;
-    if (effective.provider === 'openrouter') {
-      headers['HTTP-Referer'] = 'https://workspace.local';
-      headers['X-Title'] = 'WorkSpace';
-    }
+    const headers = buildProviderHeaders(effective, options.sessionId);
 
     const apiMessages: any[] = [
       {
@@ -819,17 +862,11 @@ export const aiService = {
     { onChunk, onFinish }: StreamCallbacks,
     signal?: AbortSignal,
     appContext?: string,
-    extraSystem?: string
+    extraSystem?: string,
+    sessionId?: string
   ): Promise<void> {
     const endpoint = this.resolveEndpoint(settings);
-
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (settings.apiKey.trim()) headers['Authorization'] = `Bearer ${settings.apiKey.trim()}`;
-    // OpenRouter требует идентификацию клиента
-    if (settings.provider === 'openrouter') {
-      headers['HTTP-Referer'] = 'https://workspace.local';
-      headers['X-Title'] = 'WorkSpace';
-    }
+    const headers = buildProviderHeaders(settings, sessionId);
 
     const full = await this.requestStream(
       endpoint,

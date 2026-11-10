@@ -53,7 +53,10 @@ CSV/TSV сохраняются в UTF-8 с BOM, чтобы русский Excel 
 
 ### AI-ассистент (BYOK — свой ключ)
 Поддерживаются провайдеры: **OpenAI**, **Anthropic Claude**, **Google Gemini**,
-**DeepSeek**, **OpenRouter**, **Ollama**, **Starimg AI** и любой OpenAI-совместимый endpoint.
+**DeepSeek**, **OpenRouter**, **OpenCode (Go)**, **Ollama**, **Starimg AI** и любой
+OpenAI-совместимый endpoint. OpenCode Go использует базовый URL
+`https://opencode.ai/inference/go/openai/v1`; для pay-as-you-go укажите
+`https://opencode.ai/inference/openai/v1` в поле «Базовый URL API».
 
 - **Боковой чат** — стриминг ответов в реальном времени, прикрепление открытого
   документа или выделенного фрагмента к запросу, подсветка кода в ответах.

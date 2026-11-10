@@ -110,6 +110,7 @@ export type AIProvider =
   | 'gemini'
   | 'deepseek'
   | 'openrouter'
+  | 'opencode'
   | 'ollama'
   | 'starimg'
   | 'custom';

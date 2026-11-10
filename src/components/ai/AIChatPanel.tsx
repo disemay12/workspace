@@ -594,6 +594,7 @@ export const AIChatPanel: React.FC<Props> = ({
               const result = await aiService.runDocumentAgent({
                 messages: [...base, agentMessage],
                 settings: requestSettings,
+                sessionId,
                 appContext,
                 systemPromptExtra: buildDocumentSystemPrompt({
                   name: activeTab.name,
@@ -626,7 +627,8 @@ export const AIChatPanel: React.FC<Props> = ({
                 streamCallbacks,
                 controller.signal,
                 appContext,
-                fallbackPrompt
+                fallbackPrompt,
+                sessionId
               );
             }
           } else {
@@ -637,7 +639,8 @@ export const AIChatPanel: React.FC<Props> = ({
               streamCallbacks,
               controller.signal,
               appContext,
-              fallbackPrompt
+              fallbackPrompt,
+              sessionId
             );
           }
 
@@ -687,6 +690,7 @@ export const AIChatPanel: React.FC<Props> = ({
                 const retry = await aiService.runDocumentAgent({
                   messages: [...base, agentMessage, previous, nudge],
                   settings: requestSettings,
+                  sessionId,
                   appContext,
                   systemPromptExtra: strictPrompt,
                   tools,
@@ -713,7 +717,8 @@ export const AIChatPanel: React.FC<Props> = ({
                   fallbackPrompt +
                     (atsRequest
                       ? '\n\nВАЖНО: предыдущая попытка не изменила документ. Верни workspace-action document_apply с replace_document и текстом, переписанным под ATS (без таблиц и колонок), а не копию.'
-                      : '\n\nВАЖНО: предыдущая попытка не изменила документ. Верни workspace-action document_apply с операциями find_replace/replace_block, а не текст в чат.')
+                      : '\n\nВАЖНО: предыдущая попытка не изменила документ. Верни workspace-action document_apply с операциями find_replace/replace_block, а не текст в чат.'),
+                  sessionId
                 );
               } catch (error) {
                 if ((error as Error)?.name === 'AbortError') throw error;
@@ -773,7 +778,9 @@ export const AIChatPanel: React.FC<Props> = ({
             requestSettings,
             streamCallbacks,
             controller.signal,
-            appContext
+            appContext,
+            undefined,
+            sessionId
           );
         }
 
