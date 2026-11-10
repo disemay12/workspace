@@ -6,7 +6,7 @@
  * не трогается; перед обновлением он дополнительно копируется в backup.
  */
 import { app, BrowserWindow, ipcMain, net } from 'electron';
-import { spawn, execFile } from 'child_process';
+import { execFile } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -278,62 +278,58 @@ async function downloadUpdate(payload: {
   }
 }
 
-function installScriptPath(version: string): string {
-  return path.join(app.getPath('temp'), `WorkSpace-update-${version}.ps1`);
+/**
+ * Код выхода, которым приложение просит загрузчик применить обновление.
+ * Загрузчик WorkSpace.exe ждёт завершения приложения, копирует файлы и
+ * запускает новую версию — сам он в job-объекте Chromium не состоит.
+ */
+export const UPDATE_EXIT_CODE = 42;
+
+/** Маркер подготовленного обновления; его читает загрузчик. */
+function pendingUpdatePath(): string {
+  return path.join(app.getPath('userData'), 'pending-update.txt');
 }
 
-function buildInstallScript(): string {
-  return [
-    'param(',
-    '  [int]$ProcessId,',
-    '  [string]$Source,',
-    '  [string]$Target,',
-    '  [string]$Zip,',
-    '  [string]$UserData,',
-    '  [string]$Version',
-    ')',
-    "$ErrorActionPreference = 'Stop'",
-    '$log = Join-Path $env:TEMP "workspace-update.log"',
-    'try {',
-    '  Wait-Process -Id $ProcessId -Timeout 180 -ErrorAction SilentlyContinue',
-    '  Start-Sleep -Milliseconds 800',
-    '  if (Test-Path -LiteralPath $UserData) {',
-    '    $backup = Join-Path $UserData ("backup-before-" + $Version)',
-    '    New-Item -ItemType Directory -Force -Path $backup | Out-Null',
-    "    foreach ($name in @('ai-settings.json','secrets.local.ps1','gdrive.json','workspace-session.json')) {",
-    '      $file = Join-Path $UserData $name',
-    '      if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $backup -Force }',
-    '    }',
-    '  }',
-    "  $asar = Join-Path $Target 'app\\resources\\app.asar'",
-    '  if (Test-Path -LiteralPath $asar) {',
-    "    Copy-Item -LiteralPath $asar -Destination ($asar + '.bak-' + $Version) -Force",
-    '    Get-ChildItem -LiteralPath (Split-Path $asar -Parent) -Filter "app.asar.bak-*" |',
-    '      Sort-Object LastWriteTime -Descending | Select-Object -Skip 1 | Remove-Item -Force -ErrorAction SilentlyContinue',
-    '  }',
-    '  Copy-Item -Path (Join-Path $Source "*") -Destination $Target -Recurse -Force',
-    '  Add-Content -LiteralPath $log -Value ("[" + (Get-Date -Format o) + "] updated to " + $Version)',
-    '  Start-Process -FilePath (Join-Path $Target "WorkSpace.exe") -WorkingDirectory $Target',
-    '} catch {',
-    '  Add-Content -LiteralPath $log -Value ("[" + (Get-Date -Format o) + "] ERROR: " + $_)',
-    '  $launcher = Join-Path $Target "WorkSpace.exe"',
-    '  if (Test-Path -LiteralPath $launcher) { Start-Process -FilePath $launcher -WorkingDirectory $Target }',
-    '} finally {',
-    '  try { Remove-Item -LiteralPath $Source -Recurse -Force -ErrorAction SilentlyContinue } catch {}',
-    '  try { Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue } catch {}',
-    '  try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch {}',
-    '}',
-  ].join('\r\n');
+/** Новый загрузчик пишет launcher.json при каждом старте. */
+function launcherSupportsRestart(): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(app.getPath('userData'), 'launcher.json'), 'utf8');
+    return /"autoRestart"\s*:\s*true/.test(raw);
+  } catch {
+    return false;
+  }
 }
 
+export interface InstallResult {
+  success: boolean;
+  /** Обновление применит загрузчик и перезапустит приложение сам. */
+  autoRestart?: boolean;
+  /** Нужен ручной перезапуск: загрузчик старой версии не умеет применять маркер. */
+  deferred?: boolean;
+  error?: string;
+}
+
+/**
+ * Готовит обновление к установке.
+ *
+ * Electron держит resources/app.asar открытым, поэтому заменить его из
+ * работающего приложения нельзя (Windows: «файл занят другим процессом»).
+ * Приложение пишет маркер и завершается, а файлы копирует загрузчик —
+ * до старта приложения и после выхода с кодом UPDATE_EXIT_CODE.
+ *
+ * Процессы, запущенные приложением, живут в job-объекте Chromium с
+ * KILL_ON_JOB_CLOSE и не могут пережить выход — поэтому внешний скрипт
+ * установки здесь не используется.
+ */
 function installUpdate(payload: {
   zipPath: string;
   extractDir: string;
   version: string;
-}): { success: boolean; started?: boolean; error?: string } {
+}): InstallResult {
   if (!app.isPackaged) {
     return { success: false, error: 'Обновление доступно только в собранной версии' };
   }
+
   const appDir = path.dirname(process.execPath);
   const target = path.dirname(appDir);
   if (
@@ -360,41 +356,57 @@ function installUpdate(payload: {
     };
   }
 
-  const scriptPath = installScriptPath(payload.version);
+  // Загрузчик новой версии ждёт завершения приложения, поэтому его файл занят.
+  // Тогда новый загрузчик кладём рядом: на старте он переименует старый образ
+  // и встанет на его место.
+  let launcherStaged = false;
   try {
-    fs.writeFileSync(scriptPath, buildInstallScript(), 'utf8');
-    const child = spawn(
-      'powershell',
-      [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        scriptPath,
-        '-ProcessId',
-        String(process.pid),
-        '-Source',
-        payload.extractDir,
-        '-Target',
-        target,
-        '-Zip',
-        payload.zipPath,
-        '-UserData',
-        app.getPath('userData'),
-        '-Version',
-        payload.version,
-      ],
-      {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      }
-    );
-    child.unref();
-    return { success: true, started: true };
+    fs.copyFileSync(path.join(payload.extractDir, 'WorkSpace.exe'), path.join(target, 'WorkSpace.exe'));
   } catch (error) {
-    return { success: false, error: (error as Error).message };
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') {
+      return {
+        success: false,
+        error: `Не удалось обновить загрузчик WorkSpace.exe: ${(error as Error).message}`,
+      };
+    }
+    try {
+      fs.copyFileSync(
+        path.join(payload.extractDir, 'WorkSpace.exe'),
+        path.join(target, 'WorkSpace.exe.new')
+      );
+      launcherStaged = true;
+    } catch (stageError) {
+      return {
+        success: false,
+        error: `Не удалось подготовить загрузчик: ${(stageError as Error).message}`,
+      };
+    }
   }
+  void launcherStaged;
+
+  // Среду Electron заменить на ходу нельзя — кладём рядом, загрузчик поставит
+  // её на место перед следующим запуском.
+  try {
+    const newRuntime = path.join(payload.extractDir, 'app', 'WorkSpace.exe');
+    const currentRuntime = path.join(appDir, 'WorkSpace.exe');
+    if (fs.statSync(newRuntime).size !== fs.statSync(currentRuntime).size) {
+      fs.copyFileSync(newRuntime, `${currentRuntime}.new`);
+    }
+  } catch {
+    // Среда Electron обычно не меняется между версиями приложения.
+  }
+
+  const marker = pendingUpdatePath();
+  try {
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, `source=${payload.extractDir}\nversion=${payload.version}\n`, 'utf8');
+  } catch (error) {
+    return { success: false, error: `Не удалось записать маркер обновления: ${(error as Error).message}` };
+  }
+
+  const autoRestart = launcherSupportsRestart();
+  return { success: true, autoRestart, deferred: !autoRestart };
 }
 
 export function registerUpdater(options: { quitForUpdate: () => void }): void {
@@ -403,9 +415,10 @@ export function registerUpdater(options: { quitForUpdate: () => void }): void {
   ipcMain.handle('update:download', (_event, payload) => downloadUpdate(payload));
   ipcMain.handle('update:install', async (_event, payload) => {
     const result = installUpdate(payload);
-    if (result.success) {
-      // Даём IPC-ответу дойти до интерфейса и только потом закрываемся.
-      setTimeout(() => options.quitForUpdate(), 600);
+    // Закрываемся только тогда, когда загрузчик умеет применить обновление и
+    // поднять приложение: иначе окно просто исчезнет без обновления.
+    if (result.success && result.autoRestart) {
+      setTimeout(() => options.quitForUpdate(), 1200);
     }
     return result;
   });

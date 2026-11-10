@@ -430,7 +430,7 @@ const electronAPI = {
     zipPath: string;
     extractDir: string;
     version: string;
-  }): Promise<{ success: boolean; started?: boolean; error?: string }> =>
+  }): Promise<{ success: boolean; autoRestart?: boolean; deferred?: boolean; error?: string }> =>
     ipcRenderer.invoke('update:install', payload),
   onUpdateProgress: (
     cb: (data: {

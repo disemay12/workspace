@@ -145,7 +145,11 @@ export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) =>
       if (!installed?.success) {
         throw new Error(installed?.error || 'Не удалось запустить обновление');
       }
-      onNotify?.('WorkSpace обновляется и сейчас перезапустится. Ключи и настройки сохранены.');
+      onNotify?.(
+        installed.deferred
+          ? 'Архив скачан, но установить его может только новый загрузчик. Распакуйте архив релиза поверх папки программы один раз — дальше обновления будут ставиться сами.'
+          : 'WorkSpace обновляется: приложение перезапустится само. Ключи и настройки сохранены.'
+      );
     } catch (error) {
       setUpdateError((error as Error).message);
       setUpdateBusy(false);

@@ -369,7 +369,7 @@ declare global {
         zipPath: string;
         extractDir: string;
         version: string;
-      }) => Promise<{ success: boolean; started?: boolean; error?: string }>;
+      }) => Promise<{ success: boolean; autoRestart?: boolean; deferred?: boolean; error?: string }>;
       onUpdateProgress?: (cb: (data: UpdateProgress) => void) => () => void;
 
       /** Метаданные файла secrets.local.ps1 — без самого ключа. */

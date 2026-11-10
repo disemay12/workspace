@@ -15,7 +15,7 @@ import { docBufferToText } from './docText';
 import { setWatchRoot } from './watcher';
 import { registerTerminal } from './terminal';
 import { registerContextMenuIpc } from './contextMenu';
-import { registerUpdater } from './updater';
+import { registerUpdater, UPDATE_EXIT_CODE } from './updater';
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -88,6 +88,12 @@ let allowClose = false;
 
 /** Признак того, что диалог подтверждения уже отправлен в рендерер. */
 let closeRequestPending = false;
+
+/**
+ * Код выхода для загрузчика: он применяет скачанное обновление и запускает
+ * приложение заново. Обычный выход оставляет здесь null.
+ */
+let updateExitCode: number | null = null;
 
 /** Текущая корневая папка рабочего пространства (выбирается пользователем). */
 let workspaceRoot: string = '';
@@ -272,7 +278,12 @@ app.whenReady().then(() => {
   registerTerminal(() => mainWindow);
   registerUpdater({
     quitForUpdate: () => {
+      // Загрузчик WorkSpace.exe ждёт завершения с этим кодом, копирует
+      // подготовленное обновление и запускает приложение заново. Свои
+      // процессы пережить выход не могут: Chromium держит их в job-объекте
+      // с KILL_ON_JOB_CLOSE.
       allowClose = true;
+      updateExitCode = UPDATE_EXIT_CODE;
       app.quit();
     },
   });
@@ -304,6 +315,14 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+/**
+ * Код выхода загрузчику возвращаем через process.exit: app.quit() завершает
+ * процесс с нулём, и обновление не применилось бы.
+ */
+app.on('will-quit', () => {
+  if (updateExitCode !== null) process.exit(updateExitCode);
 });
 
 /* ============================================================
