@@ -141,17 +141,19 @@
     );
 
     const frame = () => {
-      warmX += (targetX - warmX) * 0.24;
-      warmY += (targetY - warmY) * 0.24;
-      coolX += (targetX - coolX) * 0.07;
-      coolY += (targetY - coolY) * 0.07;
-      shiftX += ((targetX / window.innerWidth - 0.5) * 18 - shiftX) * 0.1;
-      shiftY += ((targetY / window.innerHeight - 0.5) * 14 - shiftY) * 0.1;
+      warmX += (targetX - warmX) * 0.16;
+      warmY += (targetY - warmY) * 0.16;
+      coolX += (targetX - coolX) * 0.05;
+      coolY += (targetY - coolY) * 0.05;
+      shiftX += ((targetX / window.innerWidth - 0.5) * 12 - shiftX) * 0.08;
+      shiftY += ((targetY / window.innerHeight - 0.5) * 9 - shiftY) * 0.08;
 
       bg.style.setProperty('--mx', `${warmX.toFixed(1)}px`);
       bg.style.setProperty('--my', `${warmY.toFixed(1)}px`);
       bg.style.setProperty('--lx', `${coolX.toFixed(1)}px`);
       bg.style.setProperty('--ly', `${coolY.toFixed(1)}px`);
+      bg.style.setProperty('--hx', `${shiftX.toFixed(2)}px`);
+      bg.style.setProperty('--hy', `${shiftY.toFixed(2)}px`);
 
       if (parallax) {
         parallax.style.setProperty('--hx', `${shiftX.toFixed(2)}px`);

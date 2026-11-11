@@ -16,49 +16,81 @@
 /* токены страницы: то, что появилось поверх темы */
 :root {
   --color-scrim: oklch(9% 0.008 250 / 0.5);
-  --pool-warm: oklch(82% 0.15 80 / 0.10);
   --pool-cool: oklch(77% 0.12 245 / 0.07);
   --pool-size: 980px;
 }
 
-/* фон, который ходит за курсором */
+/* фон: точечная сетка, проявляющаяся у курсора, и медленная аура позади */
 .bg {
   position: fixed;
   inset: 0;
   z-index: 0;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 700ms var(--ease-out);
+  transition: opacity 600ms var(--ease-out);
   --mx: 50vw;
   --my: 30vh;
   --lx: 50vw;
   --ly: 30vh;
+  --hx: 0px;
+  --hy: 0px;
+  --dot: 22px;
+  --spot: 24rem;
 }
 
 .bg.is-live {
   opacity: 1;
 }
 
-.bg__warm,
+/* точки видны только вокруг курсора — фон «читается» движением, а не пятном */
+.bg::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  background-image: radial-gradient(circle at center, oklch(96% 0.004 250 / 0.18) 1px, transparent 1.3px);
+  background-size: var(--dot) var(--dot);
+  -webkit-mask-image: radial-gradient(
+    circle var(--spot) at var(--mx) var(--my),
+    #000 0%,
+    rgb(0 0 0 / 0.55) 42%,
+    transparent 72%
+  );
+  mask-image: radial-gradient(
+    circle var(--spot) at var(--mx) var(--my),
+    #000 0%,
+    rgb(0 0 0 / 0.55) 42%,
+    transparent 72%
+  );
+  will-change: mask-image;
+}
+
+/* редкая сетка, уезжающая за курсором с задержкой */
+.bg__warm {
+  position: absolute;
+  inset: -3rem;
+  background-image:
+    linear-gradient(to right, oklch(100% 0 0 / 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, oklch(100% 0 0 / 0.06) 1px, transparent 1px);
+  background-size: 5.5rem 5.5rem;
+  transform: translate3d(var(--hx), var(--hy), 0);
+  -webkit-mask-image: radial-gradient(ellipse 88% 72% at 50% 30%, #000 0%, rgb(0 0 0 / 0.5) 58%, transparent 84%);
+  mask-image: radial-gradient(ellipse 88% 72% at 50% 30%, #000 0%, rgb(0 0 0 / 0.5) 58%, transparent 84%);
+}
+
+/* очень мягкая аура, заметно отстающая от курсора */
 .bg__cool {
   position: absolute;
   top: 0;
   left: 0;
-  width: var(--pool-size);
-  height: var(--pool-size);
+  width: calc(var(--pool-size) * 1.6);
+  height: calc(var(--pool-size) * 1.6);
   border-radius: 50%;
-}
-
-.bg__warm {
-  background: radial-gradient(circle, var(--pool-warm), transparent 70%);
-  transform: translate3d(calc(var(--mx) - var(--pool-size) / 2), calc(var(--my) - var(--pool-size) / 2), 0);
-}
-
-.bg__cool {
-  width: calc(var(--pool-size) * 1.7);
-  height: calc(var(--pool-size) * 1.7);
   background: radial-gradient(circle, var(--pool-cool), transparent 68%);
-  transform: translate3d(calc(var(--lx) - var(--pool-size) * 0.85), calc(var(--ly) - var(--pool-size) * 0.85), 0);
+  transform: translate3d(
+    calc(var(--lx) - var(--pool-size) * 0.8),
+    calc(var(--ly) - var(--pool-size) * 0.8),
+    0
+  );
 }
 
 main,
@@ -1181,28 +1213,45 @@ html:not(.js) .form__foot .btn {
 /* ---------- подвал ---------- */
 
 .footer {
-  padding-block: var(--space-3xl) var(--space-lg);
+  padding-block: var(--space-lg);
+  border-top: var(--rule-hair) solid var(--color-rule);
 }
 
-.footer__mast {
+.footer__bar {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: var(--space-2xl);
+  gap: var(--space-sm) var(--space-lg);
   flex-wrap: wrap;
 }
 
+.footer__id {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
 .brand--footer {
-  font-size: var(--text-3xl);
-  font-weight: 500;
-  letter-spacing: var(--tracking-display);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  color: var(--color-ink);
+}
+
+.footer__note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-muted);
 }
 
 .footer__links {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-lg);
-  font-size: var(--text-sm);
+  align-items: center;
+  gap: var(--space-md);
+  font-size: var(--text-xs);
   color: var(--color-muted);
 }
 
@@ -1211,16 +1260,14 @@ html:not(.js) .form__foot .btn {
   transition: color var(--dur-short) var(--ease-out);
 }
 
-.footer__links a:hover {
-  color: var(--color-ink);
+.footer__links a + a::before {
+  content: "·";
+  margin-inline-end: var(--space-md);
+  color: var(--color-rule-2);
 }
 
-.footer__line {
-  margin-top: var(--space-xl);
-  padding-top: var(--space-sm);
-  border-top: var(--rule-hair) solid var(--color-rule);
-  font-size: var(--text-sm);
-  color: var(--color-muted);
+.footer__links a:hover {
+  color: var(--color-ink);
 }
 
 /* ---------- узкие экраны ---------- */
@@ -1391,11 +1438,11 @@ html:not(.js) .form__foot .btn {
   }
 
   .footer {
-    padding-top: var(--space-2xl);
+    padding-top: var(--space-lg);
   }
 
-  .footer__mast {
-    gap: var(--space-lg);
+  .footer__bar {
+    gap: var(--space-xs) var(--space-md);
   }
 }
 
@@ -1404,12 +1451,32 @@ html:not(.js) .form__foot .btn {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .hero {
+    min-height: 0;
+    padding-block: var(--space-xl) var(--space-2xl);
+  }
+
+  .hero h1 {
+    font-size: clamp(2rem, 7.5vw, 2.6rem);
+  }
+
   .hero__actions {
     gap: var(--space-md);
+    margin-top: var(--space-lg);
   }
 
   .hero__actions .btn {
     flex: 1 1 auto;
+  }
+
+  .section,
+  .section--close {
+    padding-block: var(--space-2xl);
+  }
+
+  .head {
+    margin-bottom: var(--space-lg);
+    gap: var(--space-md);
   }
 
   .facts > div {
@@ -1421,10 +1488,24 @@ html:not(.js) .form__foot .btn {
     font-size: var(--text-md);
   }
 
-  .footer__mast,
+  .footer {
+    padding-block: var(--space-md);
+  }
+
+  .footer__bar {
+    gap: var(--space-2xs) var(--space-md);
+  }
+
+  .footer__note {
+    font-size: 0.75rem;
+  }
+
   .footer__links {
-    flex-direction: column;
-    align-items: flex-start;
+    gap: var(--space-sm);
+  }
+
+  .footer__links a + a::before {
+    margin-inline-end: var(--space-sm);
   }
 }
 
