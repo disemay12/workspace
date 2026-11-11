@@ -367,8 +367,22 @@ code {
 
 .hero h1 {
   max-width: 22ch;
-  font-size: clamp(2.9rem, 5.4vw + 0.4rem, 5rem);
-  letter-spacing: -0.035em;
+  font-size: clamp(2.3rem, 3.5vw + 0.9rem, 4.05rem);
+  letter-spacing: -0.03em;
+}
+
+.hero__ai {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--color-accent) 70%, transparent);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.13em;
+  transition: color var(--dur-short) var(--ease-out), text-decoration-color var(--dur-short) var(--ease-out);
+}
+
+.hero__ai:hover {
+  color: var(--color-accent);
+  text-decoration-color: var(--color-accent);
 }
 
 .hero .lead {
@@ -911,6 +925,31 @@ html.is-locked {
   color: var(--color-ink-2);
 }
 
+/* ---------- автоматизация ассистентом ---------- */
+
+.automation {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-lg) var(--gap-columns);
+  margin-top: var(--space-2xl);
+}
+
+.automation__item {
+  padding-top: var(--space-sm);
+  border-top: var(--rule-hair) solid var(--color-rule-2);
+}
+
+.automation__item h3 {
+  font-size: var(--text-lg);
+  margin-bottom: var(--space-2xs);
+}
+
+.automation__item p {
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+  max-width: 34ch;
+}
+
 /* ---------- факты сеткой ---------- */
 
 .grid-facts {
@@ -1171,6 +1210,11 @@ html.is-locked {
     gap: var(--space-lg);
   }
 
+  .automation {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: var(--space-xl);
+  }
+
   .faq {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1207,6 +1251,10 @@ html.is-locked {
 }
 
 @media (max-width: 40rem) {
+  .automation {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .hero__actions {
     gap: var(--space-md);
   }

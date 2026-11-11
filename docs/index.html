@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkSpace, офис в одном окне</title>
-<meta name="description" content="Word, Excel, PowerPoint, Markdown и код в одном приложении для Windows. Microsoft Office не нужен, ключи остаются на компьютере.">
+<meta name="description" content="Word, Excel, PowerPoint, Markdown и код в одном приложении для Windows. AI-ассистент по вашему ключу сам вносит правки в документы, таблицы и слайды.">
 <meta name="theme-color" content="#0b0d12">
 <meta name="color-scheme" content="dark">
 <meta property="og:type" content="website">
-<meta property="og:title" content="WorkSpace, офис в одном окне без Microsoft Office">
-<meta property="og:description" content="Документы, таблицы, презентации, код и AI-ассистент по вашему ключу. Portable-сборка для Windows x64.">
+<meta property="og:title" content="WorkSpace: офис в одном окне и автоматизация через AI">
+<meta property="og:description" content="Документы, таблицы, презентации, код и AI-ассистент, который правит файлы инструментами редактора. Portable-сборка для Windows x64.">
 <meta property="og:image" content="https://disemay12.github.io/workspace/assets/og.jpg">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
@@ -56,7 +56,7 @@
   <section class="hero" aria-labelledby="hero-title">
     <div class="container">
       <div class="hero__text">
-        <h1 id="hero-title" class="rise">Офис в одном окне</h1>
+        <h1 id="hero-title" class="rise">Офис в одном окне с <a class="hero__ai" href="#ai" aria-label="AI-ассистент: перейти к разделу">AI</a></h1>
         <p class="lead rise" style="--i:1">Word, Excel, PowerPoint, Markdown и код. <span class="nowrap">Microsoft Office</span> не нужен.</p>
         <div class="hero__actions rise" style="--i:2">
           <a class="btn btn--primary btn--lg" href="https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip">Скачать для Windows</a>
@@ -105,7 +105,7 @@
         <ol class="steps__list">
           <li class="step is-active" data-shot="word">
             <h3>Документы Word</h3>
-            <p>OOXML-редактор: заголовки, таблицы, картинки, сноски и колонтитулы. Правка сохраняется в исходный пакет, а не пересобирает файл целиком.</p>
+            <p>Редактор Word: заголовки, таблицы, картинки, сноски и колонтитулы. Правка сохраняется в исходный пакет, а не пересобирает файл целиком.</p>
           </li>
           <li class="step" data-shot="excel">
             <h3>Таблицы</h3>
@@ -177,23 +177,44 @@
   </section>
 
   <section class="section section--split" id="ai" aria-labelledby="ai-title">
-    <div class="container split">
-      <div class="split__text reveal">
-        <h2 id="ai-title">Свой ключ, свой провайдер</h2>
-        <p>Ассистент работает по вашему API-ключу и с той моделью, которую вы выбрали.</p>
-        <ul class="chips" aria-label="Поддерживаемые провайдеры">
-          <li>OpenAI</li><li>Anthropic</li><li>Gemini</li><li>DeepSeek</li><li>OpenRouter</li><li>OpenCode</li><li>Ollama</li><li>OpenAI-совместимый</li>
-        </ul>
-        <dl class="facts">
-          <div><dt>Где живёт ключ</dt><dd>На этом компьютере, в зашифрованном виде</dd></div>
-          <div><dt>Что умеет</dt><dd>Правка текста, формулы, разбор логов, правка документов</dd></div>
-        </dl>
+    <div class="container">
+      <div class="split">
+        <div class="split__text reveal">
+          <h2 id="ai-title">Полная автоматизация через AI</h2>
+          <p>Ассистент не подсказывает, а вносит правки: читает структуру файла и вызывает инструменты редактора.</p>
+          <ul class="chips" aria-label="Инструменты ассистента">
+            <li>read_document</li><li>write_document</li><li>save_as</li><li>convert_file</li><li>md_read</li>
+          </ul>
+          <dl class="facts">
+            <div><dt>Где живёт ключ</dt><dd>На этом компьютере, в зашифрованном виде</dd></div>
+            <div><dt>Провайдеры</dt><dd>OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, OpenCode, Ollama, любой OpenAI-совместимый</dd></div>
+          </dl>
+        </div>
+        <figure class="shot shot--split reveal" style="--i:1" data-gallery>
+          <img src="assets/screens/settings.webp" alt="Настройки WorkSpace: выбор провайдера, поле ключа и базового URL" width="1600" height="1000" loading="lazy" decoding="async">
+          <button class="shot__open" type="button" aria-label="Открыть скриншот настроек крупно"></button>
+          <figcaption>Настройки провайдера: ключ уходит только выбранному сервису.</figcaption>
+        </figure>
       </div>
-      <figure class="shot shot--split reveal" style="--i:1" data-gallery>
-        <img src="assets/screens/settings.webp" alt="Настройки WorkSpace: выбор провайдера, поле ключа и базового URL" width="1600" height="1000" loading="lazy" decoding="async">
-        <button class="shot__open" type="button" aria-label="Открыть скриншот настроек крупно"></button>
-        <figcaption>Настройки провайдера: ключ уходит только выбранному сервису.</figcaption>
-      </figure>
+
+      <div class="automation">
+        <article class="automation__item reveal" style="--i:0">
+          <h3>Word и Markdown</h3>
+          <p>Заголовки, списки, таблицы, сноски, TOC и колонтитулы. Правка приходит блоком с diff и откатом одной кнопкой.</p>
+        </article>
+        <article class="automation__item reveal" style="--i:1">
+          <h3>Excel</h3>
+          <p>Ячейки, формулы и листы: ассистент пишет диапазон и показывает панель изменений с отменой.</p>
+        </article>
+        <article class="automation__item reveal" style="--i:2">
+          <h3>PowerPoint</h3>
+          <p>Слайды, порядок, заметки докладчика и макеты: правка идёт патчем XML без пересборки файла.</p>
+        </article>
+        <article class="automation__item reveal" style="--i:3">
+          <h3>Файлы и форматы</h3>
+          <p>Сохранить как, конвертировать <code>.md</code> в <code>.docx</code>, <code>.csv</code> в <code>.xlsx</code> и разобрать лог на ошибки.</p>
+        </article>
+      </div>
     </div>
   </section>
 
