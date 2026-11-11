@@ -34,14 +34,15 @@
 <a class="skip" href="#main">Перейти к содержимому</a>
 
 <header class="nav" id="nav">
-  <div class="container nav__row">
+  <div class="nav__row">
     <a class="brand" href="./" aria-label="WorkSpace, к началу страницы">
       <img src="assets/icon.png" alt="" width="26" height="26">
       <span>WorkSpace</span>
     </a>
     <nav class="nav__links" aria-label="Разделы страницы">
-      <a href="#screens">Экраны</a>
+      <a href="#editors">Редакторы</a>
       <a href="#formats">Форматы</a>
+      <a href="#ai">AI</a>
       <a href="#needs">Запуск</a>
       <a href="#questions">Вопросы</a>
     </nav>
@@ -52,77 +53,74 @@
 <main id="main">
 
   <section class="hero" aria-labelledby="hero-title">
-    <div class="container hero__grid">
+    <div class="container">
       <div class="hero__text">
-        <h1 id="hero-title" class="rise" style="--i:0">Офис в одном окне</h1>
+        <h1 id="hero-title" class="rise">Офис в одном окне</h1>
         <p class="lead rise" style="--i:1">Word, Excel, PowerPoint, Markdown и код. <span class="nowrap">Microsoft Office</span> не нужен.</p>
         <div class="hero__actions rise" style="--i:2">
           <a class="btn btn--primary btn--lg" href="https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip">Скачать для Windows</a>
-          <a class="link" href="https://github.com/disemay12/workspace/releases/latest">Все релизы</a>
+          <span class="hero__note">1.0.15, архив <span data-count="252" data-suffix=" МБ">252 МБ</span>, win-x64</span>
         </div>
       </div>
 
-      <figure class="shot shot--hero rise" style="--i:1">
+      <figure class="hero__shot rise" style="--i:3">
         <img src="assets/screens/word.webp" alt="Открытый DOCX в WorkSpace: дерево файлов, структура документа, полотно с заголовками и таблица показателей" width="1600" height="1000" fetchpriority="high" decoding="async">
       </figure>
     </div>
+  </section>
 
-    <div class="container hero__plate rise" style="--i:3">
-      <dl class="measure">
-        <div class="measure__item">
-          <dt>Версия</dt>
-          <dd class="measured">1.0.15</dd>
+  <section class="band band--statement" aria-labelledby="statement-title">
+    <div class="container">
+      <h2 id="statement-title" class="statement reveal">
+        <span class="statement__ink">Все редакторы уже внутри.</span>
+        <span class="statement__dim">Открывайте файл прямо с диска, сохраняйте в исходный формат.</span>
+      </h2>
+      <dl class="figures">
+        <div class="figure reveal" style="--i:0">
+          <dt>форматов без конвертации</dt>
+          <dd class="measured">7</dd>
         </div>
-        <div class="measure__item">
-          <dt>Архив</dt>
-          <dd class="measured"><span data-count="252" data-suffix=" МБ">252 МБ</span></dd>
+        <div class="figure reveal" style="--i:1">
+          <dt>языков в редакторе кода</dt>
+          <dd class="measured">100<span class="figure__plus">+</span></dd>
         </div>
-        <div class="measure__item">
-          <dt>Сборка</dt>
-          <dd class="measured">win-x64</dd>
+        <div class="figure reveal" style="--i:2">
+          <dt>установок перед запуском</dt>
+          <dd class="measured">0</dd>
         </div>
       </dl>
     </div>
   </section>
 
-  <section class="section" id="screens" aria-labelledby="screens-title">
-    <div class="container">
-      <div class="head reveal">
-        <h2 id="screens-title">Четыре редактора, один список файлов</h2>
-        <p class="head__line">Вкладки, несохранённые правки и переключение без потери курсора.</p>
+  <section class="section section--steps" id="editors" aria-labelledby="editors-title">
+    <div class="container steps">
+      <div class="steps__text">
+        <div class="head head--flush reveal">
+          <h2 id="editors-title">Три редактора, один список файлов</h2>
+          <p class="head__line">Вкладки, несохранённые правки и переключение без потери курсора.</p>
+        </div>
+
+        <ol class="steps__list">
+          <li class="step is-active" data-shot="word">
+            <h3>Документы Word</h3>
+            <p>OOXML-редактор: заголовки, таблицы, картинки, сноски и колонтитулы. Правка сохраняется в исходный пакет, а не пересобирает файл целиком.</p>
+          </li>
+          <li class="step" data-shot="excel">
+            <h3>Таблицы</h3>
+            <p>Формулы, несколько листов, объединение ячеек и экспорт в CSV. Заливка, шрифт и границы остаются нативными стилями Excel.</p>
+          </li>
+          <li class="step" data-shot="slides">
+            <h3>Презентации</h3>
+            <p>Слайды, заметки докладчика и изображения. Новый файл собирается из пустого шаблона, сохранение идёт патчем XML.</p>
+          </li>
+        </ol>
       </div>
 
-      <div class="bento">
-        <figure class="tile tile--wide reveal" style="--i:0">
-          <img src="assets/screens/excel.webp" alt="Таблица бюджета в WorkSpace: формулы отклонения, несколько листов, панель формул" width="1600" height="1000" loading="lazy" decoding="async">
-          <figcaption>
-            <h3>Таблицы</h3>
-            <p>Формулы, листы, объединение ячеек, экспорт в CSV.</p>
-          </figcaption>
-        </figure>
-
-        <figure class="tile reveal" style="--i:1">
-          <img src="assets/screens/markdown.webp" alt="Markdown-файл в разделённом режиме: исходник слева, готовый документ справа" width="1600" height="1000" loading="lazy" decoding="async">
-          <figcaption>
-            <h3>Markdown</h3>
-            <p>Код и результат рядом, слэш-команды, история правок.</p>
-          </figcaption>
-        </figure>
-
-        <figure class="tile reveal" style="--i:2">
-          <img src="assets/screens/code.webp" alt="Файл Python в редакторе кода: подсветка синтаксиса, номера строк, миникарта" width="1600" height="1000" loading="lazy" decoding="async">
-          <figcaption>
-            <h3>Код и логи</h3>
-            <p>Monaco, 100+ языков, поиск по RegEx, разбор логов.</p>
-          </figcaption>
-        </figure>
-
-        <figure class="tile tile--wide reveal" style="--i:3">
-          <img src="assets/screens/slides.webp" alt="Презентация в WorkSpace: список слайдов, полотно слайда и заметки докладчика" width="1600" height="1000" loading="lazy" decoding="async">
-          <figcaption>
-            <h3>Презентации</h3>
-            <p>Слайды, заметки докладчика и изображения; новый файл собирается из пустого шаблона.</p>
-          </figcaption>
+      <div class="steps__screen">
+        <figure class="shot shot--pin">
+          <img class="pin__img is-active" data-shot-img="word" src="assets/screens/word.webp" alt="Редактор Word в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
+          <img class="pin__img" data-shot-img="excel" src="assets/screens/excel.webp" alt="Редактор таблиц в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
+          <img class="pin__img" data-shot-img="slides" src="assets/screens/slides.webp" alt="Редактор презентаций в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
         </figure>
       </div>
     </div>
@@ -130,8 +128,9 @@
 
   <section class="section" id="formats" aria-labelledby="formats-title">
     <div class="container">
-      <div class="head head--tight reveal">
+      <div class="head reveal">
         <h2 id="formats-title">Что открывается без конвертации</h2>
+        <p class="head__line">Формат определяется по расширению: редактор подставляется сам.</p>
       </div>
       <table class="table">
         <caption class="visually-hidden">Поддерживаемые форматы файлов и редакторы</caption>
@@ -140,32 +139,32 @@
         </thead>
         <tbody>
           <tr class="reveal" style="--i:0">
-            <th scope="row"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 16h6"/></svg>Документы Word</th>
+            <th scope="row">Документы Word</th>
             <td class="measured">.docx .doc</td>
             <td>Заголовки, таблицы, картинки, сноски, колонтитулы</td>
           </tr>
           <tr class="reveal" style="--i:1">
-            <th scope="row"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M9 9v11M15 9v11"/></svg>Таблицы</th>
+            <th scope="row">Таблицы</th>
             <td class="measured">.xlsx .xls .csv .tsv</td>
             <td>Формулы, листы, форматирование, CSV</td>
           </tr>
           <tr class="reveal" style="--i:2">
-            <th scope="row"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 14v-3M12 14V9M16 14v-4"/></svg>Презентации</th>
+            <th scope="row">Презентации</th>
             <td class="measured">.pptx .ppt</td>
             <td>Слайды и заметки; <code>.ppt</code> не редактируется</td>
           </tr>
           <tr class="reveal" style="--i:3">
-            <th scope="row"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>Заметки</th>
+            <th scope="row">Заметки</th>
             <td class="measured">.md .markdown .note</td>
             <td>Код и предпросмотр, слэш-команды</td>
           </tr>
           <tr class="reveal" style="--i:4">
-            <th scope="row"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 7 5 12l4 5M15 7l4 5-4 5"/></svg>Код и конфиги</th>
-            <td class="measured">.json .yaml .py .ts .sql и <span data-count="100" data-suffix="+">100+</span></td>
+            <th scope="row">Код и конфиги</th>
+            <td class="measured">.json .yaml .py .ts .sql и 100+</td>
             <td>Подсветка, поиск по RegEx, миникарта</td>
           </tr>
           <tr class="reveal" style="--i:5">
-            <th scope="row"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 10h16M4 14h10M4 18h7"/></svg>Текст и логи</th>
+            <th scope="row">Текст и логи</th>
             <td class="measured">.txt .log .ini .bat</td>
             <td>UTF-8, UTF-16, Windows-1251, KOI8-R</td>
           </tr>
@@ -196,7 +195,7 @@
 
   <section class="section" id="needs" aria-labelledby="needs-title">
     <div class="container">
-      <div class="head head--tight reveal">
+      <div class="head reveal">
         <h2 id="needs-title">Запуск и обновление</h2>
         <p class="head__line">Распаковать, запустить, дальше версия ставится сама.</p>
       </div>
@@ -231,7 +230,7 @@
 
   <section class="section" id="questions" aria-labelledby="questions-title">
     <div class="container">
-      <div class="head head--tight reveal">
+      <div class="head reveal">
         <h2 id="questions-title">Частые вопросы</h2>
       </div>
       <div class="faq">
