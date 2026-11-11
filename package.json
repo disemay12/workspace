@@ -24,7 +24,8 @@
     "pack": "npm run build && electron-builder --win --x64 --dir",
     "dist": "npm run build && electron-builder --win --x64",
     "build:portable": "node scripts/build-portable.js",
-    "pack:release": "node scripts/pack-release.js"
+    "pack:release": "node scripts/pack-release.js",
+    "site:sync": "node scripts/sync-site-release.js"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
