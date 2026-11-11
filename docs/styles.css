@@ -222,7 +222,7 @@ code {
   width: min(1180px, calc(100% - var(--space-xl)));
   border: var(--rule-hair) solid var(--color-rule);
   border-radius: 999px;
-  background: color-mix(in oklab, var(--color-paper) 72%, transparent);
+  background: color-mix(in oklab, var(--color-paper) 86%, transparent);
   backdrop-filter: blur(16px) saturate(130%);
   transition: background-color var(--dur-short) var(--ease-out), border-color var(--dur-short) var(--ease-out);
 }
@@ -553,7 +553,7 @@ code {
 
 .shot--pin {
   position: relative;
-  height: min(58svh, 640px);
+  aspect-ratio: 16 / 10;
   background: var(--color-paper-3);
 }
 
@@ -912,7 +912,8 @@ code {
   }
 
   .shot--pin {
-    height: 42svh;
+    aspect-ratio: 16 / 10;
+    height: auto;
   }
 
   .step.is-active::before {
