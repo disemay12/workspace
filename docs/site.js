@@ -361,8 +361,23 @@
         setStatus('Отправлено. Спасибо, ответим на указанную почту.', 'ok');
       } catch (error) {
         const reason = String((error && error.message) || error);
+
+        // запасной путь: письмо с уже набранным текстом
+        const fallback = form.querySelector('.form__fallback a');
+        if (fallback) {
+          const bodyText = [
+            `Имя: ${form.elements.name.value.trim()}`,
+            `Почта: ${form.elements.email.value.trim()}`,
+            '',
+            form.elements.idea.value.trim(),
+          ].join('\n');
+          fallback.href = `mailto:getup322@gmail.com?subject=${encodeURIComponent(
+            'WorkSpace: предложение по улучшению'
+          )}&body=${encodeURIComponent(bodyText)}`;
+        }
+
         const text = /activation/i.test(reason)
-          ? 'Форма ждёт подтверждения владельца: письмо с кнопкой Activate уже ушло на getup322@gmail.com. Пока можно написать туда напрямую.'
+          ? 'Форма ждёт подтверждения владельца: письмо с кнопкой Activate уже ушло на getup322@gmail.com. Пока можно отправить письмо.'
           : `Не отправилось: ${reason.slice(0, 140)}. Напишите на getup322@gmail.com.`;
         setStatus(text, 'error');
       } finally {
