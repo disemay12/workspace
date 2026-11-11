@@ -264,7 +264,13 @@
   const form = document.getElementById('feedback-form');
 
   if (form) {
-    const endpoint = 'https://formsubmit.co/ajax/getup322@gmail.com';
+    // адрес получателя не держим в разметке открытым текстом
+    const address = String.fromCharCode(
+      103, 101, 116, 117, 112, 51, 50, 50, 64, 103, 109, 97, 105, 108, 46, 99, 111, 109
+    );
+    const endpoint = `https://formsubmit.co/ajax/${address}`;
+    form.setAttribute('action', `https://formsubmit.co/${address}`);
+
     const status = document.getElementById('f-status');
     const submit = form.querySelector('button[type="submit"]');
     const idea = form.elements.idea;
@@ -361,24 +367,9 @@
         setStatus('Отправлено. Спасибо, ответим на указанную почту.', 'ok');
       } catch (error) {
         const reason = String((error && error.message) || error);
-
-        // запасной путь: письмо с уже набранным текстом
-        const fallback = form.querySelector('.form__fallback a');
-        if (fallback) {
-          const bodyText = [
-            `Имя: ${form.elements.name.value.trim()}`,
-            `Почта: ${form.elements.email.value.trim()}`,
-            '',
-            form.elements.idea.value.trim(),
-          ].join('\n');
-          fallback.href = `mailto:getup322@gmail.com?subject=${encodeURIComponent(
-            'WorkSpace: предложение по улучшению'
-          )}&body=${encodeURIComponent(bodyText)}`;
-        }
-
         const text = /activation/i.test(reason)
-          ? 'Форма ждёт подтверждения владельца: письмо с кнопкой Activate уже ушло на getup322@gmail.com. Пока можно отправить письмо.'
-          : `Не отправилось: ${reason.slice(0, 140)}. Напишите на getup322@gmail.com.`;
+          ? 'Отправка пока не подтверждена владельцем формы. Попробуйте позже.'
+          : `Не получилось отправить: ${reason.slice(0, 140)}. Попробуйте ещё раз.`;
         setStatus(text, 'error');
       } finally {
         submit.disabled = false;
