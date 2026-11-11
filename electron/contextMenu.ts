@@ -44,6 +44,36 @@ export function isContextMenuInstalled(): boolean {
   }
 }
 
+/** Значение параметра ветки реестра (пустая строка, если его нет). */
+function regValue(key: string, name: string): string {
+  try {
+    const out = execFileSync('reg', ['query', key, '/v', name], {
+      encoding: 'utf8',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const match = new RegExp(`${name}\\s+REG_\\w+\\s+(.+)`).exec(out);
+    return match?.[1]?.trim().replace(/^"|"$/g, '') ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** Подпись пункта контекстного меню ((default) ветки). */
+function regDefault(key: string): string {
+  try {
+    const out = execFileSync('reg', ['query', key, '/ve'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const match = /REG_SZ\s+(.+)/.exec(out);
+    return match?.[1]?.trim() ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Регистрирует пункт «Редактировать в WorkSpace» для файлов и папок в HKCU.
  * Не требует прав администратора (UAC) и действует для текущего пользователя Windows.
@@ -84,13 +114,14 @@ export function installContextMenu(): { success: boolean; error?: string } {
     }
 
     // 1. Для всех файлов (*)
-    // Пункт: "Редактировать в WorkSpace"
+    // Подпись одна для всех типов: «Открыть в WorkSpace» — пункт открывает
+    // файл в приложении, а не «правит» его.
     execFileSync('reg', [
       'add',
       'HKCU\\Software\\Classes\\*\\shell\\WorkSpace',
       '/ve',
       '/d',
-      'Редактировать в WorkSpace',
+      'Открыть в WorkSpace',
       '/f',
     ], { windowsHide: true });
 
@@ -350,9 +381,27 @@ export function isDesktopShortcutPresent(): boolean {
  */
 export function registerContextMenuIpc(): void {
   ipcMain.handle('system:getContextMenuStatus', async () => {
+    const exePath = getAppExecutablePath();
+    const keys = {
+      files: 'HKCU\\Software\\Classes\\*\\shell\\WorkSpace',
+      exefile: 'HKCU\\Software\\Classes\\exefile\\shell\\WorkSpace',
+      directory: 'HKCU\\Software\\Classes\\Directory\\shell\\WorkSpace',
+      background: 'HKCU\\Software\\Classes\\Directory\\Background\\shell\\WorkSpace',
+    };
+    const labels: Record<string, string> = {};
+    for (const [id, key] of Object.entries(keys)) labels[id] = regDefault(key);
+    const icon = regValue(keys.files, 'Icon');
+    const command = regDefault(keys.files + '\\command');
     return {
       installed: isContextMenuInstalled(),
-      exePath: getAppExecutablePath(),
+      exePath,
+      labels,
+      command,
+      icon,
+      /** Ярлык указывает на текущий исполняемый файл. */
+      iconMatches: Boolean(
+        icon && path.resolve(icon).toLowerCase() === path.resolve(exePath).toLowerCase()
+      ),
     };
   });
 

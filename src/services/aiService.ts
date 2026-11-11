@@ -1,6 +1,7 @@
 import { AISettings, ChatMessage, ToolRun } from '../types';
 import { PROVIDER_PRESETS, normalizeSettings } from '../state/settings';
 import { uid } from '../lib/utils';
+import { profilePrompt } from '../lib/aiProfiles';
 import type { ToolDefinition } from './aiTools';
 
 /** Максимальный размер прикрепляемого к запросу файла (символов). */
@@ -35,12 +36,20 @@ export interface DocumentAgentOptions {
   maxIterations?: number;
 }
 
+/** Токены, потраченные на последний ответ модели. */
+export interface TokenUsageTotals {
+  promptTokens: number;
+  completionTokens: number;
+}
+
 export interface DocumentAgentResult {
   text: string;
   iterations: number;
   toolCalls: number;
   /** Что реально вызвано — уходит в историю диалога, чтобы следующий запрос знал о сделанном. */
   toolRuns: ToolRun[];
+  /** Расход токенов, если провайдер его прислал. */
+  usage?: TokenUsageTotals;
 }
 
 /**
@@ -360,11 +369,18 @@ export const WORKSPACE_OPERATOR_SYSTEM_PROMPT = `Ты — интеллектуа
 
 20) save_as — сохранить открытый документ под новым именем или в другом формате
 { "action": "save_as", "format": "xlsx", "path": "Отчёт.xlsx" }
-Форматы: xlsx, csv, tsv, docx, md, txt, html, pdf. Если открыт CSV и просят «сохрани в Excel» — вызывай save_as с "format": "xlsx". Не создавай новый файл вручную и не переписывай данные. Без path файл создаётся рядом с исходным. Существующий файл не перезаписывается: агент добавит « (2)».
+Форматы: xlsx, csv, tsv, docx, pptx, md, txt, html, pdf. Если открыт CSV и просят «сохрани в Excel» — вызывай save_as с "format": "xlsx". Не создавай новый файл вручную и не переписывай данные. Без path файл создаётся рядом с исходным. Существующий файл не перезаписывается: агент добавит « (2)».
 
 21) convert_file — конвертировать любой файл рабочей папки
 { "action": "convert_file", "source": "notes.md", "target": "notes.docx", "format": "docx" }
-Поддерживается: md/txt/html ↔ docx, csv/tsv ↔ xlsx, docx/xlsx/pptx → md/txt/html/pdf, Markdown-таблица → xlsx. Для PDF используй format "pdf".
+Поддерживается: md/txt/html ↔ docx, csv/tsv ↔ xlsx, docx/xlsx/pptx → md/txt/html/pdf, Markdown-таблица → xlsx, md/txt/html/docx → pptx (слайды по заголовкам). Для PDF используй format "pdf".
+
+22) create_presentation — собрать презентацию .pptx из текста
+{ "action": "create_presentation", "name": "Презентация.pptx", "title": "О проекте", "markdown": "# Титул\n\n- пункт\n\n## Второй слайд\n\nТекст" }
+Правила разметки: «# Заголовок» начинает слайд, «## Подраздел» — новый слайд при наличии содержимого, «---» — принудительный разрыв, списки и абзацы идут в тело, таблица Markdown становится таблицей PowerPoint, блоки кода (тройные обратные кавычки) — моноширинным текстом. Поле theme принимает пресет темы (office, ink, ocean, forest, sunset, mono…). Если просят «создай презентацию / слайды», используй именно это действие, а не Markdown-файл: отдельного шага сборки pptx из чата больше не нужно.
+
+23) image_edit — править изображения инструментами image_transform/image_batch (пакета действий для медиа нет: перечисляй операции в инструменте). Если инструмент недоступен, а пользователь просит «поверни/сожми/уменьши фото», попроси открыть изображение во вкладке — тогда редактор применит операции сам.
+24) video_edit — видео обрабатывается инструментами video_operate, video_extract_audio, video_frames, video_convert, video_gif; без открытой вкладки укажи path файла.
 
 РЕДАКТИРОВАНИЕ ДОКУМЕНТА
 - Имя открытого документа и права записи — в блоке «ОТКРЫТЫЙ ДОКУМЕНТ» ниже. Не додумывай права: если там написано «НЕТ», правку выполнять нельзя.
@@ -415,8 +431,12 @@ function composeSystemPrompt(
   extraSystem?: string
 ): string {
   const base = resolveSystemPrompt(settings.systemPrompt, appContext);
+  const profile = profilePrompt(settings.activeProfileId, settings.promptProfiles);
+  const withProfile = profile
+    ? `${base}\n\nДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА (профиль):\n${profile}`
+    : base;
   const extra = (extraSystem || '').trim();
-  return extra ? `${base}\n\n${extra}` : base;
+  return extra ? `${withProfile}\n\n${extra}` : withProfile;
 }
 
 /** Провайдер ответил, что tools/function calling не поддерживаются. */
@@ -823,6 +843,25 @@ export const aiService = {
     const toolRuns: ToolRun[] = [];
     let nudges = 0;
     let idleSteps = 0;
+    const usage: TokenUsageTotals = { promptTokens: 0, completionTokens: 0 };
+    /** usage приходит по-разному: OpenAI — usage, Anthropic — delta.usage, Gemini — usageMetadata. */
+    const addUsage = (payload: any): void => {
+      if (!payload) return;
+      const openai = payload.usage ?? payload.usageMetadata;
+      if (openai) {
+        const prompt = Number(openai.prompt_tokens ?? openai.promptTokenCount ?? 0);
+        const completion = Number(openai.completion_tokens ?? openai.candidatesTokenCount ?? 0);
+        if (prompt > 0) usage.promptTokens = prompt;
+        if (completion > 0) usage.completionTokens = completion;
+      }
+      const anthropic = payload.delta?.usage ?? (payload.type === 'message_delta' ? payload.usage : null);
+      if (anthropic) {
+        const prompt = Number(anthropic.input_tokens ?? 0);
+        const completion = Number(anthropic.output_tokens ?? 0);
+        if (prompt > 0) usage.promptTokens = prompt;
+        if (completion > 0) usage.completionTokens += completion;
+      }
+    };
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       const textParts: string[] = [];
@@ -840,8 +879,16 @@ export const aiService = {
             temperature: effective.temperature,
             max_tokens: Math.max(effective.maxTokens, 4096),
             stream: true,
+            // usage в потоке присылают только OpenAI-совместимые шлюзы;
+            // локальные (Ollama и подобные) на неизвестное поле отвечают 400.
+            ...(['openai', 'openrouter', 'deepseek', 'groq', 'mistral', 'xai'].includes(
+              effective.provider
+            )
+              ? { stream_options: { include_usage: true } }
+              : {}),
           },
           (payload) => {
+            addUsage(payload);
             const choice = payload?.choices?.[0];
             if (!choice) return;
 
@@ -892,7 +939,7 @@ export const aiService = {
           apiMessages.push({ role: 'user', content: AGENT_CONTINUE_NUDGE });
           continue;
         }
-        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount, toolRuns };
+        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount, toolRuns, usage: { ...usage } };
       }
 
       const toolCalls = [...calls.entries()]
@@ -905,7 +952,7 @@ export const aiService = {
         .filter((call) => call.function.name);
 
       if (toolCalls.length === 0) {
-        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount, toolRuns };
+        return { text: lastText, iterations: iteration + 1, toolCalls: toolCallsCount, toolRuns, usage: { ...usage } };
       }
 
       apiMessages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
@@ -969,6 +1016,7 @@ export const aiService = {
           iterations: iteration + 1,
           toolCalls: toolCallsCount,
           toolRuns,
+          usage: { ...usage },
         };
       }
     }
@@ -982,6 +1030,7 @@ export const aiService = {
         `Напишите «продолжай», и я продолжу с этого места.${tail}`,
       iterations: maxIterations,
       toolCalls: toolCallsCount,
+      usage: { ...usage },
       toolRuns,
     };
   },

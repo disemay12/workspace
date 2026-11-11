@@ -79,3 +79,7 @@ graphify-out/
 # ---------- Артефакты сайта ----------
 .hallmark/
 docs/.hallmark/
+
+# локальные проверки и разовые артефакты
+.verify/
+pw-triage/

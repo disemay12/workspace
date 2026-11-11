@@ -18,14 +18,17 @@ import {
   Download,
   Info,
   Monitor,
+  Palette,
 } from 'lucide-react';
 import { AISettings, AIProvider } from '../../types';
 import { PROVIDER_PRESETS, PROVIDER_ORDER, SYSTEM_PRESETS, keyVault } from '../../state/settings';
 import { aiService } from '../../services/aiService';
 import { cn } from '../../lib/utils';
 import { Button, Field, Input, Modal, Select, Textarea } from '../ui';
+import { DEFAULT_PROFILES, mergeProfiles, nextProfileId } from '../../lib/aiProfiles';
 import { IntegrationsSettings } from './IntegrationsSettings';
 import { SystemSettings } from './SystemSettings';
+import { AppearanceSettings } from './AppearanceSettings';
 
 interface Props {
   open: boolean;
@@ -42,7 +45,7 @@ interface Props {
   onBeforeUpdate?: () => Promise<boolean>;
 }
 
-type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system';
+type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system' | 'appearance';
 
 interface SecretsInfo {
   found: boolean;
@@ -259,6 +262,7 @@ export const SettingsModal: React.FC<Props> = ({
     { id: 'keys', label: 'Хранилище', icon: <ShieldCheck size={13} /> },
     { id: 'integrations', label: 'Сервисы', icon: <Cloud size={13} /> },
     { id: 'system', label: 'Система', icon: <Monitor size={13} /> },
+    { id: 'appearance', label: 'Вид', icon: <Palette size={13} /> },
   ];
 
   return (
@@ -287,13 +291,13 @@ export const SettingsModal: React.FC<Props> = ({
       }
     >
       {/* Вкладки */}
-      <div className="mb-4 flex items-center gap-1 border-b border-ws pb-2">
+      <div className="mb-4 flex flex-wrap items-center gap-1 border-b border-ws pb-2">
         {tabs.map((t) => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
             className={cn(
-              'flex items-center gap-1.5 rounded px-2.5 py-1.5 text-xs font-medium transition-colors',
+              'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1.5 text-xs font-medium transition-colors',
               tab === t.id
                 ? 'bg-ws-accent-soft text-ws-accent'
                 : 'text-ws-muted hover:bg-ws-hover hover:text-ws'
@@ -678,6 +682,78 @@ export const SettingsModal: React.FC<Props> = ({
               placeholder="Ты — профессиональный ассистент…"
             />
           </Field>
+
+          <Field
+            label="Профиль промпта"
+            hint="Дополнительные правила поверх системного промпта — можно держать несколько под задачи."
+          >
+            {(() => {
+              const profiles = mergeProfiles(settings.promptProfiles);
+              const activeId = settings.activeProfileId || profiles[0]?.id || 'general';
+              const active = profiles.find((profile) => profile.id === activeId) ?? profiles[0];
+              const updateProfile = (patch: { label?: string; prompt?: string }) => {
+                onUpdateSettings({
+                  promptProfiles: profiles.map((profile) =>
+                    profile.id === active.id ? { ...profile, ...patch } : profile
+                  ),
+                });
+              };
+              return (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Select
+                      value={active.id}
+                      onChange={(event) => onUpdateSettings({ activeProfileId: event.target.value })}
+                    >
+                      {profiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.label}
+                        </option>
+                      ))}
+                    </Select>
+                    <Button
+                      onClick={() => {
+                        const id = nextProfileId(profiles);
+                        onUpdateSettings({
+                          promptProfiles: [...profiles, { id, label: 'Свой профиль', prompt: '' }],
+                          activeProfileId: id,
+                        });
+                      }}
+                    >
+                      Новый
+                    </Button>
+                    {!DEFAULT_PROFILES.some((profile) => profile.id === active.id) && (
+                      <Button
+                        onClick={() => {
+                          onUpdateSettings({
+                            promptProfiles: profiles.filter((profile) => profile.id !== active.id),
+                            activeProfileId: 'general',
+                          });
+                        }}
+                      >
+                        Удалить
+                      </Button>
+                    )}
+                  </div>
+                  <Input
+                    value={active.label}
+                    onChange={(event) => updateProfile({ label: event.target.value })}
+                    placeholder="Название профиля"
+                  />
+                  <Textarea
+                    value={active.prompt}
+                    onChange={(event) => updateProfile({ prompt: event.target.value })}
+                    rows={5}
+                    placeholder="Например: пиши короткими абзацами, без канцелярита; в правках сохраняй авторский голос."
+                  />
+                  <p className="text-[10px] text-ws-faint">
+                    Активный профиль добавляет свои правила к системному промпту. «Обычный помощник» ничего
+                    не добавляет.
+                  </p>
+                </div>
+              );
+            })()}
+          </Field>
         </div>
       )}
 
@@ -729,6 +805,7 @@ export const SettingsModal: React.FC<Props> = ({
 
       {tab === 'integrations' && <IntegrationsSettings onNotify={onNotify || (() => undefined)} />}
       {tab === 'system' && <SystemSettings onNotify={onNotify} onBeforeUpdate={onBeforeUpdate} />}
+      {tab === 'appearance' && <AppearanceSettings onNotify={onNotify} />}
     </Modal>
   );
 };

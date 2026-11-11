@@ -301,6 +301,58 @@ export const fileSystemService = {
     return { base64: res.base64, size: res.size ?? 0 };
   },
 
+  /** Размер файла и время изменения — без чтения содержимого. */
+  async statFile(
+    filePath: string
+  ): Promise<{ size: number; mtimeMs: number; isDirectory: boolean }> {
+    if (!this.isElectron()) throw new Error('Файловая система доступна только в настольном приложении');
+    const res = await window.electronAPI!.statFile(filePath);
+    if (!res.success) throw new Error(res.error || 'Не удалось получить сведения о файле');
+    return { size: res.size ?? 0, mtimeMs: res.mtimeMs ?? 0, isDirectory: Boolean(res.isDirectory) };
+  },
+
+  /** Байты файла: используется воркером разбора таблиц для больших книг. */
+  async readBinary(filePath: string): Promise<ArrayBuffer> {
+    if (!this.isElectron()) throw new Error('Чтение файлов доступно только в настольном приложении');
+    const res = await window.electronAPI!.readBinary(filePath);
+    if (!res.success || !res.bytes) throw new Error(res.error || 'Ошибка чтения файла');
+    return res.bytes;
+  },
+
+  /** Кусок файла для потокового разбора CSV. */
+  async readBinarySlice(
+    filePath: string,
+    offset: number,
+    length: number
+  ): Promise<{ bytes: ArrayBuffer; size: number; total: number; eof: boolean }> {
+    if (!this.isElectron()) throw new Error('Чтение файлов доступно только в настольном приложении');
+    const res = await window.electronAPI!.readBinarySlice(filePath, offset, length);
+    if (!res.success || !res.bytes) throw new Error(res.error || 'Ошибка чтения фрагмента файла');
+    return {
+      bytes: res.bytes,
+      size: res.size ?? 0,
+      total: res.total ?? 0,
+      eof: Boolean(res.eof),
+    };
+  },
+
+  /** Запись байтов с атомарной заменой файла. */
+  async writeBinary(filePath: string, bytes: ArrayBuffer | Uint8Array): Promise<void> {
+    if (!this.isElectron()) throw new Error('Запись файлов доступна только в настольном приложении');
+    const res = await window.electronAPI!.writeBinary(filePath, bytes);
+    if (!res.success) throw new Error(res.error || 'Ошибка записи файла');
+  },
+
+  /** Кодировка текстового файла по BOM/валидности UTF-8. */
+  async guessEncoding(
+    filePath: string
+  ): Promise<{ encoding: string; hasBom: boolean }> {
+    if (!this.isElectron()) return { encoding: 'utf-8', hasBom: false };
+    const res = await window.electronAPI!.guessEncoding(filePath);
+    if (!res.success || !res.encoding) return { encoding: 'utf-8', hasBom: false };
+    return { encoding: res.encoding, hasBom: Boolean(res.hasBom) };
+  },
+
   /** Открывает файл средствами Windows: EXE запускается, PDF — в системном просмотрщике. */
   async openExternally(filePath: string): Promise<void> {
     if (!this.isElectron()) throw new Error('Открытие доступно только в настольном приложении');
@@ -336,6 +388,12 @@ export const fileSystemService = {
     if (!this.isElectron()) throw new Error('Переименование доступно только в настольном приложении');
     const res = await window.electronAPI!.renamePath(oldPath, newPath);
     if (!res.success) throw new Error(res.error || 'Ошибка переименования');
+  },
+
+  async copyPath(source: string, target: string): Promise<void> {
+    if (!this.isElectron()) throw new Error('Копирование доступно только в настольном приложении');
+    const res = await window.electronAPI!.copyPath(source, target);
+    if (!res.success) throw new Error(res.error || 'Ошибка копирования');
   },
 
   async searchWorkspace(

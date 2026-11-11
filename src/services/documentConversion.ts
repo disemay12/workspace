@@ -14,6 +14,7 @@ import { htmlToPlainText, pptxText } from '../lib/documentText';
 import { extractLegacyDocText, plainTextToHtml } from '../lib/legacyDoc';
 import { detectMarkdownTables } from './aiActions';
 import { applyAutoFitColumns } from '../lib/xlsxColumns';
+import { markdownToPptxBase64 } from '../lib/pptxBuilder';
 import { fileSystemService, getFileType } from './fileSystemService';
 
 export type ConversionFormat = 'xlsx' | 'csv' | 'tsv' | 'docx' | 'md' | 'txt' | 'html' | 'pdf' | 'pptx';
@@ -131,14 +132,14 @@ export function guessFormat(path: string): ConversionFormat | null {
 /** Форматы, в которые можно сохранить открытый файл. */
 export function formatsFor(source: { extension: string; type: FileType }): ConversionFormat[] {
   const ext = source.extension.toLowerCase();
-  if (source.type === 'word') return ['docx', 'md', 'txt', 'html', 'pdf'];
+  if (source.type === 'word') return ['docx', 'md', 'txt', 'html', 'pdf', 'pptx'];
   if (source.type === 'excel') {
     if (ext === 'csv' || ext === 'tsv') return ['csv', 'tsv', 'xlsx', 'md', 'html', 'pdf'];
     return ['xlsx', 'csv', 'tsv', 'md', 'html', 'pdf'];
   }
-  if (source.type === 'markdown') return ['md', 'docx', 'txt', 'html', 'pdf', 'xlsx'];
+  if (source.type === 'markdown') return ['md', 'docx', 'txt', 'html', 'pdf', 'xlsx', 'pptx'];
   if (source.type === 'richtext' || source.type === 'text' || source.type === 'code') {
-    return ['txt', 'md', 'docx', 'html', 'pdf'];
+    return ['txt', 'md', 'docx', 'html', 'pdf', 'pptx'];
   }
   if (source.type === 'powerpoint') return ['pptx', 'md', 'txt', 'docx', 'html', 'pdf'];
   return [];
@@ -523,7 +524,18 @@ export async function convertDocument(
     if (source.type === 'powerpoint' && source.extension === 'pptx') {
       return { kind: 'data', content: source.content, encoding: 'base64', extension: 'pptx' };
     }
-    throw new Error('PowerPoint можно сохранить из открытой презентации, но не собрать из другого формата');
+    // Сборка презентации из текста: каждый `#`-заголовок — новый слайд,
+    // списки и таблицы переносятся в тело слайда.
+    const markdown = await markdownFromSource(source);
+    const title = source.name.replace(/\.[^./\\]+$/, '') || 'Презентация';
+    const content = await markdownToPptxBase64(markdown, { title });
+    return {
+      kind: 'data',
+      content,
+      encoding: 'base64',
+      extension: 'pptx',
+      note: 'Слайды собраны по заголовкам: «# Заголовок» начинает новый слайд, «---» — принудительный разрыв',
+    };
   }
 
   throw new Error(`Конвертация в ${format} не поддерживается`);

@@ -1,9 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Clapperboard, Gauge, Scissors, Trash2, Upload, VolumeX } from 'lucide-react';
+import { Clapperboard, Gauge, Maximize2, Scissors, Trash2, Upload, VolumeX, ZoomIn, ZoomOut } from 'lucide-react';
 import { OpenTab } from '../../types';
 import { Button, Field, Input, Select, Textarea } from '../ui';
-import { gdriveStatus } from '../../services/shareService';
+import { googleFullStatus } from '../../services/shareService';
 import { fileSystemService } from '../../services/fileSystemService';
+import { registerVideoController } from '../../services/videoBridge';
 
 interface Props {
   tab: OpenTab;
@@ -74,6 +75,12 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
   const [busy, setBusy] = useState('');
   const [savedCopy, setSavedCopy] = useState('');
   const [progress, setProgress] = useState(0);
+  const [codePercent, setCodePercent] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [exportZoom, setExportZoom] = useState(1);
+  const panRef = React.useRef<{ x: number; y: number; startClientX: number; startClientY: number } | null>(null);
+  const stageRef = React.useRef<HTMLDivElement | null>(null);
   const [publishOpen, setPublishOpen] = useState(false);
   const [connected, setConnected] = useState(false);
   const [categories, setCategories] = useState(FALLBACK_CATEGORIES);
@@ -118,6 +125,56 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = previewRate;
   }, [previewRate]);
+
+  /* ---------------- Приближение и отдаление превью ---------------- */
+
+  useEffect(() => {
+    const element = stageRef.current;
+    if (!element) return;
+    const onWheel = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      setZoom((value) => {
+        const next = Math.min(8, Math.max(1, value - event.deltaY * 0.0015));
+        if (next <= 1) setPan({ x: 0, y: 0 });
+        return next;
+      });
+    };
+    element.addEventListener('wheel', onWheel, { passive: false });
+    return () => element.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const movePan = (event: React.PointerEvent) => {
+    const state = panRef.current;
+    if (!state) return;
+    setPan({
+      x: state.x + (event.clientX - state.startClientX),
+      y: state.y + (event.clientY - state.startClientY),
+    });
+  };
+
+  const startPan = (event: React.PointerEvent) => {
+    if (zoom <= 1) return;
+    panRef.current = { x: pan.x, y: pan.y, startClientX: event.clientX, startClientY: event.clientY };
+    (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+  };
+
+  const endPan = () => {
+    panRef.current = null;
+  };
+
+  const resetZoom = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  const zoomBy = (delta: number) => {
+    setZoom((value) => {
+      const next = Math.min(8, Math.max(1, Math.round((value + delta) * 10) / 10));
+      if (next <= 1) setPan({ x: 0, y: 0 });
+      return next;
+    });
+  };
 
   const addSpeedSegment = () => {
     const duration = probe?.duration || 0;
@@ -176,6 +233,10 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
     }
 
     setBusy('ffmpeg');
+    setCodePercent(0);
+    const offProgress = window.electronAPI?.onVideoProgress?.((data) => {
+      if (data.filePath === tab.path) setCodePercent(data.percent);
+    });
     try {
       const result = await window.electronAPI!.videoEdit({
         filePath: tab.path,
@@ -188,6 +249,7 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
         duration: probe?.duration || 0,
         hasAudio: probe?.hasAudio ?? true,
         outputPath,
+        zoom: exportZoom > 1 ? { scale: exportZoom } : undefined,
       });
       if (!result.success || !result.outputPath) throw new Error(result.error || 'Не удалось обработать видео');
       setSavedCopy(result.outputPath);
@@ -196,9 +258,70 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
     } catch (err) {
       onNotify((err as Error).message);
     } finally {
+      offProgress?.();
+      setCodePercent(0);
       setBusy('');
     }
   };
+
+  /* AI-мост: инструменты применяют план к открытой вкладке. */
+  useEffect(() => {
+    return registerVideoController({
+      tabId: tab.id,
+      getState: () => ({
+        filePath: tab.path,
+        duration: probe?.duration ?? 0,
+        width: probe?.width ?? 0,
+        height: probe?.height ?? 0,
+        hasAudio: probe?.hasAudio ?? true,
+        start,
+        end,
+        speed,
+        segments: speedSegments,
+        stripAudio,
+        compress,
+        exportZoom,
+      }),
+      applyPlan: async (plan) => {
+        try {
+          const stem = tab.path.replace(/\.[^./\\]+$/, '');
+          const outputPath = plan.outputPath || `${stem}-edit.mp4`;
+          const nextStart = plan.start ?? start;
+          const nextEnd = plan.end ?? end;
+          const zoomScale = plan.zoom?.scale ?? exportZoom;
+          const result = await window.electronAPI!.videoEdit({
+            filePath: tab.path,
+            start: nextStart,
+            end: nextEnd > nextStart ? nextEnd : undefined,
+            stripAudio: plan.stripAudio ?? stripAudio,
+            compress: plan.compress ?? compress,
+            speed: plan.speed ?? speed,
+            speedSegments: plan.speedSegments ?? speedSegments,
+            duration: probe?.duration || 0,
+            hasAudio: probe?.hasAudio ?? true,
+            outputPath,
+            zoom:
+              zoomScale > 1
+                ? { scale: zoomScale, x: plan.zoom?.x, y: plan.zoom?.y }
+                : undefined,
+          });
+          if (!result.success || !result.outputPath) {
+            throw new Error(result.error || 'Не удалось обработать видео');
+          }
+          onNotify('Готово: ' + result.outputPath);
+          onOpenResult(result.outputPath);
+          return {
+            ok: true,
+            message: `Готово: ${result.outputPath.split(/[\\/]/).pop() ?? result.outputPath}`,
+            outputPath: result.outputPath,
+          };
+        } catch (err) {
+          return { ok: false, message: (err as Error).message };
+        }
+      },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab.id, tab.path, probe, start, end, speed, speedSegments, stripAudio, compress, exportZoom]);
 
   const deleteOriginal = async () => {
     const name = tab.name;
@@ -219,9 +342,10 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
 
   const openPublish = async () => {
     setPublishOpen(true);
-    const status = await gdriveStatus();
-    setConnected(status.connected);
-    if (!status.connected) return;
+    // Публикация требует согласия именно на YouTube, а не на Диск.
+    const status = await googleFullStatus();
+    setConnected(status.youtube.connected);
+    if (!status.youtube.connected) return;
     const [cats, lists] = await Promise.all([
       window.electronAPI!.youtubeCategories(),
       window.electronAPI!.youtubePlaylists(),
@@ -260,8 +384,54 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-black text-ws">
-      <div className="min-h-0 flex-1 bg-black">
-        <video ref={videoRef} src={src} controls className="h-full w-full bg-black" />
+      <div
+        ref={stageRef}
+        className="relative min-h-0 flex-1 overflow-hidden bg-black"
+        onPointerDown={startPan}
+        onPointerMove={movePan}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
+        onDoubleClick={resetZoom}
+        style={{ cursor: zoom > 1 ? 'grab' : 'default' }}
+      >
+        <video
+          ref={videoRef}
+          src={src}
+          controls
+          className="h-full w-full bg-black object-contain"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: 'center center',
+          }}
+        />
+        <div className="absolute right-3 top-3 flex items-center gap-1.5 rounded bg-black/60 px-2 py-1 text-[11px] text-white/80">
+          <button onClick={() => zoomBy(-0.25)} title="Отдалить (Ctrl+колесо)">
+            <ZoomOut size={12} />
+          </button>
+          <span className="w-10 text-center font-mono">{Math.round(zoom * 100)}%</span>
+          <button onClick={() => zoomBy(0.25)} title="Приблизить (Ctrl+колесо)">
+            <ZoomIn size={12} />
+          </button>
+          <button onClick={resetZoom} title="По размеру (двойной клик)">
+            <Maximize2 size={12} />
+          </button>
+        </div>
+        {busy === 'ffmpeg' && (
+          <div className="absolute inset-x-0 bottom-0 space-y-1 bg-black/70 p-2">
+            <div className="flex items-center justify-between text-[10px] text-white/70">
+              <span>Обработка ffmpeg: {codePercent}%</span>
+              <button
+                onClick={() => void window.electronAPI?.videoCancel?.(tab.path)}
+                className="rounded bg-white/15 px-2 py-0.5 hover:bg-white/25"
+              >
+                Отменить
+              </button>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded bg-white/20">
+              <div className="h-full bg-emerald-400 transition-[width]" style={{ width: codePercent + '%' }} />
+            </div>
+          </div>
+        )}
       </div>
       <div className="max-h-[46%] space-y-3 overflow-auto border-t border-ws bg-ws-surface p-3">
         <div className="flex flex-wrap items-center gap-3 text-[11px] text-ws-muted">
@@ -392,6 +562,21 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
           <button onClick={() => setCompress((v) => !v)} className={'flex items-center gap-1 rounded border px-2 py-1 text-[11px] ' + (compress ? 'border-ws-accent bg-ws-accent-soft text-ws-accent' : 'border-ws text-ws-muted')}>
             <Gauge size={12} /> Сжать (CRF 20)
           </button>
+          <label className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-[11px] text-ws-muted">
+            Масштаб кадра:
+            <select
+              value={exportZoom}
+              onChange={(e) => setExportZoom(Number(e.target.value))}
+              title="Приближение при экспорте: кадр увеличивается и обрезается по центру"
+              className="rounded border border-ws bg-ws-editor px-1 py-0.5 text-[11px] text-ws"
+            >
+              {[1, 1.25, 1.5, 2].map((value) => (
+                <option key={value} value={value}>
+                  {Math.round(value * 100)}%
+                </option>
+              ))}
+            </select>
+          </label>
           <Button variant="primary" disabled={!ffmpeg || Boolean(busy)} onClick={() => void apply()}>
             <Scissors size={12} /> {busy === 'ffmpeg' ? 'Обработка…' : 'Сохранить копию'}
           </Button>
@@ -418,7 +603,11 @@ export const VideoEditor: React.FC<Props> = ({ tab, onNotify, onOpenResult, onCl
         {publishOpen && (
           <div className="space-y-3 rounded-lg border border-ws bg-ws-elevated p-3">
             {!connected ? (
-              <p className="text-xs text-ws-warning">Сначала подключите Google в проводнике. Для YouTube при следующем входе нужно согласие на загрузку видео — нажмите «Подключить» ещё раз.</p>
+              <p className="text-xs text-ws-warning">
+                YouTube подключается отдельным согласием: Настройки → Сервисы → «Подключить
+                YouTube». Пока приложение не верифицировано, аккаунт должен быть добавлен в Test
+                users проекта Google Cloud, а у аккаунта должен существовать канал YouTube.
+              </p>
             ) : (
               <>
                 <Field label="Название"><Input value={meta.title} maxLength={100} onChange={(e) => setMeta({ ...meta, title: e.target.value })} /></Field>

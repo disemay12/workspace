@@ -18,9 +18,21 @@ import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment, FileType } 
 import { fileSystemService, getFileType } from './services/fileSystemService';
 import { getSheetController } from './services/sheetBridge';
 import { getPptxController } from './services/pptBridge';
+import { fontPresetById } from './lib/pptxThemes';
+import { resolvePasteName } from './lib/explorerOps';
+import { applyImageOps, normalizeImageOps } from './lib/imageOps';
+import { markdownToPptxBase64 } from './lib/pptxBuilder';
+import { getImageController } from './services/imageBridge';
+import { getVideoController } from './services/videoBridge';
 import { useWorkspace } from './state/workspace';
 import { useAISettings, useChatSessions } from './state/settings';
 import { useTheme } from './hooks/useTheme';
+import { applyAppearance } from './lib/appearance';
+import { layoutFingerprint, normalizeLayout, MAX_RESTORED_TABS } from './lib/layout';
+import { playChimeFor } from './services/chime';
+import { listSnapshots, pruneSnapshots, writeSnapshot } from './services/autosave';
+import { copyDiagnosticsReport, installDiagnosticsHooks } from './services/diagnostics';
+import type { NotificationKind } from './lib/notifyRules';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { cn, baseName, dirName, extName, joinPath, uid } from './lib/utils';
 import { docxText, pptxText, tabToDocumentText, htmlToPlainText } from './lib/documentText';
@@ -68,14 +80,38 @@ import { Button, Input, Modal, Spinner, Toast } from './components/ui';
 
 import { MonacoEditorWrapper } from './components/editors/MonacoEditorWrapper';
 import { RichTextEditor } from './components/editors/RichTextEditor';
-import { ExcelEditor, AIAction } from './components/editors/ExcelEditor';
-import { WordEditor } from './components/editors/WordEditor';
-import { PowerPointEditor } from './components/editors/PowerPointEditor';
-import { ImageViewer } from './components/editors/ImageViewer';
-import { BinaryViewer } from './components/editors/BinaryViewer';
-import { VideoEditor } from './components/editors/VideoEditor';
+import type { AIAction } from './components/editors/ExcelEditor';
+
+// Тяжёлые редакторы грузятся по требованию: старт не ждёт Monaco/SheetJS/презентаций.
+const ExcelEditor = React.lazy(() =>
+  import('./components/editors/ExcelEditor').then((module) => ({ default: module.ExcelEditor }))
+);
+const WordEditor = React.lazy(() =>
+  import('./components/editors/WordEditor').then((module) => ({ default: module.WordEditor }))
+);
+const PowerPointEditor = React.lazy(() =>
+  import('./components/editors/PowerPointEditor').then((module) => ({ default: module.PowerPointEditor }))
+);
+const ImageViewer = React.lazy(() =>
+  import('./components/editors/ImageViewer').then((module) => ({ default: module.ImageViewer }))
+);
+const VideoEditor = React.lazy(() =>
+  import('./components/editors/VideoEditor').then((module) => ({ default: module.VideoEditor }))
+);
+const PdfEditor = React.lazy(() =>
+  import('./components/editors/PdfEditor').then((module) => ({ default: module.PdfEditor }))
+);
+const BinaryViewer = React.lazy(() =>
+  import('./components/editors/BinaryViewer').then((module) => ({ default: module.BinaryViewer }))
+);
+
+
+
+
+
 import { TerminalPanel } from './components/terminal/TerminalPanel';
-import { copyToClipboard, getImgurClientId, uploadFilePath, uploadAlbum, uploadMany, gdriveUpload } from './services/shareService';
+import { copyToClipboard, getImgurClientId, uploadFilePath, uploadAlbum, uploadMany, gdriveUpload, shareViaSite } from './services/shareService';
+import { readPreferences } from './state/preferences';
 import {
   AIActionPayload,
   AppActionResult,
@@ -125,6 +161,85 @@ const App: React.FC = () => {
   const chat = useChatSessions();
   const { isDark, toggleTheme } = useTheme();
 
+  // Оформление из настроек: тема, акцент, плотность, масштаб, меньше анимации.
+  useEffect(() => {
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const apply = () => {
+      applyAppearance(readPreferences().appearance, media?.matches ?? true);
+    };
+    apply();
+    media?.addEventListener?.('change', apply);
+    return () => media?.removeEventListener?.('change', apply);
+  }, []);
+
+  // Бюджет старта: время до первого кадра уходит в диагностический отчёт.
+  useEffect(() => {
+    const started = performance.now();
+    const frame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const ms = Math.round(performance.now());
+        void Promise.resolve(
+          window.electronAPI?.diagnosticsLog?.(
+            'info',
+            `startup: первый кадр через ${ms} мс (effect стартовал на ${Math.round(started)} мс)`
+          )
+        ).catch(() => undefined);
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+  // Диагностика: ошибки окна складываются в буфер главного процесса.
+  useEffect(() => installDiagnosticsHooks(), []);
+  // Автосохранение: снимок несохранённых вкладок раз в 2 секунды после правки.
+  useEffect(() => {
+    const dirty = ws.tabs.filter((tab) => tab.isDirty && tab.content);
+    if (dirty.length === 0) return;
+    const timer = window.setTimeout(() => {
+      for (const tab of dirty) void writeSnapshot(tab);
+      void pruneSnapshots(
+        ws.tabs.filter((tab) => !tab.isDirty).map((tab) => tab.path)
+      );
+    }, 2000);
+    return () => window.clearTimeout(timer);
+  }, [ws.tabs]);
+
+  // Восстановление после сбоя: поднимаем снимки в вкладки и сразу их убираем.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const snapshots = await listSnapshots();
+      if (cancelled || snapshots.length === 0) return;
+      let restored = 0;
+      for (const snapshot of snapshots) {
+        try {
+          const tabId = await ws.openFile(snapshot.path);
+          if (!tabId) continue;
+          ws.updateTabContent(tabId, snapshot.content);
+          // Снимок удаляем только после сохранения файла: иначе закрытие окна
+          // без Ctrl+S потеряет восстановленное содержимое.
+          restored += 1;
+        } catch {
+          // файл мог исчезнуть — снимок не восстанавливаем
+        }
+      }
+      if (!cancelled && restored > 0) {
+        ws.flash(`Восстановлены несохранённые документы: ${restored}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  /** Уведомление: тост + тихий сигнал по правилам из настроек. */
+  const notify = useCallback(
+    (message: string, kind: NotificationKind = 'save') => {
+      playChimeFor(kind);
+      ws.flash(message);
+    },
+    [ws]
+  );
+
   // Нечитаемый ключ (перенос профиля/portable на другой компьютер) — сказать
   // об этом прямо, иначе приложение выглядит «сломанным».
   useEffect(() => {
@@ -171,6 +286,77 @@ const App: React.FC = () => {
   const [commandQuery, setCommandQuery] = useState('');
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const [searchPanelOpen, setSearchPanelOpen] = useState(false);
+
+  // Раскладка: панели и открытые вкладки общие для окон, живут в workspace-session.json.
+  const layoutApplyingRef = useRef(false);
+  const layoutSavedRef = useRef('');
+  useEffect(() => {
+    const api = window.electronAPI;
+    const applyLayout = (layout?: {
+      aiPanelOpen?: boolean;
+      terminalOpen?: boolean;
+      searchPanelOpen?: boolean;
+      openPaths?: string[];
+    }) => {
+      if (!layout) return;
+      const normalized = normalizeLayout(layout);
+      layoutApplyingRef.current = true;
+      setAiPanelOpen(normalized.aiPanelOpen);
+      setTerminalOpen(normalized.terminalOpen);
+      setSearchPanelOpen(normalized.searchPanelOpen);
+      window.setTimeout(() => {
+        layoutApplyingRef.current = false;
+      }, 0);
+    };
+
+    let disposed = false;
+    void (async () => {
+      try {
+        const session = (await api?.sessionGet?.()) as
+          | { layout?: Parameters<typeof applyLayout>[0] }
+          | undefined;
+        if (disposed) return;
+        applyLayout(session?.layout);
+        for (const path of normalizeLayout(session?.layout).openPaths) {
+          if (path) void ws.openFile(path);
+        }
+      } catch {
+        // сессия недоступна — стартуем как обычно
+      }
+    })();
+
+    const off = api?.onSessionChanged?.((session) => {
+      const layout = (session as { layout?: Parameters<typeof applyLayout>[0] } | undefined)?.layout;
+      applyLayout(layout);
+    });
+    return () => {
+      disposed = true;
+      off?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Сохранение раскладки: только при реальных изменениях, с дебаунсом.
+  useEffect(() => {
+    if (layoutApplyingRef.current) return;
+    const layoutState = normalizeLayout({
+      aiPanelOpen,
+      terminalOpen,
+      searchPanelOpen,
+      openPaths: ws.tabs.map((tab) => tab.path).filter(Boolean).slice(0, MAX_RESTORED_TABS),
+      activePath: ws.activeTab?.path ?? '',
+    });
+    const fingerprint = layoutFingerprint(layoutState);
+    if (fingerprint === layoutSavedRef.current) return;
+    const timer = window.setTimeout(() => {
+      layoutSavedRef.current = fingerprint;
+      void window.electronAPI?.sessionPatch?.({ layout: layoutState });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [aiPanelOpen, terminalOpen, searchPanelOpen, ws.tabs, ws.activeTab]);
+
+  /** Папка, в которой открыт поиск (пункт «Искать в этой папке»). */
+  const [searchScope, setSearchScope] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('provider');
   const [saveAsOpen, setSaveAsOpen] = useState(false);
@@ -437,17 +623,27 @@ const App: React.FC = () => {
         if (data.isDirectory) {
           await ws.openWorkspace(data.path);
           ws.flash(`Открыта папка: ${baseName(data.path)}`);
-        } else {
-          const parentDir = data.path.slice(
-            0,
-            Math.max(data.path.lastIndexOf('\\'), data.path.lastIndexOf('/'))
-          );
-          if (!ws.rootPath) {
-            await ws.openWorkspace(parentDir);
-          }
+          return;
+        }
+
+        const parentDir = dirName(data.path);
+        const revealEnabled = readPreferences().explorerRevealOnOpen;
+        if (!revealEnabled) {
+          if (!ws.rootPath) await ws.openWorkspace(parentDir);
           await ws.openFile(data.path);
           ws.flash(`Открыт файл: ${baseName(data.path)}`);
+          return;
         }
+        // Файл внутри текущего дерева — только раскрываем и подсвечиваем.
+        const insideCurrent = ws.rootPath ? await ws.revealPath(data.path) : false;
+        if (!insideCurrent) {
+          // Иначе корнем становится папка файла: так в проводнике видно его
+          // окружение, а не дерево посторонней папки.
+          await ws.openWorkspace(parentDir);
+          await ws.revealPath(data.path);
+        }
+        await ws.openFile(data.path);
+        ws.flash(`Открыт файл: ${baseName(data.path)}`);
       } catch (err) {
         ws.flash(`Ошибка открытия: ${(err as Error).message}`);
       }
@@ -1169,7 +1365,8 @@ const App: React.FC = () => {
         if (!ppt) return { ok: false, message: 'Редактор презентации ещё не готов' };
 
         if (name === 'pptx_read') {
-          const model = await ppt.readModel();
+          const model = await ppt.readLegacyModel?.();
+          if (!model) return { ok: false, message: 'Модель презентации недоступна' };
           const lines = model.slides.map((slide) => {
             const shapes = slide.shapes
               .map(
@@ -1279,7 +1476,8 @@ const App: React.FC = () => {
           const slide = Math.max(1, Number(args.slide) || 1) - 1;
           const requested = String(args.layout ?? args.name ?? args.part ?? '').trim();
           if (!requested) return { ok: false, message: 'Не указан макет' };
-          const model = await ppt.readModel();
+          const model = await ppt.readLegacyModel?.();
+          if (!model) return { ok: false, message: 'Макеты недоступны' };
           const numeric = /^\d+$/.test(requested) ? Number(requested) : 0;
           const layout = numeric
             ? model.layouts[numeric - 1]
@@ -1305,7 +1503,611 @@ const App: React.FC = () => {
           return ppt.setNotes(slide, text);
         }
 
+        /* ---------- Полное управление презентацией ---------- */
+
+        if (name === 'pptx_get_slide') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const detail = await ppt.getSlide?.(slide);
+          if (!detail) return { ok: false, message: `Слайд ${slide + 1} не найден` };
+          const lines = detail.shapes.map(
+            (shape) =>
+              `  shape_id=${shape.id} ${shape.kind}${/заголовок/i.test(shape.name) ? ' [title]' : ''}` +
+              ` (${Math.round(shape.x / 36000)},${Math.round(shape.y / 36000)} см · ${Math.round(
+                shape.w / 36000
+              )}×${Math.round(shape.h / 36000)} см)` +
+              (shape.text
+                ? ` «${shape.text.paragraphs
+                    .map((paragraph) => paragraph.runs.map((run) => run.text).join(''))
+                    .join(' / ')
+                    .slice(0, 160)}»`
+                : '')
+          );
+          return {
+            ok: true,
+            message: `Слайд ${slide + 1}: ${detail.shapes.length} фигур`,
+            changed: false,
+            structure: [
+              `Фон: #${detail.background}; переход: ${detail.transition?.type ?? 'none'}; скрыт: ${
+                detail.hidden ? 'да' : 'нет'
+              }`,
+              ...lines,
+              detail.notes ? `Заметки: ${detail.notes}` : '',
+            ]
+              .filter(Boolean)
+              .join('\n'),
+            meta: { index: slide, shapes: detail.shapes.length },
+          };
+        }
+
+        if (name === 'pptx_duplicate_slide') {
+          const index = Math.max(1, Number(args.index ?? args.slide) || 1) - 1;
+          return ppt.duplicateSlide
+            ? await ppt.duplicateSlide(index)
+            : { ok: false, message: 'Дублирование не поддержано' };
+        }
+
+        if (name === 'pptx_hide_slide') {
+          const index = Math.max(1, Number(args.index ?? args.slide) || 1) - 1;
+          const hidden = args.hidden !== false && args.hidden !== 'false';
+          return ppt.setSlideHidden
+            ? await ppt.setSlideHidden(index, hidden)
+            : { ok: false, message: 'Скрытие слайдов не поддержано' };
+        }
+
+        if (name === 'pptx_set_slide_size') {
+          const preset = String(args.preset ?? '').toLowerCase();
+          const sizes: Record<string, [number, number]> = {
+            '16:9': [12192000, 6858000],
+            '4:3': [9144000, 6858000],
+            '16:10': [12192000, 7620000],
+          };
+          const width = Number(args.width_cm)
+            ? Math.round(Number(args.width_cm) * 360000)
+            : sizes[preset]?.[0];
+          const height = Number(args.height_cm)
+            ? Math.round(Number(args.height_cm) * 360000)
+            : sizes[preset]?.[1];
+          if (!width || !height) {
+            return { ok: false, message: 'Укажите preset (16:9, 4:3, 16:10) или width_cm и height_cm' };
+          }
+          return ppt.setSlideSize
+            ? await ppt.setSlideSize(width, height)
+            : { ok: false, message: 'Размер слайда не поддержан' };
+        }
+
+        if (name === 'pptx_set_transition') {
+          const index = Math.max(1, Number(args.index ?? args.slide) || 1) - 1;
+          const type = String(args.type ?? 'none');
+          const allowed = ['none', 'fade', 'push', 'wipe', 'cut'];
+          if (!allowed.includes(type)) {
+            return { ok: false, message: `Переход «${type}» неизвестен. Доступны: ${allowed.join(', ')}` };
+          }
+          return ppt.setTransition
+            ? await ppt.setTransition(index, {
+                type: type as 'none' | 'fade' | 'push' | 'wipe' | 'cut',
+                speed: (args.speed as 'slow' | 'med' | 'fast') ?? 'med',
+              })
+            : { ok: false, message: 'Переходы не поддержаны' };
+        }
+
+        if (name === 'pptx_set_background') {
+          const index = Math.max(1, Number(args.index ?? args.slide) || 1) - 1;
+          const color = String(args.color ?? '').replace('#', '');
+          const all = args.all === true || args.all === 'true';
+          if (!color && !args.image) return { ok: false, message: 'Укажите color или image' };
+          let imageDataUrl: string | undefined;
+          if (args.image) {
+            const root = current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+            const resolved = await resolveImageSource(String(args.image), root);
+            if (!resolved.ok) return { ok: false, message: resolved.message };
+            imageDataUrl = resolved.dataUrl;
+          }
+          return ppt.setBackground
+            ? await ppt.setBackground(index, { color: color || undefined, imageDataUrl, all })
+            : { ok: false, message: 'Фон слайда не поддержан' };
+        }
+
+        if (name === 'pptx_format_text') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          const format: Record<string, unknown> = {};
+          for (const key of ['bold', 'italic', 'underline', 'strike'] as const) {
+            if (args[key] !== undefined) format[key] = args[key] === true || args[key] === 'true';
+          }
+          if (args.size !== undefined) format.size = Number(args.size);
+          if (args.color !== undefined) format.color = String(args.color).replace('#', '');
+          if (args.font !== undefined) format.font = String(args.font);
+          if (args.align !== undefined) format.align = String(args.align);
+          if (args.bullet !== undefined) format.bullet = String(args.bullet);
+          if (args.level !== undefined) format.level = Number(args.level);
+          if (args.line_spacing !== undefined) format.lineSpacing = Number(args.line_spacing);
+          return ppt.formatText
+            ? await ppt.formatText(slide, shapeId, format as Parameters<NonNullable<typeof ppt.formatText>>[2])
+            : { ok: false, message: 'Форматирование текста не поддержано' };
+        }
+
+        if (name === 'pptx_find_replace') {
+          const query = String(args.find ?? args.query ?? '');
+          const replacement = String(args.replace ?? args.replacement ?? '');
+          if (!query) return { ok: false, message: 'Не указан текст для поиска' };
+          return ppt.findReplace
+            ? await ppt.findReplace(query, replacement, {
+                includeNotes: args.include_notes === true || args.include_notes === 'true',
+              })
+            : { ok: false, message: 'Поиск-замена не поддержан' };
+        }
+
+        if (name === 'pptx_add_shape') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const unit: 'cm' | 'emu' = args.unit === 'cm' ? 'cm' : 'emu';
+          const geometry = {
+            x: args.x !== undefined ? Number(args.x) : undefined,
+            y: args.y !== undefined ? Number(args.y) : undefined,
+            w: args.w !== undefined ? Number(args.w) : undefined,
+            h: args.h !== undefined ? Number(args.h) : undefined,
+            unit,
+          };
+          return ppt.addShape
+            ? await ppt.addShape(slide, {
+                geom: args.geom !== undefined ? String(args.geom) : undefined,
+                geometry,
+                fill: args.fill !== undefined ? String(args.fill).replace('#', '') : undefined,
+                outline:
+                  args.outline_color !== undefined
+                    ? { color: String(args.outline_color).replace('#', ''), width: Number(args.outline_width) || 1 }
+                    : undefined,
+                shadow: args.shadow === true || args.shadow === 'true',
+                text: args.text !== undefined ? String(args.text) : undefined,
+              })
+            : { ok: false, message: 'Вставка фигур не поддержана' };
+        }
+
+        if (name === 'pptx_set_shape_geometry') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          if (!ppt.setShapeGeometry) return { ok: false, message: 'Геометрия не поддержана' };
+          return await ppt.setShapeGeometry(slide, shapeId, {
+            x: args.x !== undefined ? Number(args.x) : undefined,
+            y: args.y !== undefined ? Number(args.y) : undefined,
+            w: args.w !== undefined ? Number(args.w) : undefined,
+            h: args.h !== undefined ? Number(args.h) : undefined,
+            rotation: args.rotation !== undefined ? Number(args.rotation) : undefined,
+            unit: args.unit === 'cm' ? 'cm' : 'emu',
+          });
+        }
+
+        if (name === 'pptx_delete_shape') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          return ppt.deleteShape
+            ? await ppt.deleteShape(slide, shapeId)
+            : { ok: false, message: 'Удаление фигур не поддержано' };
+        }
+
+        if (name === 'pptx_duplicate_shape') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          return ppt.duplicateShape
+            ? await ppt.duplicateShape(slide, shapeId)
+            : { ok: false, message: 'Дублирование фигур не поддержано' };
+        }
+
+        if (name === 'pptx_reorder_shape') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          const mode = String(args.mode ?? 'front');
+          const allowed = ['front', 'back', 'forward', 'backward'] as const;
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          if (!allowed.includes(mode as (typeof allowed)[number])) {
+            return { ok: false, message: `Порядок «${mode}» неизвестен. Доступны: ${allowed.join(', ')}` };
+          }
+          return ppt.reorderShape
+            ? await ppt.reorderShape(slide, shapeId, mode as (typeof allowed)[number])
+            : { ok: false, message: 'Порядок наложения не поддержан' };
+        }
+
+        if (name === 'pptx_set_shape_style') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          return ppt.setShapeStyle
+            ? await ppt.setShapeStyle(slide, shapeId, {
+                fill:
+                  args.fill === undefined
+                    ? undefined
+                    : args.fill === null || args.fill === 'none'
+                      ? null
+                      : String(args.fill).replace('#', ''),
+                outline:
+                  args.outline === undefined
+                    ? undefined
+                    : args.outline === null || args.outline === 'none'
+                      ? null
+                      : {
+                          color: args.outline_color ? String(args.outline_color).replace('#', '') : undefined,
+                          width: Number(args.outline_width) || 1,
+                        },
+                shadow: args.shadow === undefined ? undefined : args.shadow === true || args.shadow === 'true',
+              })
+            : { ok: false, message: 'Стиль фигуры не поддержан' };
+        }
+
+        if (name === 'pptx_add_table') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const rows = Math.max(1, Number(args.rows) || (Array.isArray(args.data) ? (args.data as string[][]).length : 2));
+          const cols = Math.max(
+            1,
+            Number(args.cols) ||
+              (Array.isArray(args.data) ? Math.max(...(args.data as string[][]).map((row) => row.length)) : 2)
+          );
+          if (!ppt.addTable) return { ok: false, message: 'Вставка таблиц не поддержана' };
+          return await ppt.addTable(slide, {
+            rows,
+            cols,
+            data: Array.isArray(args.data) ? (args.data as string[][]) : undefined,
+            geometry: {
+              x: args.x !== undefined ? Number(args.x) : undefined,
+              y: args.y !== undefined ? Number(args.y) : undefined,
+              w: args.w !== undefined ? Number(args.w) : undefined,
+              h: args.h !== undefined ? Number(args.h) : undefined,
+              unit: args.unit === 'cm' ? 'cm' : 'emu',
+            },
+          });
+        }
+
+        if (name === 'pptx_set_table_data') {
+          const slide = Math.max(1, Number(args.slide) || 1) - 1;
+          const shapeId = String(args.shape_id ?? args.shapeId ?? '');
+          if (!shapeId) return { ok: false, message: 'Не указан shape_id' };
+          if (!Array.isArray(args.data)) return { ok: false, message: 'Не переданы данные таблицы' };
+          return ppt.setTableData
+            ? await ppt.setTableData(slide, shapeId, args.data as string[][])
+            : { ok: false, message: 'Правка таблиц не поддержана' };
+        }
+
+        if (name === 'pptx_apply_theme') {
+          if (!ppt.applyTheme) return { ok: false, message: 'Темы не поддержаны' };
+          const presetId = args.preset !== undefined ? String(args.preset) : undefined;
+          return await ppt.applyTheme({
+            presetId,
+            colors:
+              args.colors && typeof args.colors === 'object'
+                ? (args.colors as Record<string, string>)
+                : undefined,
+            fonts: args.font_pair ? fontPresetById(String(args.font_pair)) : undefined,
+          });
+        }
+
+        if (name === 'pptx_present') {
+          if (!ppt.present) return { ok: false, message: 'Показ слайдов не поддержан' };
+          const index = Number(args.slide);
+          return await ppt.present(Number.isFinite(index) ? Math.max(0, index - 1) : undefined);
+        }
+
+        if (name === 'pptx_export_pdf') {
+          if (!ppt.exportPdf) return { ok: false, message: 'Экспорт PDF не поддержан' };
+          return await ppt.exportPdf(args.path ? String(args.path) : undefined);
+        }
+
+        if (name === 'pptx_export_images') {
+          if (!ppt.exportSlideImages) return { ok: false, message: 'Экспорт PNG не поддержан' };
+          const folder = args.dir ? await resolveWorkspacePath(String(args.dir)) : undefined;
+          return await ppt.exportSlideImages(folder);
+        }
+
         return { ok: false, message: `Неизвестный инструмент PowerPoint: ${name}` };
+      }
+
+      if (name === 'create_presentation') {
+        const markdown = String(args.markdown ?? args.text ?? args.content ?? '');
+        if (!markdown.trim()) return { ok: false, message: 'Пустая разметка презентации' };
+        const dir = await resolveWorkspacePath(args.path ? String(args.path) : '');
+        const fileName = sanitizeFileName(String(args.name ?? 'Презентация.pptx'), '.pptx');
+        const base64 = await markdownToPptxBase64(markdown, {
+          title: args.title ? String(args.title) : baseName(fileName).replace(/\.pptx$/i, ''),
+          themePresetId: args.theme ? String(args.theme) : undefined,
+        });
+        const created = await ws.createFile(dir, fileName, base64, 'base64');
+        if (!created) return { ok: false, message: `Не удалось создать ${fileName}` };
+        await ws.openFile(created);
+        return {
+          ok: true,
+          message: `Презентация создана: ${fileName} (слайдов по заголовкам)`,
+          path: created,
+        };
+      }
+
+      if (name.startsWith('image_')) {
+        const root = current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+        const imageTab = tab.type === 'image' ? tab : null;
+        const bridge = imageTab ? getImageController(imageTab.id) : undefined;
+
+        const readBase64 = async (
+          filePath: string
+        ): Promise<{ ok: true; base64: string; mime: string } | { ok: false; message: string }> => {
+          const resolved = await resolveImageSource(filePath, root);
+          if (!resolved.ok) return { ok: false, message: resolved.message };
+          const match = /^data:([^;]+);base64,(.*)$/s.exec(resolved.dataUrl);
+          if (!match) return { ok: false, message: 'Источник не является изображением' };
+          return { ok: true, base64: match[2], mime: match[1] };
+        };
+
+        if (name === 'image_info') {
+          const target = args.path ? await resolveWorkspacePath(String(args.path)) : '';
+          const live = bridge?.getImage() ?? null;
+          if (!target && !live) return { ok: false, message: 'Укажите path изображения' };
+          const source = target ? await readBase64(target) : { ok: true as const, base64: live!.base64, mime: live!.mime };
+          if (!source.ok) return { ok: false, message: source.message };
+          const info = await applyImageOps({ base64: source.base64, mime: source.mime }, []);
+          return {
+            ok: true,
+            message: `${info.width}×${info.height}, ${info.mime}, ${Math.round(info.bytes / 1024)} КБ`,
+            changed: false,
+            meta: { width: info.width, height: info.height, mime: info.mime, bytes: info.bytes },
+          };
+        }
+
+        if (name === 'image_transform') {
+          const ops = normalizeImageOps(args.ops);
+          if (ops.length === 0) return { ok: false, message: 'Не переданы операции (ops)' };
+          const target = args.path ? await resolveWorkspacePath(String(args.path)) : '';
+          if (!target && bridge) {
+            const result = await bridge.applyOps(ops);
+            return { ok: result.ok, message: result.message, changed: result.ok };
+          }
+          if (!target) return { ok: false, message: 'Укажите path изображения' };
+          const source = await readBase64(target);
+          if (!source.ok) return { ok: false, message: source.message };
+          const info = await applyImageOps({ base64: source.base64, mime: source.mime }, ops);
+          const mode = String(args.output ?? 'copy');
+          const ext = info.mime === 'image/jpeg' ? '.jpg' : info.mime === 'image/webp' ? '.webp' : '.png';
+          const suffix = String(args.suffix ?? '-edit');
+          let outPath: string;
+          if (mode === 'overwrite') {
+            outPath = target;
+          } else if (mode === 'copy') {
+            outPath = target.replace(/\.[^./\\]+$/, '') + suffix + ext;
+          } else {
+            outPath = await resolveWorkspacePath(mode);
+          }
+          await fileSystemService.writeFile(outPath, info.base64, 'base64');
+          if (mode !== 'overwrite') await ws.openFile(outPath);
+          return {
+            ok: true,
+            message: `${info.width}×${info.height}, ${Math.round(info.bytes / 1024)} КБ → ${baseName(outPath)}`,
+            path: outPath,
+            changed: true,
+          };
+        }
+
+        if (name === 'image_batch') {
+          const ops = normalizeImageOps(args.ops);
+          if (ops.length === 0) return { ok: false, message: 'Не переданы операции (ops)' };
+          const rawPaths = Array.isArray(args.paths) ? (args.paths as unknown[]).map(String) : [];
+          if (rawPaths.length === 0) {
+            return { ok: false, message: 'Передайте paths: обработка папок — через выделение в дереве файлов' };
+          }
+          const overwrite = args.overwrite === true || args.overwrite === 'true';
+          const suffix = String(args.suffix ?? '-edit');
+          const done: string[] = [];
+          const failed: string[] = [];
+          for (const relative of rawPaths) {
+            try {
+              const target = await resolveWorkspacePath(relative);
+              const source = await readBase64(target);
+              if (!source.ok) throw new Error(source.message);
+              const info = await applyImageOps({ base64: source.base64, mime: source.mime }, ops);
+              const ext = info.mime === 'image/jpeg' ? '.jpg' : info.mime === 'image/webp' ? '.webp' : '.png';
+              const outPath = overwrite ? target : target.replace(/\.[^./\\]+$/, '') + suffix + ext;
+              await fileSystemService.writeFile(outPath, info.base64, 'base64');
+              done.push(baseName(outPath));
+            } catch (err) {
+              failed.push(`${relative}: ${(err as Error).message}`);
+            }
+          }
+          return {
+            ok: failed.length === 0,
+            message:
+              `Обработано ${done.length} из ${rawPaths.length}` + (failed.length ? `; ошибки: ${failed.join('; ')}` : ''),
+            changed: done.length > 0,
+            content: done.join('\n'),
+          };
+        }
+
+        if (name === 'image_insert') {
+          const path = String(args.path ?? '');
+          if (!path) return { ok: false, message: 'Не указан path' };
+          const target = await resolveWorkspacePath(path);
+          const source = await readBase64(target);
+          if (!source.ok) return { ok: false, message: source.message };
+          const dataUrl = `data:${source.mime};base64,${source.base64}`;
+          if (String(args.target ?? 'word') === 'slide') {
+            const ppt = getPptxController(current.activeTab?.id ?? '');
+            if (!ppt) return { ok: false, message: 'Откройте презентацию, чтобы вставить изображение на слайд' };
+            const slide = Math.max(1, Number(args.slide) || 1) - 1;
+            return await ppt.addImage(slide, dataUrl);
+          }
+          return await runDocumentTool('insert_image', { src: dataUrl }, transactionId, tab.id);
+        }
+
+        if (name === 'image_upload') {
+          const host = String(args.host ?? 'imgbb').toLowerCase();
+          if (!['imgbb', 'freeimage', 'yapx'].includes(host)) {
+            return { ok: false, message: `Хостинг ${host} не поддержан инструментом. Доступны: imgbb, freeimage, yapx` };
+          }
+          const rawPaths = Array.isArray(args.paths) ? (args.paths as unknown[]).map(String) : [];
+          if (rawPaths.length === 0) return { ok: false, message: 'Не указаны файлы (paths)' };
+          const files: { path: string; name: string }[] = [];
+          for (const relative of rawPaths) {
+            const absolute = await resolveWorkspacePath(relative);
+            files.push({ path: absolute, name: baseName(absolute) });
+          }
+          const result = await shareViaSite(host as 'imgbb' | 'freeimage' | 'yapx', files, {});
+          return {
+            ok: result.success,
+            message: result.success
+              ? `Загружено ${result.count} файл(ов)${result.albums?.length ? `: ${result.albums.join(', ')}` : ''}`
+              : result.error || 'Не удалось загрузить изображения',
+            path: result.albums?.[0],
+            changed: false,
+          };
+        }
+
+        if (name === 'image_open') {
+          const path = String(args.path ?? '');
+          if (!path) return { ok: false, message: 'Не указан path' };
+          const target = await resolveWorkspacePath(path);
+          const tabId = await ws.openFile(target);
+          return tabId
+            ? { ok: true, message: `Открыто изображение: ${baseName(target)}`, path: target }
+            : { ok: false, message: 'Не удалось открыть изображение' };
+        }
+      }
+
+      if (name.startsWith('video_')) {
+        const api = window.electronAPI;
+        const root = current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
+        const videoTab = tab.type === 'video' ? tab : null;
+        const videoBridge = videoTab ? getVideoController(videoTab.id) : undefined;
+        const filePath = args.path ? await resolveWorkspacePath(String(args.path)) : videoBridge?.getState()?.filePath;
+
+        if (name === 'video_info') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео или откройте его во вкладке' };
+          const info = await api?.videoProbe?.(filePath);
+          if (!info?.success) return { ok: false, message: info?.error || 'Не удалось прочитать видео' };
+          return {
+            ok: true,
+            message: `${Math.round(info.duration ?? 0)} с, ${info.width ?? 0}×${info.height ?? 0}, звук: ${
+              info.hasAudio ? 'есть' : 'нет'
+            }`,
+            changed: false,
+            meta: info,
+          };
+        }
+
+        if (name === 'video_operate') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео или откройте его во вкладке' };
+          const plan = {
+            start: args.start !== undefined ? Number(args.start) : undefined,
+            end: args.end !== undefined ? Number(args.end) : undefined,
+            speed: args.speed !== undefined ? Number(args.speed) : undefined,
+            speedSegments: Array.isArray(args.speed_segments)
+              ? (args.speed_segments as { start: number; end: number; speed: number }[])
+              : undefined,
+            stripAudio: args.strip_audio === true || args.strip_audio === 'true',
+            compress: args.compress === true || args.compress === 'true',
+            zoom:
+              args.zoom_scale !== undefined || args.zoom_x !== undefined || args.zoom_y !== undefined
+                ? {
+                    scale: args.zoom_scale !== undefined ? Number(args.zoom_scale) : undefined,
+                    x: args.zoom_x !== undefined ? Number(args.zoom_x) : undefined,
+                    y: args.zoom_y !== undefined ? Number(args.zoom_y) : undefined,
+                  }
+                : undefined,
+            outputPath: args.output ? String(args.output) : undefined,
+          };
+          if (videoBridge) {
+            const result = await videoBridge.applyPlan(plan);
+            return { ok: result.ok, message: result.message, path: result.outputPath, changed: result.ok };
+          }
+          const info = await api?.videoProbe?.(filePath);
+          if (!info?.success) return { ok: false, message: info?.error || 'Не удалось прочитать видео' };
+          const result = await api?.videoEdit?.({
+            filePath,
+            duration: info.duration,
+            hasAudio: info.hasAudio,
+            ...plan,
+          });
+          if (!result?.success) return { ok: false, message: result?.error || 'Не удалось обработать видео' };
+          if (result.outputPath) await ws.openFile(result.outputPath);
+          return {
+            ok: true,
+            message: `Готово: ${result.outputPath ? baseName(result.outputPath) : 'файл сохранён'}`,
+            path: result.outputPath,
+            changed: true,
+          };
+        }
+
+        if (name === 'video_extract_audio') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео' };
+          const result = await api?.videoExtractAudio?.(filePath, {
+            format: (args.format as 'mp3' | 'aac' | 'copy') ?? 'mp3',
+            outputPath: args.output ? await resolveWorkspacePath(String(args.output)) : undefined,
+          });
+          if (!result?.success) return { ok: false, message: result?.error || 'Не удалось извлечь звук' };
+          return { ok: true, message: `Звук извлечён: ${baseName(result.outputPath ?? '')}`, path: result.outputPath, changed: true };
+        }
+
+        if (name === 'video_frames') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео' };
+          const result = await api?.videoFrames?.(filePath, {
+            count: args.count !== undefined ? Number(args.count) : undefined,
+            at: Array.isArray(args.at) ? (args.at as unknown[]).map(Number) : undefined,
+            maxWidth: args.max_width !== undefined ? Number(args.max_width) : undefined,
+            dir: args.dir ? await resolveWorkspacePath(String(args.dir)) : undefined,
+          });
+          if (!result?.success) return { ok: false, message: result?.error || 'Не удалось сделать кадры' };
+          return {
+            ok: true,
+            message: `Кадров: ${result.files?.length ?? 0}`,
+            path: result.files?.[0],
+            content: (result.files ?? []).join('\n'),
+            changed: true,
+          };
+        }
+
+        if (name === 'video_convert') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео' };
+          const result = await api?.videoConvert?.(filePath, {
+            format: (args.format as 'mp4' | 'webm' | 'gif') ?? 'mp4',
+            quality: (args.quality as 'low' | 'medium' | 'high') ?? 'medium',
+            outputPath: args.output ? await resolveWorkspacePath(String(args.output)) : undefined,
+          });
+          if (!result?.success) return { ok: false, message: result?.error || 'Не удалось конвертировать видео' };
+          if (result.outputPath) await ws.openFile(result.outputPath);
+          return { ok: true, message: `Готово: ${baseName(result.outputPath ?? '')}`, path: result.outputPath, changed: true };
+        }
+
+        if (name === 'video_gif') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео' };
+          const result = await api?.videoGif?.(filePath, {
+            start: args.start !== undefined ? Number(args.start) : 0,
+            duration: args.duration !== undefined ? Number(args.duration) : 3,
+            fps: args.fps !== undefined ? Number(args.fps) : undefined,
+            width: args.width !== undefined ? Number(args.width) : undefined,
+            outputPath: args.output ? await resolveWorkspacePath(String(args.output)) : undefined,
+          });
+          if (!result?.success) return { ok: false, message: result?.error || 'Не удалось сделать GIF' };
+          if (result.outputPath) await ws.openFile(result.outputPath);
+          return { ok: true, message: `GIF готов: ${baseName(result.outputPath ?? '')}`, path: result.outputPath, changed: true };
+        }
+
+        if (name === 'video_publish') {
+          if (!filePath) return { ok: false, message: 'Укажите path видео' };
+          const title = String(args.title ?? baseName(filePath));
+          const result = await api?.youtubeUpload?.(filePath, {
+            title,
+            description: String(args.description ?? ''),
+            privacyStatus: ((args.privacy as 'private' | 'unlisted' | 'public') ?? 'unlisted') as
+              | 'private'
+              | 'unlisted'
+              | 'public',
+            categoryId: args.category !== undefined ? String(args.category) : undefined,
+            playlistId: args.playlist !== undefined ? String(args.playlist) : undefined,
+            madeForKids: false,
+          });
+          if (!result?.success) return { ok: false, message: result?.error || 'Не удалось опубликовать видео' };
+          return {
+            ok: true,
+            message: `Опубликовано: ${(result as { url?: string }).url ?? title}`,
+            path: (result as { url?: string }).url,
+            changed: false,
+          };
+        }
       }
 
       if (name.startsWith('md_')) {
@@ -2172,6 +2974,50 @@ const App: React.FC = () => {
             };
           }
 
+          case 'create_presentation': {
+            const markdown = action.markdown ?? '';
+            if (!markdown.trim()) return fail('Пустая разметка презентации');
+            const fileName = sanitizeFileName(action.name || 'Презентация.pptx', '.pptx');
+            const dir = await resolveWorkspacePath(action.path || '');
+            const base64 = await markdownToPptxBase64(markdown, {
+              title: action.title || baseName(fileName).replace(/\.pptx$/i, ''),
+              themePresetId: action.theme,
+            });
+            const created = await ws.createFile(dir, fileName, base64, 'base64');
+            if (!created) return fail(`Не удалось создать ${fileName}`);
+            await ws.openFile(created);
+            return { ok: true, message: `Создана презентация: ${fileName}`, path: created };
+          }
+
+          case 'image_edit': {
+            const result = await runDocumentTool('image_transform', {
+              path: action.path,
+              ops: action.ops,
+              output: action.output,
+              suffix: action.suffix,
+            });
+            return result.ok ? { ok: true, message: result.message, path: result.path } : fail(result.message);
+          }
+
+          case 'video_edit': {
+            const toolName =
+              action.operation === 'extract_audio'
+                ? 'video_extract_audio'
+                : action.operation === 'frames'
+                  ? 'video_frames'
+                  : action.operation === 'convert'
+                    ? 'video_convert'
+                    : action.operation === 'gif'
+                      ? 'video_gif'
+                      : 'video_operate';
+            const params = (action.params ?? {}) as Record<string, unknown>;
+            const result = await runDocumentTool(toolName, {
+              ...params,
+              path: action.path ?? (typeof params.path === 'string' ? params.path : undefined),
+            });
+            return result.ok ? { ok: true, message: result.message, path: result.path } : fail(result.message);
+          }
+
           case 'notify': {
             ws.flash(action.message || 'Готово');
             return { ok: true, message: action.message || 'Готово' };
@@ -2402,6 +3248,51 @@ const App: React.FC = () => {
     [ws.rootPath]
   );
 
+  const handleExplorerRename = useCallback(
+    async (filePath: string, newName: string): Promise<string | null> => {
+      const dir = filePath.replace(/[\\/][^\\/]+$/, '');
+      const target = `${dir}\\${newName}`;
+      try {
+        await fileSystemService.renamePath(filePath, target);
+        await ws.loadDirectory(dir);
+        return target;
+      } catch (err) {
+        ws.flash('Переименование не удалось: ' + (err as Error).message);
+        return null;
+      }
+    },
+    [ws]
+  );
+
+  const handleExplorerMove = useCallback(
+    async (paths: string[], targetDir: string, copy: boolean): Promise<void> => {
+      let done = 0;
+      const failed: string[] = [];
+      for (const source of paths) {
+        const name = source.split(/[\\/]/).pop() ?? source;
+        const existing = (ws.tree[targetDir] ?? []).map((item) => item.name);
+        const unique = resolvePasteName(name, existing, copy ? 'copy' : 'move');
+        const target = `${targetDir}\\${unique}`;
+        try {
+          if (copy) await fileSystemService.copyPath(source, target);
+          else await fileSystemService.renamePath(source, target);
+          done += 1;
+        } catch (err) {
+          failed.push(`${name}: ${(err as Error).message}`);
+        }
+      }
+      const sourceDir = paths[0]?.replace(/[\\/][^\\/]+$/, '');
+      await ws.loadDirectory(targetDir);
+      if (sourceDir && sourceDir !== targetDir) await ws.loadDirectory(sourceDir);
+      ws.flash(
+        failed.length === 0
+          ? `${copy ? 'Скопировано' : 'Перемещено'}: ${done}`
+          : `${copy ? 'Скопировано' : 'Перемещено'} ${done} из ${paths.length}; ${failed.slice(0, 2).join('; ')}`
+      );
+    },
+    [ws]
+  );
+
   const handleFileAction = useCallback(async (action: string, item: FileItem, serviceId?: string, selection?: FileItem[]) => {
     if (action === 'open') {
       if (item.isDirectory) void ws.toggleDirectory(item.path);
@@ -2454,6 +3345,55 @@ const App: React.FC = () => {
       if (ok) ws.flash('Путь скопирован'); else ws.flash('Не удалось скопировать путь');
     } else if (action === 'reveal') {
       await fileSystemService.showInExplorer(item.path);
+    } else if (action === 'image-process') {
+      const images = (selection || []).filter((it) => it.type === 'image' && !it.isDirectory);
+      if (images.length === 0) {
+        ws.flash('Выделите изображения для пакетной обработки');
+        return;
+      }
+      const preset = serviceId === 'thumb' ? 'thumb' : 'web';
+      const ops: Parameters<typeof applyImageOps>[1] =
+        preset === 'thumb'
+          ? [{ op: 'thumbnail', max: 512 }, { op: 'compress', maxKb: 120 }]
+          : [{ op: 'resize', mode: 'max', max: 1920 }, { op: 'compress', maxKb: 400 }];
+      const toBase64 = (bytes: Uint8Array): string => {
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+      };
+      ws.flash(`Обрабатываю ${images.length} изображений (${preset === 'thumb' ? 'миниатюры' : 'для веба'})…`);
+      let done = 0;
+      const failed: string[] = [];
+      for (const image of images) {
+        try {
+          const bytes = new Uint8Array(await fileSystemService.readBinary(image.path));
+          const mime =
+            /\.png$/i.test(image.name)
+              ? 'image/png'
+              : /\.webp$/i.test(image.name)
+                ? 'image/webp'
+                : 'image/jpeg';
+          const result = await applyImageOps({ base64: toBase64(bytes), mime }, ops);
+          const ext = result.mime === 'image/png' ? '.png' : result.mime === 'image/webp' ? '.webp' : '.jpg';
+          const outPath = image.path.replace(/\.[^./\\]+$/, '') + (preset === 'thumb' ? '-thumb' : '-web') + ext;
+          await fileSystemService.writeFile(outPath, result.base64, 'base64');
+          done += 1;
+        } catch (err) {
+          failed.push(`${image.name}: ${(err as Error).message}`);
+        }
+      }
+      ws.flash(
+        failed.length === 0
+          ? `Готово: ${done} изображений`
+          : `Обработано ${done} из ${images.length}; ошибки: ${failed.slice(0, 2).join('; ')}`
+      );
+      void ws.loadDirectory(images[0].path.replace(/[\\/][^\\/]+$/, ''));
+    } else if (action === 'search-folder') {
+      setSearchScope(item.isDirectory ? item.path : item.path.replace(/[\\/][^\\/]+$/, ''));
+      setSearchPanelOpen(true);
     } else if (action === 'album' && serviceId) {
       const images = (selection || []).filter((it) => it.type === 'image' && !it.isDirectory);
       if (images.length < 2) {
@@ -2461,11 +3401,36 @@ const App: React.FC = () => {
         return;
       }
       const title = 'WorkSpace ' + new Date().toLocaleString('ru-RU');
-      if (serviceId === 'imgbb' || serviceId === 'freeimage') {
-        const open = serviceId === 'imgbb' ? window.electronAPI?.openImgbb : window.electronAPI?.openFreeimage;
-        const result = await open?.(images.map((it) => it.path));
-        const name = serviceId === 'imgbb' ? 'ImgBB' : 'Freeimage.host';
-        ws.flash(result?.success ? name + ' открыт, фото добавлены в форму' : 'Не удалось открыть ' + name);
+      if (serviceId === 'imgbb' || serviceId === 'freeimage' || serviceId === 'yapx') {
+        const authorized = readPreferences().yapxAccountMode;
+        const isSite = serviceId === 'yapx';
+        ws.flash(
+          isSite
+            ? `Загружаю ${images.length} фото на Япикс…`
+            : `Открываю ${serviceId === 'imgbb' ? 'ImgBB' : 'Freeimage.host'}…`
+        );
+        const result = await shareViaSite(
+          serviceId,
+          images.map((it) => ({ path: it.path, name: it.name })),
+          { authorized }
+        );
+        const name =
+          serviceId === 'imgbb' ? 'ImgBB' : serviceId === 'freeimage' ? 'Freeimage.host' : 'Япикс';
+        if (!isSite) {
+          ws.flash(result.success ? name + ' открыт, фото добавлены в форму' : 'Не удалось открыть ' + name);
+        } else if (result.albums.length > 0) {
+          await copyToClipboard(result.albums.join('\n'));
+          const skipped = result.skipped.length ? `, пропущено ${result.skipped.length}` : '';
+          ws.flash(
+            `Япикс: ${result.count}/${images.length} фото в ${result.albums.length} альбом(ах)${skipped}, ссылки скопированы`
+          );
+        } else if (result.count > 0) {
+          ws.flash(`Япикс: ${result.count}/${images.length} фото добавлены в форму загрузки`);
+        } else {
+          ws.flash(
+            `Япикс не принял фото: ${result.error || result.skipped.map((item) => item.reason).join('; ')}`
+          );
+        }
       } else if (serviceId === 'telegraph') {
         ws.flash('Собираю страницу Telegraph: ' + images.length + ' фото…');
         const result = await uploadAlbum('telegraph', title, images.map((it) => ({ path: it.path, name: it.name })));
@@ -2512,11 +3477,24 @@ const App: React.FC = () => {
         ws.flash('Загружено в Google Drive: ' + result.uploaded + ' файл(ов)');
       } else ws.flash('Загрузка в Google Drive не выполнена: ' + (result.error || result.failed.join('; ')));
     } else if (action === 'share' && serviceId) {
-      if (serviceId === 'imgbb' || serviceId === 'freeimage') {
-        const open = serviceId === 'imgbb' ? window.electronAPI?.openImgbb : window.electronAPI?.openFreeimage;
-        const result = await open?.([item.path]);
-        const name = serviceId === 'imgbb' ? 'ImgBB' : 'Freeimage.host';
-        ws.flash(result?.success ? name + ' открыт, фото добавлено в форму' : 'Не удалось открыть ' + name);
+      if (serviceId === 'imgbb' || serviceId === 'freeimage' || serviceId === 'yapx') {
+        const result = await shareViaSite(
+          serviceId,
+          [{ path: item.path, name: item.name }],
+          { authorized: readPreferences().yapxAccountMode }
+        );
+        const name =
+          serviceId === 'imgbb' ? 'ImgBB' : serviceId === 'freeimage' ? 'Freeimage.host' : 'Япикс';
+        if (!result.success) {
+          ws.flash(`Не удалось открыть ${name}: ${result.error || 'ошибка'}`);
+          return;
+        }
+        if (result.albums.length > 0) {
+          await copyToClipboard(result.albums.join('\n'));
+          ws.flash(`${name}: альбом создан, ссылка скопирована`);
+        } else {
+          ws.flash(name + ' открыт, фото добавлено в форму');
+        }
         return;
       }
       if (serviceId === 'imgur' && !getImgurClientId()) {
@@ -2563,26 +3541,20 @@ const App: React.FC = () => {
         editor = <PowerPointEditor {...common} />;
         break;
       case 'pdf':
-        editor = (
-          <embed
-            src={'media://local/?path=' + encodeURIComponent(tab.path)}
-            type="application/pdf"
-            className="h-full w-full"
-          />
-        );
+        editor = <PdfEditor {...common} onNotify={notify} />;
         break;
       case 'video':
         editor = (
           <VideoEditor
             tab={tab}
-            onNotify={ws.flash}
+            onNotify={notify}
             onOpenResult={(filePath) => void ws.openFile(filePath)}
             onCloseTab={() => ws.closeTab(tab.id)}
           />
         );
         break;
       case 'binary':
-        editor = <BinaryViewer tab={tab} onNotify={ws.flash} />;
+        editor = <BinaryViewer tab={tab} onNotify={notify} />;
         break;
       case 'image':
         editor = (
@@ -2590,7 +3562,7 @@ const App: React.FC = () => {
             tab={tab}
             onChange={(content) => ws.updateTabContent(tab.id, content)}
             onSave={() => void ws.saveTab(tab.id)}
-            onNotify={ws.flash}
+            onNotify={notify}
           />
         );
         break;
@@ -2616,7 +3588,16 @@ const App: React.FC = () => {
       );
     return (
       <div className="h-full" inert={locked || undefined}>
-        {editor}
+        <React.Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center gap-2 text-xs text-ws-muted">
+              <span className="h-3 w-3 animate-spin rounded-full border-2 border-ws-faint border-t-transparent" />
+              Загрузка редактора…
+            </div>
+          }
+        >
+          {editor}
+        </React.Suspense>
       </div>
     );
   };
@@ -2730,9 +3711,12 @@ const App: React.FC = () => {
 
             {searchPanelOpen ? (
               <GlobalSearchPanel
-                workspacePath={ws.rootPath}
+                workspacePath={searchScope || ws.rootPath}
                 onOpenFile={(p) => void ws.openFile(p)}
-                onClose={() => setSearchPanelOpen(false)}
+                onClose={() => {
+                  setSearchPanelOpen(false);
+                  setSearchScope('');
+                }}
               />
             ) : (
               <FileTree
@@ -2742,6 +3726,8 @@ const App: React.FC = () => {
                 loadingDirs={ws.loadingDirs}
                 activePath={ws.activeTab?.path ?? ''}
                 dirtyPaths={dirtyPaths}
+                onRenamePath={handleExplorerRename}
+                onMovePaths={handleExplorerMove}
                 onToggleDir={(p) => void ws.toggleDirectory(p)}
                 onOpenFile={(p) => void ws.openFile(p)}
                 onPreviewFile={(p) => void ws.openFile(p, 'primary', false, true)}
@@ -2768,6 +3754,7 @@ const App: React.FC = () => {
                 onToggleFavorite={(dirPath) => void ws.toggleFavorite(dirPath)}
                 onOpenGoogleDriveSettings={() => { setSettingsTab('integrations'); setSettingsOpen(true); }}
                 onItemAction={(action, item, serviceId, selection) => void handleFileAction(action, item, serviceId, selection)}
+                revealTarget={ws.revealTarget}
               />
             )}
           </div>
@@ -3081,6 +4068,36 @@ const App: React.FC = () => {
                     setSettingsOpen(true);
                   },
                 },
+                {
+                  label: 'Диагностика: скопировать отчёт',
+                  hint: 'без секретов',
+                  run: () => {
+                    void copyDiagnosticsReport()
+                      .then((size) => notify(`Отчёт диагностики скопирован (${size} символов)`, 'export'))
+                      .catch((error: Error) => notify(`Отчёт не собран: ${error.message}`, 'error'));
+                  },
+                },
+                {
+                  label: 'Тема: светлая / тёмная',
+                  hint: 'Ctrl+Shift+P',
+                  run: () => toggleTheme(),
+                },
+                {
+                  label: 'Проверить уведомление',
+                  hint: 'тост и сигнал',
+                  run: () => notify('Проверка уведомления', 'update'),
+                },
+                {
+                  label: 'Новое окно',
+                  hint: 'второй монитор',
+                  run: () => {
+                    void window.electronAPI
+                      ?.windowNew?.()
+                      .then((result) =>
+                        result?.success ? undefined : notify('Окно не открыто: ' + (result?.error ?? ''), 'error')
+                      );
+                  },
+                },
               ]
                 .filter((item) =>
                   item.label.toLowerCase().includes(commandQuery.trim().toLowerCase())
@@ -3118,7 +4135,7 @@ const App: React.FC = () => {
         busy={saveAsBusy}
         onClose={() => setSaveAsOpen(false)}
         onSave={handleSaveAs}
-        onNotify={ws.flash}
+        onNotify={notify}
       />
 
       <SettingsModal
@@ -3132,7 +4149,7 @@ const App: React.FC = () => {
         onFetchModels={ai.fetchModels}
         modelsCache={ai.modelsCache}
         initialTab={settingsTab}
-        onNotify={ws.flash}
+        onNotify={notify}
         onBeforeUpdate={async () => {
           const { failed } = await ws.saveAll();
           if (failed.length > 0) {

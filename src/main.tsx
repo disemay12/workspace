@@ -18,7 +18,22 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
     import('./lib/aiDocument'),
     import('./lib/pptx'),
     import('./lib/pptxTemplate'),
-  ]).then(([model, workspacePath, history, docx, session, markdownOps, customStyles, aiDocument, pptx, pptxTemplate]) => {
+    import('./lib/pptxDoc'),
+    import('./lib/pptxBuilder'),
+    import('./services/aiTools'),
+    import('./services/aiActions'),
+    import('./lib/imageOps'),
+    import('./lib/explorerOps'),
+    import('./lib/appearance'),
+    import('./lib/notifyRules'),
+    import('./lib/snapshot'),
+    import('./lib/redact'),
+    import('./lib/layout'),
+    import('./lib/aiDiff'),
+    import('./lib/pdfOps'),
+    import('./lib/pdfAnnotate'),
+    import('./lib/pdfRender'),
+  ]).then(([model, workspacePath, history, docx, session, markdownOps, customStyles, aiDocument, pptx, pptxTemplate, pptxDoc, pptxBuilder, aiTools, aiActions, imageOps, explorerOps, appearance, notifyRules, snapshot, redact, layout, aiDiff, pdfOps, pdfAnnotate, pdfRender]) => {
     const target = window as unknown as {
       __documentModel?: typeof model;
       __workspacePath?: typeof workspacePath;
@@ -30,6 +45,21 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
       __aiDocument?: typeof aiDocument;
       __pptx?: typeof pptx;
       __pptxTemplate?: typeof pptxTemplate;
+      __pptxDoc?: typeof pptxDoc;
+      __pptxBuilder?: typeof pptxBuilder;
+      __aiTools?: typeof aiTools;
+      __aiActions?: typeof aiActions;
+      __imageOps?: typeof imageOps;
+      __explorerOps?: typeof explorerOps;
+      __appearance?: typeof appearance;
+      __notifyRules?: typeof notifyRules;
+      __snapshot?: typeof snapshot;
+      __redact?: typeof redact;
+      __layout?: typeof layout;
+      __aiDiff?: typeof aiDiff;
+      __pdfOps?: typeof pdfOps;
+      __pdfAnnotate?: typeof pdfAnnotate;
+      __pdfRender?: typeof pdfRender;
     };
     target.__documentModel = model;
     target.__workspacePath = workspacePath;
@@ -41,6 +71,21 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
     target.__aiDocument = aiDocument;
     target.__pptx = pptx;
     target.__pptxTemplate = pptxTemplate;
+    target.__pptxDoc = pptxDoc;
+    target.__pptxBuilder = pptxBuilder;
+    target.__aiTools = aiTools;
+    target.__aiActions = aiActions;
+    target.__imageOps = imageOps;
+    target.__explorerOps = explorerOps;
+    target.__appearance = appearance;
+    target.__notifyRules = notifyRules;
+    target.__snapshot = snapshot;
+    target.__redact = redact;
+    target.__layout = layout;
+    target.__aiDiff = aiDiff;
+    target.__pdfOps = pdfOps;
+    target.__pdfAnnotate = pdfAnnotate;
+    target.__pdfRender = pdfRender;
   });
 }
 

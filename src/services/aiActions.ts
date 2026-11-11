@@ -30,6 +30,9 @@ export type AppActionKind =
   | 'save'
   | 'save_as'
   | 'convert_file'
+  | 'create_presentation'
+  | 'image_edit'
+  | 'video_edit'
   | 'notify'
   | 'run_command';
 
@@ -129,7 +132,7 @@ export interface AIDocumentApplyPayload {
   operations: AIDocumentOperation[];
 }
 
-export type SettingsTab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system';
+export type SettingsTab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system' | 'appearance';
 
 export interface AIOpenSettingsPayload {
   action: 'open_settings';
@@ -181,6 +184,36 @@ export interface AIConvertFilePayload {
   format?: string;
 }
 
+/** Собрать .pptx из Markdown-разметки. */
+export interface AICreatePresentationPayload {
+  action: 'create_presentation';
+  name?: string;
+  path?: string;
+  title?: string;
+  /** Содержимое слайдов: «# Заголовок» — новый слайд, «---» — разрыв. */
+  markdown: string;
+  /** Пресет темы из pptxThemes. */
+  theme?: string;
+}
+
+/** Правка изображения теми же операциями, что у инструмента image_transform. */
+export interface AIImageEditPayload {
+  action: 'image_edit';
+  path?: string;
+  /** rotate/flip/crop/resize/convert/compress/thumbnail. */
+  ops: Record<string, unknown>[];
+  output?: string;
+  suffix?: string;
+}
+
+/** Обработка видео теми же полями, что у video_operate. */
+export interface AIVideoEditPayload {
+  action: 'video_edit';
+  path?: string;
+  operation?: 'operate' | 'extract_audio' | 'frames' | 'convert' | 'gif';
+  params?: Record<string, unknown>;
+}
+
 export interface AINotifyPayload {
   action: 'notify';
   message: string;
@@ -213,6 +246,9 @@ export type AIActionPayload =
   | AISavePayload
   | AISaveAsPayload
   | AIConvertFilePayload
+| AICreatePresentationPayload
+| AIImageEditPayload
+| AIVideoEditPayload
   | AINotifyPayload
   | AIRunCommandPayload;
 
@@ -320,6 +356,19 @@ const ACTION_ALIASES: Record<string, AppActionKind> = {
   save_copy: 'save_as',
   export_copy: 'save_as',
   convert_file: 'convert_file',
+create_presentation: 'create_presentation',
+create_pptx: 'create_presentation',
+make_presentation: 'create_presentation',
+presentation: 'create_presentation',
+pptx: 'create_presentation',
+image_edit: 'image_edit',
+edit_image: 'image_edit',
+process_image: 'image_edit',
+image_transform: 'image_edit',
+video_edit: 'video_edit',
+edit_video: 'video_edit',
+process_video: 'video_edit',
+video_operate: 'video_edit',
   convert: 'convert_file',
   transform_file: 'convert_file',
   export_file: 'convert_file',
@@ -640,7 +689,7 @@ function normalizeAction(input: unknown): AIActionPayload | null {
 
     case 'open_settings': {
       const tab = (asString(body.tab) || 'provider').toLowerCase();
-      const allowed: SettingsTab[] = ['provider', 'model', 'prompt', 'keys', 'integrations', 'system'];
+      const allowed: SettingsTab[] = ['provider', 'model', 'prompt', 'keys', 'integrations', 'system', 'appearance'];
       return { action: 'open_settings', tab: allowed.includes(tab as SettingsTab) ? (tab as SettingsTab) : 'provider' };
     }
 
@@ -691,7 +740,56 @@ function normalizeAction(input: unknown): AIActionPayload | null {
       return { action: 'convert_file', source, target, format };
     }
 
-    case 'notify': {
+    case 'create_presentation': {
+const markdown =
+asString(body.markdown) ??
+asString(body.slides_markdown) ??
+asString(body.source_text) ??
+content ??
+'';
+if (!markdown.trim()) return null;
+return {
+action: 'create_presentation',
+name: name || 'Презентация.pptx',
+path,
+title: asString(body.title) || asString(body.heading),
+markdown,
+theme: asString(body.theme) || asString(body.preset),
+};
+}
+
+case 'image_edit': {
+const ops = Array.isArray(body.ops)
+? (body.ops as Record<string, unknown>[])
+: Array.isArray(body.operations)
+? (body.operations as Record<string, unknown>[])
+: [];
+if (ops.length === 0) return null;
+return {
+action: 'image_edit',
+path: path || asString(body.source) || name,
+ops,
+output: asString(body.output),
+suffix: asString(body.suffix),
+};
+}
+
+case 'video_edit': {
+const operation = (asString(body.operation) || 'operate').toLowerCase();
+const allowed = ['operate', 'extract_audio', 'frames', 'convert', 'gif'] as const;
+const kind = allowed.includes(operation as (typeof allowed)[number])
+? (operation as (typeof allowed)[number])
+: 'operate';
+const params = (body.params && typeof body.params === 'object' ? body.params : body) as Record<string, unknown>;
+return {
+action: 'video_edit',
+path: path || asString(body.source) || asString(body.file),
+operation: kind,
+params,
+};
+}
+
+case 'notify': {
       const message = asString(body.message) ?? content;
       if (!message) return null;
       return { action: 'notify', message };

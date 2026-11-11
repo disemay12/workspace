@@ -134,6 +134,39 @@ export function useWorkspace() {
     }
   }, [rootPath, expandedDirs, loadDirectory]);
 
+  /* ---------------- Показ файла в дереве ---------------- */
+
+  /** Файл, который нужно подсветить в проводнике (nonce — повторный показ). */
+  const [revealTarget, setRevealTarget] = useState<{ path: string; nonce: number } | null>(null);
+
+  /**
+   * Раскрывает дерево до файла и просит панель подсветить строку.
+   * Возвращает false, если файл вне текущего корня — тогда вызывающий меняет корень.
+   */
+  const revealPath = useCallback(
+    async (filePath: string): Promise<boolean> => {
+      if (!rootPath) return false;
+      const normalize = (value: string) => value.toLowerCase().replace(/\//g, '\\');
+      const root = normalize(rootPath).replace(/\\+$/, '');
+      const target = normalize(filePath);
+      if (target !== root && !target.startsWith(root + '\\')) return false;
+
+      const base = rootPath.replace(/[\\/]+$/, '');
+      const relative = filePath.slice(base.length).replace(/^[\\/]+/, '');
+      const segments = relative.split(/[\\/]/).slice(0, -1);
+      let cursor = base;
+      for (const segment of segments) {
+        if (!segment) continue;
+        cursor = `${cursor}\\${segment}`;
+        await loadDirectory(cursor);
+        setExpandedDirs((prev) => new Set(prev).add(cursor));
+      }
+      setRevealTarget({ path: filePath, nonce: Date.now() });
+      return true;
+    },
+    [loadDirectory, rootPath]
+  );
+
   /* ---------------- Вкладки ---------------- */
 
   /** Определяет способ чтения файла и нормализует содержимое вкладки. */
@@ -379,9 +412,19 @@ export function useWorkspace() {
   /** Редактирование содержимого вкладки с пересчётом флага несохранённых изменений. */
   const updateTabContent = useCallback((tabId: string, content: string) => {
     setTabs((prev) =>
-      prev.map((t) =>
-        t.id === tabId ? { ...t, content, isDirty: content !== t.initialContent } : t
-      )
+      prev.map((t) => {
+        if (t.id !== tabId) return t;
+        // PDF и прочие бинарные вкладки открываются в режиме «path»: содержимое
+        // читает сам редактор. Как только редактор отдал данные, вкладка
+        // становится base64 — иначе сохранение считает файл доступным только для чтения.
+        const switchToBase64 = t.encoding === 'path' && Boolean(content) && (t.type === 'pdf' || t.type === 'binary');
+        return {
+          ...t,
+          content,
+          encoding: switchToBase64 ? ('base64' as const) : t.encoding,
+          isDirty: content !== t.initialContent,
+        };
+      })
     );
   }, []);
 
@@ -763,6 +806,8 @@ export function useWorkspace() {
     toggleDirectory,
     loadDirectory,
     refreshTree,
+    revealPath,
+    revealTarget,
     // вкладки
     tabs,
     activeTabId,

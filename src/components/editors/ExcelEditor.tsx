@@ -54,6 +54,11 @@ import { injectStylesIntoXlsx } from '../../lib/xlsxStyles';
 import { applyAutoFitColumns } from '../../lib/xlsxColumns';
 import { detectMarkdownTables, normalizeTableValue } from '../../services/aiActions';
 import {
+  openWindowedSheet,
+  shouldOpenWindowed,
+  type WorkerSheetSource,
+} from '../../lib/sheets/sheetSource';
+import {
   columnName,
   computeCellDisplay,
   createContext,
@@ -99,6 +104,26 @@ export interface AIAction {
 
 const MIN_ROWS = 60;
 const MIN_COLS = 16;
+
+/** Сколько строк подгружается за один заход в режиме больших файлов. */
+const WINDOW_ROWS = 4000;
+
+/** Плотная сетка из окна строк воркера: та же форма, что и у полного разбора. */
+function buildWindowGrid(
+  raw: (string | number | boolean | null)[][],
+  minRows = MIN_ROWS,
+  minCols = MIN_COLS
+): (string | number | boolean | null)[][] {
+  const cols = Math.max(minCols, ...raw.map((row) => row.length), 1);
+  const count = Math.max(raw.length, minRows);
+  const grid: (string | number | boolean | null)[][] = [];
+  for (let row = 0; row < count; row++) {
+    const values: (string | number | boolean | null)[] = [];
+    for (let col = 0; col < cols; col++) values.push(raw[row]?.[col] ?? '');
+    grid.push(values);
+  }
+  return grid;
+}
 
 /**
  * Пояснение к ошибке, которую нельзя исправить правкой формулы:
@@ -364,14 +389,83 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
 
   const isCsv = tab.extension === 'csv' || tab.extension === 'tsv';
 
+  /* ---------------- Режим больших файлов ---------------- */
+
+  /** Сводка оконного режима: сколько строк у листа всего и сколько уже загружено. */
+  const [windowed, setWindowed] = useState<{
+    totals: Record<string, number>;
+    loaded: Record<string, number>;
+    progress: number;
+    dirty: boolean;
+  } | null>(null);
+  const windowedRef = useRef<WorkerSheetSource | null>(null);
+  const windowedStateRef = useRef<{
+    totals: Record<string, number>;
+    loaded: Record<string, number>;
+  } | null>(null);
+
   /* ---------------- Разбор книги ---------------- */
 
   useEffect(() => {
-    try {
+    let cancelled = false;
+
+    /** Оконный режим: книга не разбирается целиком, строки идут кусками. */
+    const loadWindowed = async (): Promise<boolean> => {
+      if (!['csv', 'tsv', 'xlsx', 'xls', 'xlsm'].includes(tab.extension)) return false;
+      const large = await shouldOpenWindowed(tab.path, tab.extension).catch(() => false);
+      if (!large) return false;
       setLoading(true);
       setError('');
+      try {
+        const opened = await openWindowedSheet(tab.path, { name: tab.name, ext: tab.extension });
+        if (cancelled) {
+          opened.source.close();
+          return true;
+        }
+        windowedRef.current?.close();
+        windowedRef.current = opened.source;
+        const totals: Record<string, number> = {};
+        for (const sheetMeta of opened.meta) totals[sheetMeta.name] = sheetMeta.rows;
+        const first = opened.meta[0]?.name ?? 'Лист 1';
+        const rows = await opened.source.getWindow(first, 0, WINDOW_ROWS);
+        if (cancelled) return true;
+        const parsed: Workbook = {};
+        for (const sheetMeta of opened.meta) parsed[sheetMeta.name] = [];
+        parsed[first] = buildWindowGrid(rows);
+        const loadedMap: Record<string, number> = { [first]: rows.length };
+        windowedStateRef.current = { totals, loaded: loadedMap };
+        setWindowed({ totals, loaded: loadedMap, progress: 100, dirty: false });
+        setSheetNames(opened.meta.map((sheetMeta) => sheetMeta.name));
+        setActiveSheet(first);
+        metaRef.current = {};
+        setMeta({});
+        setSheets(parsed);
+        setHistory([]);
+        setFuture([]);
+        setAiDiff(null);
+        return true;
+      } catch (err) {
+        if (!cancelled) setError(`Не удалось открыть таблицу: ${(err as Error).message}`);
+        return true;
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
 
-      const isEmpty = !tab.content || tab.content.trim() === '';
+    const load = async () => {
+      const handled = await loadWindowed();
+      if (handled || cancelled) return;
+      if (windowedRef.current) {
+        windowedRef.current.close();
+        windowedRef.current = null;
+        windowedStateRef.current = null;
+        setWindowed(null);
+      }
+      try {
+        setLoading(true);
+        setError('');
+
+        const isEmpty = !tab.content || tab.content.trim() === '';
       const workbook = isEmpty
         ? (() => {
             const wb = XLSX.utils.book_new();
@@ -476,11 +570,20 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       setHistory([]);
       setFuture([]);
       setAiDiff(null);
-    } catch (err) {
-      setError(`Не удалось открыть таблицу: ${(err as Error).message}`);
-    } finally {
-      setLoading(false);
-    }
+      } catch (err) {
+        if (!cancelled) setError(`Не удалось открыть таблицу: ${(err as Error).message}`);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    void load();
+    return () => {
+      cancelled = true;
+      windowedRef.current?.close();
+      windowedRef.current = null;
+      windowedStateRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id, tab.reloadKey, reloadToken]);
 
@@ -522,7 +625,9 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
   }, []);
 
   const OVERSCAN = 30;
-  const totalRows = grid.length;
+  const totalRows = windowed
+    ? Math.max(grid.length, windowed.totals[activeSheet] ?? grid.length)
+    : grid.length;
   const rowOffsets = useMemo(
     () => SheetFmt.buildRowOffsets(activeMeta.rowHeights, totalRows),
     [activeMeta.rowHeights, totalRows]
@@ -551,16 +656,59 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     if (!isVirtual) {
       return grid.map((row, r) => ({ row, r }));
     }
-    return grid.slice(startRow, endRow).map((row, index) => ({
-      row,
-      r: startRow + index,
-    }));
+    const rows: { row: (string | number | boolean | null)[]; r: number }[] = [];
+    for (let r = startRow; r < endRow; r++) rows.push({ row: grid[r] ?? [], r });
+    return rows;
   }, [grid, isVirtual, startRow, endRow]);
+
+  /** Догрузка следующего окна строк в оконном режиме. */
+  const loadMoreRows = useCallback(async (sheet: string) => {
+    const source = windowedRef.current;
+    const state = windowedStateRef.current;
+    if (!source || !state) return;
+    const total = state.totals[sheet] ?? 0;
+    const loaded = state.loaded[sheet] ?? 0;
+    if (loaded >= total) return;
+    try {
+      const rows = await source.getWindow(sheet, loaded, WINDOW_ROWS);
+      if (rows.length === 0) return;
+      state.loaded[sheet] = loaded + rows.length;
+      windowedStateRef.current = state;
+      setSheets((prev) => {
+        const grid = prev[sheet] ? [...prev[sheet]] : [];
+        const cols = Math.max(
+          MIN_COLS,
+          ...grid.map((row) => row.length),
+          ...rows.map((row) => row.length),
+          1
+        );
+        rows.forEach((row, index) => {
+          const values: (string | number | boolean | null)[] = [];
+          for (let col = 0; col < cols; col++) values.push(row[col] ?? '');
+          grid[loaded + index] = values;
+        });
+        return { ...prev, [sheet]: grid };
+      });
+      setWindowed((prev) => (prev ? { ...prev, loaded: { ...state.loaded } } : prev));
+    } catch (err) {
+      setError(`Не удалось загрузить строки: ${(err as Error).message}`);
+    }
+  }, []);
+
+  // Прокрутка близко к краю — просим следующее окно.
+  useEffect(() => {
+    if (!windowed) return;
+    const loaded = windowed.loaded[activeSheet] ?? 0;
+    if (loaded === 0 || endRow >= loaded - 20) void loadMoreRows(activeSheet);
+  }, [windowed, activeSheet, endRow, loadMoreRows]);
 
   /* ---------------- Синхронизация с содержимым вкладки ---------------- */
 
   const syncWorkbook = useCallback(
     async (nextSheets: Workbook, names: string[]): Promise<string | null> => {
+      // В оконном режиме книга не пересобирается на каждое изменение:
+      // это делается один раз при сохранении (flushWindowed).
+      if (windowedRef.current) return null;
       const seq = ++syncSeqRef.current;
       try {
         const wb = XLSX.utils.book_new();
@@ -714,6 +862,63 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     },
     [activeSheet, isCsv, onChange, tab.extension]
   );
+
+  /**
+   * Сохранение оконного режима: сначала догружаем остаток строк,
+   * затем собираем книгу обычным путём (сериализация нужна один раз).
+   */
+  const flushWindowed = useCallback(async () => {
+    const source = windowedRef.current;
+    const state = windowedStateRef.current;
+    if (!source || !state) return;
+    setLoading(true);
+    try {
+      for (const sheet of sheetNamesRef.current) {
+        const total = state.totals[sheet] ?? 0;
+        let loaded = state.loaded[sheet] ?? 0;
+        while (loaded < total) {
+          const rows = await source.getWindow(sheet, loaded, WINDOW_ROWS * 4);
+          if (rows.length === 0) break;
+          const grid = sheetsRef.current[sheet] ? [...sheetsRef.current[sheet]] : [];
+          const cols = Math.max(
+            MIN_COLS,
+            ...grid.map((row) => row.length),
+            ...rows.map((row) => row.length),
+            1
+          );
+          rows.forEach((row, index) => {
+            const values: (string | number | boolean | null)[] = [];
+            for (let col = 0; col < cols; col++) values.push(row[col] ?? '');
+            grid[loaded + index] = values;
+          });
+          sheetsRef.current = { ...sheetsRef.current, [sheet]: grid };
+          loaded += rows.length;
+          state.loaded[sheet] = loaded;
+        }
+      }
+      windowedStateRef.current = state;
+      setSheets({ ...sheetsRef.current });
+      setWindowed((prev) => (prev ? { ...prev, loaded: { ...state.loaded }, dirty: false } : prev));
+
+      const guard = windowedRef.current;
+      windowedRef.current = null;
+      try {
+        const content = await syncWorkbook(sheetsRef.current, sheetNamesRef.current);
+        if (content) onChange(content);
+      } finally {
+        windowedRef.current = guard;
+      }
+    } catch (err) {
+      setError(`Не удалось подготовить книгу к сохранению: ${(err as Error).message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [onChange, syncWorkbook]);
+
+  const saveWithWindowed = useCallback(async () => {
+    if (windowedRef.current) await flushWindowed();
+    await onSave();
+  }, [flushWindowed, onSave]);
 
   /* ---------------- Вычисление формул ---------------- */
 
@@ -2817,6 +3022,22 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           <button className="block w-full rounded px-3 py-1.5 text-left text-ws-danger hover:bg-red-500/10" onClick={() => { deleteSelectionColumns(); setCellMenu(null); }}>Удалить столбцы</button>
         </div>
       )}
+      {windowed && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-3 py-1 text-[11px] text-ws-warning">
+          <FileSpreadsheet size={11} />
+          <span>
+            Режим больших файлов: загружено {windowed.loaded[activeSheet] ?? 0} из{' '}
+            {windowed.totals[activeSheet] ?? 0} строк
+          </span>
+          <span className="flex-1" />
+          <button
+            onClick={() => void flushWindowed()}
+            className="rounded border border-ws bg-ws-elevated px-1.5 py-0.5 text-[10px] text-ws hover:bg-ws-hover"
+          >
+            Загрузить всё
+          </button>
+        </div>
+      )}
       {aiDiff && aiDiff.cells.length > 0 && (
         <div
           data-ai-diff="1"
@@ -2982,9 +3203,13 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           <div className="h-3.5 w-px border-l border-ws" />
 
           <button
-            onClick={onSave}
-            disabled={!tab.isDirty}
-            title="Сохранить (Ctrl+S)"
+            onClick={() => void saveWithWindowed()}
+            disabled={!tab.isDirty && !windowed}
+            title={
+              windowed
+                ? 'Сохранить: книга будет догружена целиком'
+                : 'Сохранить (Ctrl+S)'
+            }
             className={cn(
               'flex items-center gap-1 rounded px-2.5 py-1 font-medium transition-colors',
               tab.isDirty ? 'bg-ws-accent text-white hover:opacity-90' : 'bg-ws-panel-alt text-ws-faint'

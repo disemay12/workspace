@@ -7,6 +7,7 @@ import {
   ChatSession,
 } from '../types';
 import { uid } from '../lib/utils';
+import { DEFAULT_PROFILES, mergeProfiles } from '../lib/aiProfiles';
 
 /* ============================================================
    Пресеты AI-провайдеров
@@ -136,6 +137,8 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   systemPrompt:
     'Ты — профессиональный ассистент и оператор рабочего пространства WorkSpace. Ты можешь отвечать на вопросы, писать код, анализировать логи и формулы Excel, а также НАПРЯМУЮ УПРАВЛЯТЬ приложением (создавать таблицы и файлы через блок workspace-action). Отвечай структурированно и по существу.',
   activePresetId: 'general',
+  promptProfiles: [...DEFAULT_PROFILES],
+  activeProfileId: 'general',
 };
 
 const PRESET_URLS = new Set(
@@ -341,7 +344,14 @@ function loadSettings(): AISettings {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
     if (raw) {
-      return normalizeSettings({ ...DEFAULT_AI_SETTINGS, ...(JSON.parse(raw) as Partial<AISettings>) });
+      const parsed = JSON.parse(raw) as Partial<AISettings>;
+    return normalizeSettings({
+      ...DEFAULT_AI_SETTINGS,
+      ...parsed,
+      // Системные профили не должны пропадать из сохранённых настроек.
+      promptProfiles: mergeProfiles(parsed.promptProfiles),
+      activeProfileId: parsed.activeProfileId || DEFAULT_PROFILES[0].id,
+    });
     }
   } catch {
     // повреждённые настройки — используем значения по умолчанию

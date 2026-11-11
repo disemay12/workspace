@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Загрузка видео на YouTube через тот же Google-аккаунт, что и Drive.
  *
  * Используется resumable upload: файл уходит кусками, а не целиком в память.
@@ -6,6 +6,7 @@
  * категория, теги, язык, «сделано для детей», лицензия и запись в плейлист.
  */
 import { ipcMain } from 'electron';
+import { mapGoogleError } from './googleAuth';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -28,7 +29,8 @@ const CHUNK = 8 * 1024 * 1024;
 
 async function token(): Promise<string> {
   const mod = await import('./gdrive');
-  return mod.getGoogleAccessToken();
+  // Загрузка видео требует согласия именно на YouTube-скоупы.
+  return mod.getGoogleAccessToken('youtube');
 }
 
 export async function uploadYoutube(
@@ -67,7 +69,7 @@ export async function uploadYoutube(
     }
   );
   if (!start.ok) {
-    return { success: false, error: 'YouTube не принял метаданные: ' + (await start.text()).slice(0, 400) };
+    return { success: false, error: mapGoogleError(await start.text()) };
   }
   const location = start.headers.get('location');
   if (!location) return { success: false, error: 'YouTube не выдал адрес загрузки' };
@@ -108,7 +110,7 @@ export async function uploadYoutube(
         return { success: true, id: data.id, url: data.id ? 'https://youtu.be/' + data.id : undefined };
       }
       if (put.status !== 308) {
-        return { success: false, error: 'Загрузка прервана: ' + put.status + ' ' + (await put.text()).slice(0, 300) };
+        return { success: false, error: mapGoogleError(await put.text()) };
       }
       const range = put.headers.get('range');
       const uploaded = range ? Number(range.split('-')[1]) + 1 : end + 1;
@@ -128,7 +130,7 @@ export function registerYoutube(): void {
         'https://www.googleapis.com/youtube/v3/videoCategories?part=snippet&regionCode=RU',
         { headers: { Authorization: 'Bearer ' + access } }
       );
-      if (!res.ok) return { success: false, categories: [], error: (await res.text()).slice(0, 300) };
+      if (!res.ok) return { success: false, categories: [], error: mapGoogleError(await res.text()) };
       const data = (await res.json()) as { items?: { id: string; snippet?: { title?: string; assignable?: boolean } }[] };
       const categories = (data.items || [])
         .filter((item) => item.snippet?.assignable !== false)
@@ -146,7 +148,7 @@ export function registerYoutube(): void {
         'https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50',
         { headers: { Authorization: 'Bearer ' + access } }
       );
-      if (!res.ok) return { success: false, playlists: [], error: (await res.text()).slice(0, 300) };
+      if (!res.ok) return { success: false, playlists: [], error: mapGoogleError(await res.text()) };
       const data = (await res.json()) as { items?: { id: string; snippet?: { title?: string } }[] };
       return {
         success: true,

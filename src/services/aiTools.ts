@@ -1601,7 +1601,650 @@ const MARKDOWN_TOOLS: ToolDefinition[] = [
   },
 ];
 
-/** Сохранение в другом формате и конвертация файлов — доступны всегда. */
+/** Расширенное управление слайдами: всё, что умеет модель документа. */
+const PPTX_ADVANCED_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_get_slide',
+      description:
+        'Читает один слайд: фон, переход, заметки и фигуры с shape_id, типом, геометрией в см и текстом.',
+      parameters: {
+        type: 'object',
+        properties: { slide: { type: 'number', description: 'Номер слайда с 1.' } },
+        required: ['slide'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_duplicate_slide',
+      description: 'Дублирует слайд со всем содержимым.',
+      parameters: {
+        type: 'object',
+        properties: { index: { type: 'number', description: 'Номер слайда с 1.' } },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_hide_slide',
+      description: 'Скрывает или показывает слайд при показе.',
+      parameters: {
+        type: 'object',
+        properties: {
+          index: { type: 'number', description: 'Номер слайда с 1.' },
+          hidden: { type: 'boolean', description: 'true — скрыть, false — показать.' },
+        },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_slide_size',
+      description: 'Размер слайда: пресет 16:9, 4:3, 16:10 или явные размеры в сантиметрах.',
+      parameters: {
+        type: 'object',
+        properties: {
+          preset: { type: 'string', description: '16:9, 4:3 или 16:10.' },
+          width_cm: { type: 'number', description: 'Ширина в см (вместо пресета).' },
+          height_cm: { type: 'number', description: 'Высота в см (вместо пресета).' },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_transition',
+      description: 'Переход слайда: none, fade, push, wipe, cut.',
+      parameters: {
+        type: 'object',
+        properties: {
+          index: { type: 'number', description: 'Номер слайда с 1.' },
+          type: { type: 'string', description: 'none | fade | push | wipe | cut.' },
+          speed: { type: 'string', description: 'slow | med | fast.' },
+        },
+        required: ['index', 'type'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_background',
+      description: 'Фон слайда: сплошной цвет HEX или изображение из workspace/URL.',
+      parameters: {
+        type: 'object',
+        properties: {
+          index: { type: 'number', description: 'Номер слайда с 1.' },
+          color: { type: 'string', description: 'Цвет без #, например 0F172A.' },
+          image: { type: 'string', description: 'Путь к изображению внутри workspace.' },
+          all: { type: 'boolean', description: 'true — применить ко всем слайдам.' },
+        },
+        required: ['index'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_format_text',
+      description:
+        'Форматирует текст фигуры целиком: жирный, курсив, подчёркивание, зачёркивание, размер, цвет, шрифт, выравнивание, списки, уровень.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number', description: 'Номер слайда с 1.' },
+          shape_id: { type: 'string', description: 'Идентификатор фигуры из pptx_get_slide.' },
+          bold: { type: 'boolean' },
+          italic: { type: 'boolean' },
+          underline: { type: 'boolean' },
+          strike: { type: 'boolean' },
+          size: { type: 'number', description: 'Размер в пунктах.' },
+          color: { type: 'string', description: 'Цвет без #.' },
+          font: { type: 'string', description: 'Семейство шрифта, например Calibri.' },
+          align: { type: 'string', description: 'l | ctr | r | just.' },
+          bullet: { type: 'string', description: 'none | bullet | number.' },
+          level: { type: 'number', description: 'Уровень списка 0–4.' },
+          line_spacing: { type: 'number', description: 'Межстрочный интервал.' },
+        },
+        required: ['slide', 'shape_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_find_replace',
+      description: 'Ищет и заменяет текст по всем слайдам (при необходимости и в заметках).',
+      parameters: {
+        type: 'object',
+        properties: {
+          find: { type: 'string' },
+          replace: { type: 'string' },
+          include_notes: { type: 'boolean' },
+        },
+        required: ['find'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_add_shape',
+      description:
+        'Добавляет фигуру: geom (rect, ellipse, roundRect, triangle, arrow, line…), позиция и размер, заливка, контур, тень, текст.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number', description: 'Номер слайда с 1.' },
+          geom: { type: 'string', description: 'Пресет геометрии PowerPoint.' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+          unit: { type: 'string', description: 'cm или emu (по умолчанию emu).' },
+          fill: { type: 'string', description: 'Цвет заливки без #.' },
+          outline_color: { type: 'string' },
+          outline_width: { type: 'number', description: 'Толщина контура в пунктах.' },
+          shadow: { type: 'boolean' },
+          text: { type: 'string' },
+        },
+        required: ['slide'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_shape_geometry',
+      description: 'Меняет позицию, размер или поворот фигуры.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number' },
+          shape_id: { type: 'string' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+          rotation: { type: 'number', description: 'Поворот в градусах.' },
+          unit: { type: 'string', description: 'cm или emu.' },
+        },
+        required: ['slide', 'shape_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_delete_shape',
+      description: 'Удаляет фигуру слайда по shape_id.',
+      parameters: {
+        type: 'object',
+        properties: { slide: { type: 'number' }, shape_id: { type: 'string' } },
+        required: ['slide', 'shape_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_duplicate_shape',
+      description: 'Дублирует фигуру со смещением.',
+      parameters: {
+        type: 'object',
+        properties: { slide: { type: 'number' }, shape_id: { type: 'string' } },
+        required: ['slide', 'shape_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_reorder_shape',
+      description: 'Меняет порядок наложения фигуры: front, back, forward, backward.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number' },
+          shape_id: { type: 'string' },
+          mode: { type: 'string', description: 'front | back | forward | backward.' },
+        },
+        required: ['slide', 'shape_id', 'mode'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_shape_style',
+      description: 'Заливка, контур и тень фигуры. "none" убирает заливку или контур.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number' },
+          shape_id: { type: 'string' },
+          fill: { type: 'string', description: 'Цвет без # или none.' },
+          outline: { type: 'string', description: 'Цвет без # или none.' },
+          outline_width: { type: 'number' },
+          shadow: { type: 'boolean' },
+        },
+        required: ['slide', 'shape_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_add_table',
+      description: 'Вставляет таблицу с данными; размеры в см при unit=cm.',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number' },
+          rows: { type: 'number' },
+          cols: { type: 'number' },
+          data: {
+            type: 'array',
+            description: 'Матрица строк текста (может задать rows/cols автоматически).',
+            items: { type: 'array', items: { type: 'string' } },
+          },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+          unit: { type: 'string', description: 'cm или emu.' },
+        },
+        required: ['slide'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_set_table_data',
+      description: 'Заменяет текст в существующей таблице (shape_id из pptx_get_slide).',
+      parameters: {
+        type: 'object',
+        properties: {
+          slide: { type: 'number' },
+          shape_id: { type: 'string' },
+          data: {
+            type: 'array',
+            description: 'Матрица новых значений.',
+            items: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        required: ['slide', 'shape_id', 'data'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_apply_theme',
+      description:
+        'Применяет тему: пресет (office, ink, ocean, forest, sunset, mono…), набор цветов схемы и шрифтовую пару.',
+      parameters: {
+        type: 'object',
+        properties: {
+          preset: { type: 'string', description: 'Идентификатор пресета темы.' },
+          colors: {
+            type: 'object',
+            description: 'Переопределение слотов схемы: dk1, lt1, dk2, lt2, accent1…accent6, hlink, folHlink.',
+            additionalProperties: { type: 'string' },
+          },
+          font_pair: { type: 'string', description: 'Идентификатор шрифтовой пары (calibri, segoe, arial…).' },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_present',
+      description: 'Запускает полноэкранный показ слайдов в приложении.',
+      parameters: {
+        type: 'object',
+        properties: { slide: { type: 'number', description: 'Слайд, с которого начать.' } },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_export_pdf',
+      description: 'Экспортирует презентацию в PDF (страницы размером со слайд).',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Куда сохранить PDF внутри workspace.' } },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pptx_export_images',
+      description: 'Сохраняет каждый слайд в PNG (по умолчанию в «Загрузки»): файлы slide-01.png и далее.',
+      parameters: {
+        type: 'object',
+        properties: {
+          dir: { type: 'string', description: 'Папка для PNG внутри workspace. Без неё — «Загрузки».' },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/** Управление изображениями: работает и для открытой вкладки, и для файлов. */
+const IMAGE_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'image_info',
+      description: 'Размеры, формат, вес файла изображения. Без path — открытое изображение.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'image_transform',
+      description:
+        'Правит изображение: rotate (90/-90/180), flip (h/v), crop (x,y,w,h, unit px или %), ' +
+        'resize (mode fit/exact/max, width/height/max, keep_aspect), convert (png/jpeg/webp + quality), ' +
+        'compress (max_kb), thumbnail (max). Операции применяются по порядку.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Файл; без него — открытое изображение.' },
+          ops: {
+            type: 'array',
+            description:
+              'Список операций. Пример: [{"op":"rotate","degrees":90},{"op":"resize","mode":"max","max":1600},' +
+              '{"op":"compress","max_kb":300}]',
+            items: { type: 'object', additionalProperties: true },
+          },
+          output: { type: 'string', description: 'overwrite | copy | путь к новому файлу (по умолчанию copy).' },
+          suffix: { type: 'string', description: 'Суффикс имени при copy, по умолчанию -edit.' },
+        },
+        required: ['ops'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'image_batch',
+      description: 'Применяет те же операции к нескольким файлам или папке; по умолчанию создаёт копии.',
+      parameters: {
+        type: 'object',
+        properties: {
+          paths: { type: 'array', items: { type: 'string' }, description: 'Список файлов.' },
+          dir: { type: 'string', description: 'Папка (без рекурсии).' },
+          ops: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          suffix: { type: 'string' },
+          overwrite: { type: 'boolean', description: 'true — перезаписывать оригиналы.' },
+        },
+        required: ['ops'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'image_insert',
+      description: 'Вставляет изображение в открытый Word-документ или слайд презентации.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          target: { type: 'string', description: 'word | slide.' },
+          slide: { type: 'number', description: 'Номер слайда, если target=slide.' },
+        },
+        required: ['path', 'target'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'image_upload',
+      description:
+        'Загружает изображения на хостинг и возвращает ссылки: imgbb, freeimage, yapx, imgur, catbox, teleph.',
+      parameters: {
+        type: 'object',
+        properties: {
+          paths: { type: 'array', items: { type: 'string' } },
+          host: { type: 'string', description: 'imgbb | freeimage | yapx | imgur | catbox | teleph.' },
+        },
+        required: ['paths'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'image_open',
+      description: 'Открывает изображение во вкладке редактора.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/** Управление видео: обработка через ffmpeg главного процесса. */
+const VIDEO_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'video_info',
+      description: 'Длительность, разрешение, частота кадров, дорожки аудио и субтитров.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'video_operate',
+      description:
+        'Обрезает, ускоряет, сжимает, убирает звук или кадрирует видео (зум). ' +
+        'Без вкладки обрабатывает файл по path, с открытой вкладкой — применяет к ней.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          start: { type: 'number', description: 'Начало, секунды.' },
+          end: { type: 'number', description: 'Конец, секунды.' },
+          speed: { type: 'number', description: 'Множитель скорости 0.25–4.' },
+          speed_segments: {
+            type: 'array',
+            description: 'Сегменты разной скорости: [{start,end,speed}].',
+            items: { type: 'object', additionalProperties: true },
+          },
+          strip_audio: { type: 'boolean' },
+          compress: { type: 'boolean' },
+          zoom_scale: { type: 'number', description: 'Кадрирование 1–4.' },
+          zoom_x: { type: 'number', description: 'Смещение по X -1…1.' },
+          zoom_y: { type: 'number', description: 'Смещение по Y -1…1.' },
+          output: { type: 'string', description: 'Путь результата.' },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'video_extract_audio',
+      description: 'Извлекает звук в mp3/aac (copy — без перекодирования, если дорожка подходит).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          format: { type: 'string', description: 'mp3 | aac | copy.' },
+          output: { type: 'string' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'video_frames',
+      description: 'Делает кадры-миниатюры (по умолчанию 12 равномерно) в папку рядом с видео.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          count: { type: 'number', description: 'Сколько кадров, 1–24.' },
+          at: { type: 'array', items: { type: 'number' }, description: 'Точные секунды кадров.' },
+          max_width: { type: 'number' },
+          dir: { type: 'string', description: 'Куда сохранить кадры.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'video_convert',
+      description: 'Конвертирует видео в mp4, webm или gif.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          format: { type: 'string', description: 'mp4 | webm | gif.' },
+          quality: { type: 'string', description: 'low | medium | high.' },
+          output: { type: 'string' },
+        },
+        required: ['path', 'format'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'video_gif',
+      description: 'Создаёт GIF из отрезка видео.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          start: { type: 'number' },
+          duration: { type: 'number', description: 'Длительность отрезка, секунды.' },
+          fps: { type: 'number', description: 'Кадров в секунду, 5–30.' },
+          width: { type: 'number', description: 'Ширина GIF, px.' },
+          output: { type: 'string' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'video_publish',
+      description: 'Публикует видео на YouTube (нужно подключение YouTube в настройках).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          title: { type: 'string' },
+          description: { type: 'string' },
+          privacy: { type: 'string', description: 'private | unlisted | public.' },
+          category: { type: 'string' },
+          playlist: { type: 'string' },
+        },
+        required: ['path', 'title'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/** Сборка презентации из markdown — доступна всегда. */
+const CREATE_PRESENTATION_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'create_presentation',
+    description:
+      'Создаёт .pptx из Markdown-разметки: "«# Заголовок»" начинает слайд, "---" — принудительный разрыв, ' +
+      'списки и абзацы идут в тело, таблица Markdown становится таблицей PowerPoint, ```код``` — моноширинным блоком. ' +
+      'Используй это действие, когда просят создать презентацию, а не Markdown-файл.',
+    parameters: {
+      type: 'object',
+      properties: {
+        markdown: { type: 'string', description: 'Содержимое будущих слайдов.' },
+        name: { type: 'string', description: 'Имя файла, например Презентация.pptx.' },
+        path: { type: 'string', description: 'Папка внутри workspace.' },
+        title: { type: 'string', description: 'Заголовок титульного слайда.' },
+        theme: { type: 'string', description: 'Пресет темы: office, ink, ocean, forest, sunset, mono…' },
+      },
+      required: ['markdown'],
+      additionalProperties: false,
+    },
+  },
+};
+
+
 const FILE_TOOLS: ToolDefinition[] = [
   {
     type: 'function',
@@ -1636,7 +2279,8 @@ const FILE_TOOLS: ToolDefinition[] = [
       name: 'convert_file',
       description:
         'Конвертирует любой файл workspace: Markdown/текст/HTML в DOCX, CSV/TSV в XLSX, ' +
-        'DOCX/XLSX/PPTX в Markdown/текст/HTML/PDF, Markdown-таблицу в XLSX. ' +
+        'DOCX/XLSX/PPTX в Markdown/текст/HTML/PDF, Markdown-таблицу в XLSX, ' +
+        'Markdown/текст/HTML в PPTX (слайды по заголовкам). ' +
         'Создаёт новый файл, исходный не меняет.',
       parameters: {
         type: 'object',
@@ -1656,7 +2300,7 @@ const FILE_TOOLS: ToolDefinition[] = [
 ];
 
 function withFileTools(tools: ToolDefinition[]): ToolDefinition[] {
-  return [...tools, ...FILE_TOOLS];
+  return [...tools, ...FILE_TOOLS, CREATE_PRESENTATION_TOOL];
 }
 
 export function buildDocumentTools(writeAccess: boolean, tabType: FileType | string): ToolDefinition[] {
@@ -1670,13 +2314,22 @@ export function buildDocumentTools(writeAccess: boolean, tabType: FileType | str
         );
   }
   if (tabType === 'powerpoint') {
+    const all = [...PPTX_TOOLS, ...PPTX_ADVANCED_TOOLS];
     return writeAccess
-      ? withFileTools(PPTX_TOOLS)
+      ? withFileTools(all)
       : withFileTools(
-          PPTX_TOOLS.filter((tool) =>
-            ['pptx_read', 'pptx_get_selection'].includes(tool.function.name)
-          )
+          all.filter((tool) => ['pptx_read', 'pptx_get_selection'].includes(tool.function.name))
         );
+  }
+  if (tabType === 'image') {
+    return writeAccess
+      ? withFileTools(IMAGE_TOOLS)
+      : withFileTools(IMAGE_TOOLS.filter((tool) => tool.function.name === 'image_info'));
+  }
+  if (tabType === 'video') {
+    return writeAccess
+      ? withFileTools(VIDEO_TOOLS)
+      : withFileTools(VIDEO_TOOLS.filter((tool) => tool.function.name === 'video_info'));
   }
   if (tabType === 'markdown' || tabType === 'richtext' || tabType === 'text') {
     return writeAccess
@@ -1724,6 +2377,8 @@ const TYPE_LABEL: Record<string, string> = {
   word: 'Word (.docx)',
   excel: 'Excel (.xlsx)',
   powerpoint: 'PowerPoint (.pptx)',
+  image: 'изображение',
+  video: 'видео',
   markdown: 'Markdown',
   richtext: 'текст',
   text: 'текст',
@@ -1798,8 +2453,37 @@ function buildDocumentTypePrompt(context: DocumentPromptContext): string {
       '- pptx_insert_image: slide и src (путь workspace, data URL или http-ссылка); width/height в px.',
       '- pptx_set_notes: заметки докладчика без изменения текста слайда.',
       '- pptx_set_layout: имя или номер макета из pptx_read.',
+      `- Полный набор: ${PPTX_ADVANCED_TOOLS.map((tool) => tool.function.name).join(', ')}.`,
+      '- Слайды: pptx_get_slide (shape_id и геометрия в см), pptx_duplicate_slide, pptx_hide_slide, pptx_set_slide_size, pptx_set_transition, pptx_set_background.',
+      '- Текст: pptx_format_text (жирный/курсив/размер/цвет/шрифт/выравнивание/списки) по всей фигуре, pptx_find_replace по всем слайдам.',
+      '- Фигуры: pptx_add_shape (geom, заливка, контур, тень, текст), pptx_set_shape_geometry (unit "cm" или "emu"), pptx_set_shape_style, pptx_reorder_shape, pptx_duplicate_shape, pptx_delete_shape.',
+      '- Таблицы и тема: pptx_add_table (data — матрица строк), pptx_set_table_data, pptx_apply_theme (preset/colors/font_pair).',
+      '- Показ и экспорт: pptx_present, pptx_export_pdf. Новая презентация из текста — create_presentation, а не Markdown-файл.',
       '- Не создавай новый файл и не переписывай презентацию целиком из-за одного слайда.',
       '- В чате — короткий отчёт; текст слайдов в чат не дублируй.',
+    ].join('\n');
+  }
+
+  if (context.type === 'image') {
+    return [
+      ...header,
+      '- Это изображение. Правки — инструментами image_transform и image_batch, а не переписыванием файла.',
+      `- Доступно: ${IMAGE_TOOLS.map((tool) => tool.function.name).join(', ')}.`,
+      '- image_transform: ops по порядку — rotate/flip/crop/resize/convert/compress/thumbnail; по умолчанию результат в копию с суффиксом -edit.',
+      '- image_info: размеры, формат и вес. image_upload: ссылки с imgbb/freeimage/yapx/imgur/catbox. image_insert: в открытый Word или слайд.',
+      '- В чат — только отчёт: что сделано, новые размеры и путь файла.',
+    ].join('\n');
+  }
+
+  if (context.type === 'video') {
+    return [
+      ...header,
+      '- Это видео. Обработка идёт через ffmpeg; без ffmpeg инструменты вернут ошибку, превью работает.',
+      `- Доступно: ${VIDEO_TOOLS.map((tool) => tool.function.name).join(', ')}.`,
+      '- video_operate: start/end, speed, speed_segments, strip_audio, compress, zoom_scale/zoom_x/zoom_y, output — обрезка, скорость, сжатие и кадрирование.',
+      '- video_extract_audio, video_frames, video_convert, video_gif — производные файлы; оригинал не меняется.',
+      '- video_publish — публикация на YouTube (нужно подключение в настройках).',
+      '- В чат — отчёт: длительность, что сделано и путь результата.',
     ].join('\n');
   }
 

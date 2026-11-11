@@ -37,6 +37,8 @@ import {
 } from 'lucide-react';
 import { AISettings, ChatAttachment, ChatMessage, ChatSession, OpenTab, ToolRun } from '../../types';
 import { aiService, ToolsUnsupportedError } from '../../services/aiService';
+import { describeUsage } from '../../lib/aiCost';
+import { describeOperations, filterOperations, toggleExcluded } from '../../lib/aiDiff';
 import { buildDocumentSystemPrompt, buildDocumentTools, supportsNativeDocumentTools } from '../../services/aiTools';
 import { AGENT_TAB_TYPES, DOCUMENT_TAB_TYPES, type DocumentToolResult } from '../../lib/documentModel';
 import { SYSTEM_PRESETS, PROVIDER_PRESETS } from '../../state/settings';
@@ -285,6 +287,9 @@ export const AIChatPanel: React.FC<Props> = ({
   const [isStreaming, setIsStreaming] = useState(false);
   /** Что делает агент прямо сейчас («Читаю документ…», «Правлю документ…»). */
   const [agentStatus, setAgentStatus] = useState('');
+  const [lastUsage, setLastUsage] = useState<{ promptTokens: number; completionTokens: number } | null>(
+    null
+  );
   const [toolTrace, setToolTrace] = useState<string[]>([]);
   const toolTraceRef = useRef<string[]>([]);
   /** Детальный след вызовов — сохраняется в истории для следующего запроса. */
@@ -611,6 +616,7 @@ export const AIChatPanel: React.FC<Props> = ({
               });
 
               buffer = result.text.trim();
+              if (result.usage) setLastUsage(result.usage);
               toolRunsRef.current.push(...result.toolRuns);
               toolsUsed = documentTouched;
               if (!buffer) {
@@ -1255,6 +1261,7 @@ export const AIChatPanel: React.FC<Props> = ({
             key={msg.id}
             message={msg}
             isCopied={copiedId === msg.id}
+            usageLabel={lastUsage && !isStreaming ? describeUsage(settings.model || '', lastUsage) : ''}
             agentStatus={
               isStreaming && msg.id === messages[messages.length - 1]?.id ? agentStatus : ''
             }
@@ -1485,6 +1492,24 @@ const ACTION_META: Record<
     box: 'border-blue-500/30 bg-blue-500/10',
     iconBox: 'bg-blue-500/20 text-blue-400',
   },
+  create_presentation: {
+    label: 'Создать презентацию',
+    icon: <FilePlus size={15} />,
+    box: 'border-orange-500/30 bg-orange-500/10',
+    iconBox: 'bg-orange-500/20 text-orange-400',
+  },
+  image_edit: {
+    label: 'Обработать изображение',
+    icon: <FilePlus size={15} />,
+    box: 'border-sky-500/30 bg-sky-500/10',
+    iconBox: 'bg-sky-500/20 text-sky-400',
+  },
+  video_edit: {
+    label: 'Обработать видео',
+    icon: <FilePlus size={15} />,
+    box: 'border-violet-500/30 bg-violet-500/10',
+    iconBox: 'bg-violet-500/20 text-violet-400',
+  },
   open_file: {
     label: 'Открыть файл',
     icon: <FolderOpen size={15} />,
@@ -1635,6 +1660,14 @@ function describeAction(action: AIActionPayload): string {
       return `${action.path || action.name || 'Рядом с исходным'} · ${action.format || 'формат'}`;
     case 'convert_file':
       return `${action.source || 'Файл'} → ${action.target || action.format || 'новый формат'}`;
+    case 'create_presentation': {
+      const slides = action.markdown.split(/^#\s/m).filter(Boolean).length;
+      return `${action.name || 'Презентация.pptx'}${slides > 1 ? ` · ${slides} слайдов` : ''}`;
+    }
+    case 'image_edit':
+      return `${action.path || 'Открытое изображение'} · операций: ${action.ops.length}`;
+    case 'video_edit':
+      return `${action.path || 'Открытое видео'} · ${action.operation || 'operate'}`;
     case 'notify':
       return action.message;
     case 'run_command':
@@ -1978,6 +2011,8 @@ const MessageBubble: React.FC<{
   isCopied: boolean;
   /** Текущий шаг агента, пока ответ ещё пуст. */
   agentStatus?: string;
+  /** Строка «N токенов · $X» для последнего ответа. */
+  usageLabel?: string;
   /** Инструменты, которые уже вызваны в этом ответе. */
   toolTrace?: string[];
   /** Файлы, прочитанные ассистентом ради ответа. */
@@ -1999,6 +2034,7 @@ const MessageBubble: React.FC<{
   message,
   isCopied,
   agentStatus,
+  usageLabel,
   toolTrace,
   contextFiles,
   onCopy,
@@ -2012,6 +2048,8 @@ const MessageBubble: React.FC<{
   onCreateTableFromMarkdown,
 }) => {
   const isUser = message.role === 'user';
+  // Правки документа можно применять выборочно: индексы отключённых операций.
+  const [excludedOps, setExcludedOps] = useState<Record<string, number[]>>({});
   const codeBlocks = useMemo(
     () =>
       isUser
@@ -2114,6 +2152,10 @@ const MessageBubble: React.FC<{
             </span>
           ) : null}
 
+          {!isUser && usageLabel && !message.streaming && (
+            <div className="mt-1.5 text-[10px] text-ws-faint">{usageLabel}</div>
+          )}
+
           {!isUser && toolTrace && toolTrace.length > 0 && (
             <div className="mt-1.5 flex flex-wrap gap-1">
               {toolTrace.map((name) => (
@@ -2159,15 +2201,70 @@ const MessageBubble: React.FC<{
                       : undefined);
 
             return (
-              <AIActionCard
-                key={actionKey}
-                action={act}
-                status={state.status}
-                result={state.result}
-                error={state.error}
-                onExecute={() => onExecuteAction(act, actionKey)}
-                onOpen={targetPath && onOpenFile ? () => onOpenFile(targetPath) : undefined}
-              />
+              <div key={actionKey}>
+                {act.action === 'document_apply' && act.operations.length > 0 && (
+                  <div className="mt-2 rounded-lg border border-ws bg-ws-surface p-2 text-[11px]">
+                    <div className="mb-1 flex items-center justify-between text-ws-muted">
+                      <span>Правки документа</span>
+                      <span className="text-ws-faint">
+                        {describeOperations(act.operations.length, excludedOps[actionKey] ?? [])}
+                      </span>
+                    </div>
+                    {act.operations.map((op, opIndex) => {
+                      const disabled = (excludedOps[actionKey] ?? []).includes(opIndex);
+                      return (
+                        <label
+                          key={`${actionKey}_op_${opIndex}`}
+                          className="flex cursor-pointer items-center gap-1.5 py-0.5"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={!disabled}
+                            onChange={() =>
+                              setExcludedOps((prev) => ({
+                                ...prev,
+                                [actionKey]: toggleExcluded(prev[actionKey] ?? [], opIndex),
+                              }))
+                            }
+                          />
+                          <span
+                            className={
+                              disabled ? 'truncate text-ws-faint line-through' : 'truncate text-ws'
+                            }
+                          >
+                            {op.tool}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+                <AIActionCard
+                  action={
+                    act.action === 'document_apply'
+                      ? {
+                          ...act,
+                          operations: filterOperations(act.operations, excludedOps[actionKey] ?? []),
+                        }
+                      : act
+                  }
+                  status={state.status}
+                  result={state.result}
+                  error={state.error}
+                  onExecute={() =>
+                    onExecuteAction(
+                      act.action === 'document_apply'
+                        ? {
+                            ...act,
+                            operations: filterOperations(act.operations, excludedOps[actionKey] ?? []),
+                          }
+                        : act,
+                      actionKey
+                    )
+                  }
+                  onOpen={targetPath && onOpenFile ? () => onOpenFile(targetPath) : undefined}
+                />
+              </div>
             );
           })}
 

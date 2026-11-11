@@ -78,6 +78,69 @@ function run(bin: string, args: string[]): Promise<{ code: number; stderr: strin
   });
 }
 
+/** Запущенные кодирования: по ним работает «Отменить». */
+const running = new Map<string, import('child_process').ChildProcess>();
+
+/**
+ * ffmpeg с разбором `-progress pipe:1`: строка `out_time_us` даёт текущую
+ * позицию в микросекундах, по ней считается процент выполнения.
+ */
+function runWithProgress(
+  bin: string,
+  args: string[],
+  durationSec: number,
+  key: string,
+  onProgress?: (percent: number) => void
+): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(bin, args, { windowsHide: true });
+    running.set(key, child);
+    let stderr = '';
+    let stdout = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() ?? '';
+      for (const line of lines) {
+        const match = /^out_time_(?:us|ms)=(\d+)/.exec(line);
+        if (!match) continue;
+        // Оба поля ffmpeg пишет в микросекундах.
+        const seconds = Number(match[1]) / 1_000_000;
+        if (durationSec > 0 && onProgress) {
+          onProgress(Math.max(0, Math.min(99, Math.round((seconds / durationSec) * 100))));
+        }
+      }
+    });
+    const finish = (code: number) => {
+      running.delete(key);
+      resolve({ code, stderr });
+    };
+    child.on('error', (err) => finish(1));
+    child.on('close', (code) => finish(code ?? 1));
+  });
+}
+
+/**
+ * Фильтр масштаба кадра: приближение при экспорте.
+ * `scale` > 1 увеличивает кадр и обрезает его по центру (сдвиг x/y в долях).
+ */
+export function buildZoomFilter(zoom: { scale?: number; x?: number; y?: number } | undefined): string {
+  const scale = Math.min(4, Math.max(1, Number(zoom?.scale) || 1));
+  if (scale <= 1.0001) return '';
+  const ox = Math.max(-1, Math.min(1, Number(zoom?.x) || 0)).toFixed(3);
+  const oy = Math.max(-1, Math.min(1, Number(zoom?.y) || 0)).toFixed(3);
+  const factor = scale.toFixed(4);
+  return (
+    `scale=trunc(iw*${factor}/2)*2:trunc(ih*${factor}/2)*2,` +
+    `crop=trunc(iw/${factor}/2)*2:trunc(ih/${factor}/2)*2:` +
+    `(iw-ow)/2*(1+${ox}):(ih-oh)/2*(1+${oy})`
+  );
+}
+
 function parseDuration(stderr: string): number {
   const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
   if (!match) return 0;
@@ -162,6 +225,8 @@ export interface VideoEditRequest {
   /** Длительность и наличие звука нужны для построения фильтров. */
   duration?: number;
   hasAudio?: boolean;
+  /** Масштаб кадра при экспорте: 1 — без изменений. */
+  zoom?: { scale?: number; x?: number; y?: number };
 }
 
 function atempoChain(speed: number): string {
@@ -185,7 +250,8 @@ function speedFilterGraph(
   trimEnd: number,
   speed: number,
   segments: { start: number; end: number; speed: number }[],
-  withAudio: boolean
+  withAudio: boolean,
+  zoomFilter = ''
 ): string {
   const pieces: { start: number; end: number; speed: number }[] = [];
   if (segments.length === 0) {
@@ -216,7 +282,9 @@ function speedFilterGraph(
     filters.push(
       `[0:v]trim=start=${piece.start.toFixed(3)}:end=${piece.end.toFixed(
         3
-      )},setpts=(PTS-STARTPTS)/${piece.speed.toFixed(4)},setsar=1[${vLabel}]`
+      )},setpts=(PTS-STARTPTS)/${piece.speed.toFixed(4)},setsar=1${
+        zoomFilter ? ',' + zoomFilter : ''
+      }[${vLabel}]`
     );
     if (withAudio) {
       filters.push(
@@ -237,7 +305,10 @@ function speedFilterGraph(
   return filters.join(';');
 }
 
-async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; outputPath?: string; error?: string }> {
+async function editVideo(
+  req: VideoEditRequest,
+  onProgress?: (percent: number) => void
+): Promise<{ success: boolean; outputPath?: string; error?: string }> {
   const ffmpeg = which('ffmpeg');
   if (!ffmpeg) {
     return {
@@ -262,15 +333,25 @@ async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; out
     .sort((a, b) => a.start - b.start);
   const hasSpeedChange = speed !== 1 || segments.length > 0;
   const withAudio = !req.stripAudio && req.hasAudio !== false;
+  const zoomFilter = buildZoomFilter(req.zoom);
+  const hasZoom = zoomFilter.length > 0;
 
   const ext = path.extname(req.filePath).toLowerCase() || '.mp4';
   const base = path.basename(req.filePath, ext);
   const dir = path.dirname(req.filePath);
-  const suffix = hasSpeedChange ? '.speed' : req.compress ? '.compressed' : req.stripAudio ? '.muted' : '.cut';
+  const suffix = hasZoom
+    ? '.zoom'
+    : hasSpeedChange
+      ? '.speed'
+      : req.compress
+        ? '.compressed'
+        : req.stripAudio
+          ? '.muted'
+          : '.cut';
   const output =
     req.outputPath && req.outputPath !== req.filePath
       ? req.outputPath
-      : path.join(dir, base + suffix + (hasSpeedChange ? '.mp4' : ext === '.webm' ? '.webm' : '.mp4'));
+      : path.join(dir, base + suffix + (hasSpeedChange || hasZoom ? '.mp4' : ext === '.webm' ? '.webm' : '.mp4'));
 
   const args = ['-y'];
   if (start > 0) args.push('-ss', start.toFixed(3));
@@ -284,7 +365,8 @@ async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; out
       trimEnd > start ? trimEnd : start + (duration || 0),
       speed,
       segments,
-      withAudio
+      withAudio,
+      zoomFilter
     );
     args.push('-filter_complex', graph, '-map', '[vout]');
     if (withAudio) args.push('-map', '[aout]');
@@ -302,7 +384,8 @@ async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; out
       '-movflags',
       '+faststart'
     );
-  } else if (req.compress) {
+  } else if (req.compress || hasZoom) {
+    if (hasZoom) args.push('-vf', zoomFilter);
     args.push('-c:v', 'libx264', '-crf', '20', '-preset', 'slow');
     if (!withAudio) args.push('-an');
     else args.push('-c:a', 'aac', '-b:a', '160k');
@@ -312,12 +395,14 @@ async function editVideo(req: VideoEditRequest): Promise<{ success: boolean; out
     if (!withAudio) args.push('-an');
     else args.push('-c:a', 'copy');
   }
-  args.push(output);
-  const result = await run(ffmpeg, args);
+  args.push('-progress', 'pipe:1', '-nostats', output);
+  const expected = trimEnd > start ? trimEnd - start : duration;
+  const result = await runWithProgress(ffmpeg, args, expected, req.filePath, onProgress);
   if (result.code !== 0 || !fs.existsSync(output)) {
     const tail = result.stderr.split(/\r?\n/).slice(-6).join(' ').trim();
     return { success: false, error: tail || 'ffmpeg завершился с ошибкой' };
   }
+  onProgress?.(100);
   return { success: true, outputPath: output };
 }
 
@@ -394,15 +479,229 @@ export function registerVideo(): void {
     }
   });
 
-  ipcMain.handle('video:edit', async (_event, req: VideoEditRequest) => {
+  ipcMain.handle('video:edit', async (event, req: VideoEditRequest) => {
     try {
-      return await editVideo(req);
+      return await editVideo(req, (percent) => {
+        event.sender.send('video:progress', { filePath: req.filePath, percent });
+      });
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+
+  /** Отмена кодирования: убиваем процесс ffmpeg этого файла. */
+  ipcMain.handle('video:cancel', (_event, filePath: string) => {
+    const child = running.get(filePath);
+    if (!child) return { success: false, error: 'Нет активной обработки' };
+    try {
+      child.kill();
+      running.delete(filePath);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+  ipcMain.handle('video:extractAudio', async (_event, filePath: string, req?: VideoAudioRequest) => {
+    try {
+      const ffmpeg = requireFfmpeg();
+      const format = req?.format ?? 'mp3';
+      const outputPath = req?.outputPath || uniqueOutput(filePath, format === 'mp3' ? '.mp3' : format === 'aac' ? '.m4a' : '.m4a', '-audio');
+      const args = ['-y', '-hide_banner', '-loglevel', 'error', ...buildExtractAudioArgs(filePath, outputPath, format)];
+      const result = await run(ffmpeg, args);
+      if (result.code !== 0) return { success: false, error: result.stderr.trim().split('\n').pop() || 'ffmpeg error' };
+      return { success: true, outputPath };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+
+  ipcMain.handle('video:frames', async (_event, filePath: string, req?: VideoFramesRequest) => {
+    try {
+      const ffmpeg = requireFfmpeg();
+      const info = await probe(filePath);
+      const count = Math.max(1, Math.min(24, Number(req?.count) || 12));
+      const at =
+        Array.isArray(req?.at) && req.at.length > 0
+          ? req.at.map((value) => Math.max(0, Number(value) || 0)).slice(0, 24)
+          : Array.from({ length: count }, (_, index) =>
+              Math.max(0, Math.min(info.duration || 0, ((info.duration || 0) * (index + 0.5)) / count))
+            );
+      const dir = req?.dir || path.dirname(filePath);
+      fs.mkdirSync(dir, { recursive: true });
+      const stem = path.basename(filePath, path.extname(filePath));
+      const files: string[] = [];
+      for (let index = 0; index < at.length; index += 1) {
+        const out = path.join(dir, `${stem}-frame-${String(index + 1).padStart(2, '0')}.jpg`);
+        const args = ['-y', '-hide_banner', '-loglevel', 'error', ...buildFramesArgs(filePath, out, at[index], req?.maxWidth)];
+        const result = await run(ffmpeg, args);
+        if (result.code !== 0) return { success: false, files, error: result.stderr.trim() || 'ffmpeg error' };
+        files.push(out);
+      }
+      return { success: true, files };
+    } catch (err) {
+      return { success: false, files: [], error: (err as Error).message };
+    }
+  });
+
+  ipcMain.handle('video:convert', async (event, filePath: string, req?: VideoConvertRequest) => {
+    try {
+      const ffmpeg = requireFfmpeg();
+      const format = req?.format ?? 'mp4';
+      const ext = format === 'webm' ? '.webm' : format === 'gif' ? '.gif' : '.mp4';
+      const outputPath = req?.outputPath || uniqueOutput(filePath, ext, `-${format}`);
+      const args = ['-y', '-hide_banner', '-nostats', ...buildConvertArgs(filePath, outputPath, format, req?.quality)];
+      const result = await run(ffmpeg, args);
+      if (result.code !== 0) return { success: false, error: result.stderr.trim().split('\n').pop() || 'ffmpeg error' };
+      event.sender.send('video:progress', { filePath, percent: 100 });
+      return { success: true, outputPath };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+
+  ipcMain.handle('video:gif', async (_event, filePath: string, req?: VideoGifRequest) => {
+    try {
+      const ffmpeg = requireFfmpeg();
+      const outputPath = req?.outputPath || uniqueOutput(filePath, '.gif', '-clip');
+      const start = Math.max(0, Number(req?.start) || 0);
+      const duration = Math.max(0.2, Number(req?.duration) || 3);
+      const args = ['-y', '-hide_banner', '-loglevel', 'error', ...buildGifArgs(filePath, outputPath, start, duration, req?.fps, req?.width)];
+      const result = await run(ffmpeg, args);
+      if (result.code !== 0) return { success: false, error: result.stderr.trim().split('\n').pop() || 'ffmpeg error' };
+      return { success: true, outputPath };
     } catch (err) {
       return { success: false, error: (err as Error).message };
     }
   });
 }
 
+/* ---------- Чистые построители аргументов (проверяются в v11-check) ---------- */
+
+export type VideoAudioFormat = 'mp3' | 'aac' | 'copy';
+export type VideoConvertFormat = 'mp4' | 'webm' | 'gif';
+
+export interface VideoAudioRequest {
+  format?: VideoAudioFormat;
+  outputPath?: string;
+}
+
+export interface VideoFramesRequest {
+  count?: number;
+  at?: number[];
+  maxWidth?: number;
+  dir?: string;
+}
+
+export interface VideoConvertRequest {
+  format?: VideoConvertFormat;
+  quality?: 'low' | 'medium' | 'high';
+  outputPath?: string;
+}
+
+export interface VideoGifRequest {
+  start?: number;
+  duration?: number;
+  fps?: number;
+  width?: number;
+  outputPath?: string;
+}
+
+export function buildExtractAudioArgs(
+  source: string,
+  output: string,
+  format: VideoAudioFormat = 'mp3'
+): string[] {
+  if (format === 'copy') return ['-i', source, '-vn', '-c:a', 'copy', output];
+  if (format === 'aac') return ['-i', source, '-vn', '-c:a', 'aac', '-b:a', '192k', output];
+  return ['-i', source, '-vn', '-c:a', 'libmp3lame', '-q:a', '2', output];
+}
+
+export function buildFramesArgs(source: string, output: string, at: number, maxWidth?: number): string[] {
+  const width = Math.max(64, Math.min(1920, Number(maxWidth) || 480));
+  return [
+    '-ss',
+    String(Math.max(0, at)),
+    '-i',
+    source,
+    '-frames:v',
+    '1',
+    '-vf',
+    `scale=${width}:-2:flags=lanczos`,
+    '-q:v',
+    '3',
+    output,
+  ];
+}
+
+export function buildConvertArgs(
+  source: string,
+  output: string,
+  format: VideoConvertFormat = 'mp4',
+  quality: 'low' | 'medium' | 'high' = 'medium'
+): string[] {
+  const crf = quality === 'high' ? '20' : quality === 'low' ? '30' : '24';
+  if (format === 'webm') {
+    return ['-i', source, '-c:v', 'libvpx-vp9', '-crf', crf, '-b:v', '0', '-c:a', 'libopus', output];
+  }
+  if (format === 'gif') {
+    return [
+      '-i',
+      source,
+      '-vf',
+      'fps=12,scale=480:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse',
+      '-loop',
+      '0',
+      output,
+    ];
+  }
+  return ['-i', source, '-c:v', 'libx264', '-crf', crf, '-preset', 'medium', '-c:a', 'aac', '-b:a', '160k', output];
+}
+
+export function buildGifArgs(
+  source: string,
+  output: string,
+  start: number,
+  duration: number,
+  fps = 12,
+  width = 480
+): string[] {
+  const safeFps = Math.max(5, Math.min(30, Math.round(Number(fps) || 12)));
+  const safeWidth = Math.max(120, Math.min(1280, Math.round(Number(width) || 480)));
+  return [
+    '-ss',
+    String(Math.max(0, start)),
+    '-t',
+    String(Math.max(0.2, duration)),
+    '-i',
+    source,
+    '-vf',
+    `fps=${safeFps},scale=${safeWidth}:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse`,
+    '-loop',
+    '0',
+    output,
+  ];
+}
+
 export function mediaUrl(filePath: string): string {
   return 'media://local/?path=' + encodeURIComponent(filePath);
+}
+
+/** ffmpeg обязателен для новых операций: без него — понятная ошибка. */
+function requireFfmpeg(): string {
+  const ffmpeg = which('ffmpeg');
+  if (!ffmpeg) throw new Error('ffmpeg не найден в PATH. Установите ffmpeg или добавьте его в PATH.');
+  return ffmpeg;
+}
+
+/** Свободное имя рядом с исходником: name-edit.mp4, name-edit 2.mp4… */
+function uniqueOutput(filePath: string, ext: string, suffix: string): string {
+  const dir = path.dirname(filePath);
+  const stem = path.basename(filePath, path.extname(filePath));
+  let candidate = path.join(dir, `${stem}${suffix}${ext}`);
+  let index = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dir, `${stem}${suffix} ${index}${ext}`);
+    index += 1;
+  }
+  return candidate;
 }

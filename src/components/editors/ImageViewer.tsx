@@ -13,6 +13,7 @@ import {
   UploadCloud,
   Check,
   X,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { OpenTab } from '../../types';
 import { fileSystemService, imageDataUrl, imageMime } from '../../services/fileSystemService';
@@ -21,8 +22,12 @@ import {
   copyToClipboard,
   gdriveUpload,
   getImgurClientId,
+  shareViaSite,
   uploadBase64,
 } from '../../services/shareService';
+import { readPreferences } from '../../state/preferences';
+import { applyImageOps, normalizeImageOps, type ImageOp } from '../../lib/imageOps';
+import { registerImageController } from '../../services/imageBridge';
 
 interface Props {
   tab: OpenTab;
@@ -82,6 +87,43 @@ export const ImageViewer: React.FC<Props> = ({ tab, onChange, onSave, onNotify }
     setCropMode(false);
     setSelection(null);
   };
+
+  /* AI-мост: правки изображения инструментами идут через буфер редактора. */
+  useEffect(() => {
+    return registerImageController({
+      tabId: tab.id,
+      getImage: () => ({
+        base64: data.split(',')[1] ?? '',
+        mime: /^data:([^;]+);/.exec(data)?.[1] ?? 'image/png',
+        width: natural.width,
+        height: natural.height,
+        path: tab.path,
+      }),
+      applyOps: async (ops) => {
+        try {
+          const mime = /^data:([^;]+);/.exec(data)?.[1] ?? 'image/png';
+          const base64 = data.split(',')[1] ?? '';
+          const result = await applyImageOps({ base64, mime }, normalizeImageOps(ops));
+          commit(`data:${result.mime};base64,${result.base64}`);
+          return {
+            ok: true,
+            message: `${result.width}×${result.height}, ${Math.round(result.bytes / 1024)} КБ`,
+          };
+        } catch (err) {
+          return { ok: false, message: (err as Error).message };
+        }
+      },
+      save: async () => {
+        try {
+          await onSave();
+          return { ok: true, message: 'Изображение сохранено' };
+        } catch (err) {
+          return { ok: false, message: (err as Error).message };
+        }
+      },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, natural.width, natural.height, tab.id, tab.path]);
 
   const editCanvas = async (
     kind: 'left' | 'right' | 'flipH' | 'flipV' | 'crop',
@@ -169,12 +211,23 @@ export const ImageViewer: React.FC<Props> = ({ tab, onChange, onSave, onNotify }
     setExportOpen(false);
     setBusy(true);
     try {
-      if (service === 'imgbb' || service === 'freeimage') {
-        const open = service === 'imgbb' ? window.electronAPI?.openImgbb : window.electronAPI?.openFreeimage;
-        const name = service === 'imgbb' ? 'ImgBB' : 'Freeimage.host';
-        const result = await open?.([tab.path]);
-        if (!result?.success) throw new Error(result?.error || 'Не удалось открыть ' + name);
-        onNotify(name + ' открыт, фото добавлено в форму загрузки');
+      if (service === 'imgbb' || service === 'freeimage' || service === 'yapx') {
+        const result = await shareViaSite(
+          service,
+          [{ path: tab.path, name: tab.name }],
+          { authorized: readPreferences().yapxAccountMode }
+        );
+        const name =
+          service === 'imgbb' ? 'ImgBB' : service === 'freeimage' ? 'Freeimage.host' : 'Япикс';
+        if (!result.success) {
+          throw new Error(result.error || result.skipped[0]?.reason || 'Не удалось открыть ' + name);
+        }
+        if (result.albums.length > 0) {
+          await copyToClipboard(result.albums.join('\n'));
+          onNotify(name + ': альбом создан, ссылка скопирована');
+        } else {
+          onNotify(name + ' открыт, фото добавлено в форму загрузки');
+        }
         return;
       }
       if (service === 'gdrive') {
@@ -196,6 +249,35 @@ export const ImageViewer: React.FC<Props> = ({ tab, onChange, onSave, onNotify }
       onNotify('Ссылка скопирована: ' + result.url);
     } catch (e) {
       onNotify('Экспорт не выполнен: ' + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /* Панель размера, формата и сжатия. */
+  const [tuneOpen, setTuneOpen] = useState(false);
+  const [tuneWidth, setTuneWidth] = useState(0);
+  const [tuneFormat, setTuneFormat] = useState<'png' | 'jpeg' | 'webp'>('png');
+  const [tuneQuality, setTuneQuality] = useState(0.9);
+  const [tuneMaxKb, setTuneMaxKb] = useState(0);
+
+  const applyTune = async () => {
+    try {
+      setBusy(true);
+      const mime = /^data:([^;]+);/.exec(data)?.[1] ?? 'image/png';
+      const base64 = data.split(',')[1] ?? '';
+      const ops: ImageOp[] = [];
+      if (tuneWidth > 0) ops.push({ op: 'resize', mode: 'fit', width: tuneWidth });
+      ops.push({ op: 'convert', format: tuneFormat, quality: tuneQuality });
+      if (tuneMaxKb > 0) {
+        ops.push({ op: 'compress', maxKb: tuneMaxKb, format: tuneFormat === 'webp' ? 'webp' : 'jpeg' });
+      }
+      const result = await applyImageOps({ base64, mime }, ops);
+      commit(`data:${result.mime};base64,${result.base64}`);
+      onNotify(`Готово: ${result.width}×${result.height}, ${Math.round(result.bytes / 1024)} КБ`);
+      setTuneOpen(false);
+    } catch (err) {
+      onNotify((err as Error).message);
     } finally {
       setBusy(false);
     }
@@ -237,6 +319,39 @@ export const ImageViewer: React.FC<Props> = ({ tab, onChange, onSave, onNotify }
         <button title="Вернуть исходное изображение" onClick={() => commit(tab.initialContent)} className="rounded p-1.5 text-ws-muted hover:bg-ws-hover"><Undo2 size={14} /></button>
         <button title="Сохранить изменения" disabled={!tab.isDirty} onClick={onSave} className="flex items-center gap-1 rounded bg-ws-accent px-2 py-1 text-[11px] text-white disabled:opacity-40"><Save size={13} />Сохранить</button>
         <button title="Сохранить копию" onClick={() => void saveAs()} className="rounded p-1.5 text-ws-muted hover:bg-ws-hover"><Download size={14} /></button>
+        <button title="Размер, формат и сжатие" disabled={busy} onClick={() => setTuneOpen((v) => !v)} className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-[11px] text-ws-muted hover:bg-ws-hover">
+          <SlidersHorizontal size={13} /> Размер и сжатие
+        </button>
+        {tuneOpen && (
+          <div className="absolute top-full left-0 z-30 mt-1 w-72 rounded-lg border border-ws bg-ws-surface p-3 shadow-ws">
+            <div className="grid grid-cols-2 gap-2 text-[11px]">
+              <label className="flex flex-col gap-1">
+                <span className="text-ws-muted">Ширина, px</span>
+                <input type="number" min={0} value={tuneWidth} onChange={(e) => setTuneWidth(Number(e.target.value))} className="rounded border border-ws bg-ws-editor px-2 py-1 text-ws" />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-ws-muted">Сжать до, КБ</span>
+                <input type="number" min={0} value={tuneMaxKb} onChange={(e) => setTuneMaxKb(Number(e.target.value))} className="rounded border border-ws bg-ws-editor px-2 py-1 text-ws" />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-ws-muted">Формат</span>
+                <select value={tuneFormat} onChange={(e) => setTuneFormat(e.target.value as 'png' | 'jpeg' | 'webp')} className="rounded border border-ws bg-ws-editor px-2 py-1 text-ws">
+                  <option value="png">PNG</option>
+                  <option value="jpeg">JPEG</option>
+                  <option value="webp">WebP</option>
+                </select>
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-ws-muted">Качество</span>
+                <input type="number" min={0.3} max={1} step={0.05} value={tuneQuality} onChange={(e) => setTuneQuality(Number(e.target.value))} className="rounded border border-ws bg-ws-editor px-2 py-1 text-ws" />
+              </label>
+            </div>
+            <div className="mt-2 flex items-center justify-end gap-2 text-[11px]">
+              <button onClick={() => setTuneOpen(false)} className="rounded px-2 py-1 text-ws-muted hover:bg-ws-hover">Отмена</button>
+              <button onClick={() => void applyTune()} className="rounded bg-ws-accent px-2 py-1 text-white">Применить</button>
+            </div>
+          </div>
+        )}
         <div className="relative ml-auto">
           <button title="Экспорт" disabled={busy} onClick={() => setExportOpen((v) => !v)} className="flex items-center gap-1 rounded border border-ws px-2 py-1 text-[11px] text-ws-muted hover:bg-ws-hover">
             <UploadCloud size={13} /> Экспорт

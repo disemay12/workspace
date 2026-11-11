@@ -16,6 +16,8 @@ export interface ShareServiceInfo {
   needsClientId?: boolean;
   /** Сервис принимает только изображения. */
   imagesOnly?: boolean;
+  /** Экспорт открывает сайт и подставляет файлы в форму. */
+  opensSite?: boolean;
 }
 
 export const SHARE_SERVICES: ShareServiceInfo[] = [
@@ -37,14 +39,121 @@ export const SHARE_SERVICES: ShareServiceInfo[] = [
     label: 'ImgBB',
     hint: 'Откроет сайт и добавит выбранные фото в форму',
     imagesOnly: true,
+    opensSite: true,
   },
   {
     id: 'freeimage',
     label: 'Freeimage.host',
     hint: 'Откроет сайт и добавит выбранные фото в форму',
     imagesOnly: true,
+    opensSite: true,
+  },
+  {
+    id: 'yapx',
+    label: 'Япикс (yapx.ru)',
+    hint: 'Альбом до 10 фото; большие наборы — пачками по альбомам',
+    imagesOnly: true,
+    opensSite: true,
   },
 ];
+
+/** Лимиты сайтового хостинга — те же, что применяет главный процесс. */
+export interface ImageHostLimits {
+  id: string;
+  title: string;
+  formats: string[];
+  maxFileMb: number;
+  perAlbum: number;
+  perAlbumAuthorized?: number;
+  perHour?: number;
+}
+
+export async function getImageHostLimits(): Promise<Record<string, ImageHostLimits>> {
+  const client = window.electronAPI;
+  if (!client?.imageHostLimits) return {};
+  return client.imageHostLimits();
+}
+
+/** Разбиение на пачки: одна пачка — один альбом сайта. */
+export function splitIntoBatches<T>(items: T[], perBatch: number): T[][] {
+  const size = Math.max(1, Math.floor(perBatch));
+  const batches: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    batches.push(items.slice(index, index + size));
+  }
+  return batches;
+}
+
+/** Файлы, которые сайт примет, и причины отказа для остальных. */
+export function filterHostCompatible<T extends { path: string; name: string }>(
+  files: T[],
+  limits: ImageHostLimits | undefined,
+  sizes: Record<string, number>
+): { accepted: T[]; skipped: { path: string; name: string; reason: string }[] } {
+  const accepted: T[] = [];
+  const skipped: { path: string; name: string; reason: string }[] = [];
+  for (const file of files) {
+    const ext = (file.name.split('.').pop() ?? '').toLowerCase();
+    if (limits) {
+      if (!limits.formats.includes(ext)) {
+        skipped.push({
+          path: file.path,
+          name: file.name,
+          reason: `.${ext} не поддерживается Япиксом (${limits.formats.join(', ')})`,
+        });
+        continue;
+      }
+      const size = sizes[file.path] ?? 0;
+      if (size > limits.maxFileMb * 1024 * 1024) {
+        skipped.push({
+          path: file.path,
+          name: file.name,
+          reason: `${(size / (1024 * 1024)).toFixed(1)} МБ — больше лимита ${limits.maxFileMb} МБ`,
+        });
+        continue;
+      }
+    }
+    accepted.push(file);
+  }
+  return { accepted, skipped };
+}
+
+/** Загрузка на сайт, который принимает файлы через свою форму (Япикс, ImgBB). */
+export async function shareViaSite(
+  host: 'imgbb' | 'freeimage' | 'yapx',
+  files: { path: string; name: string }[],
+  options: { authorized?: boolean; perAlbum?: number } = {}
+): Promise<{
+  success: boolean;
+  count: number;
+  albums: string[];
+  skipped: { path: string; reason: string }[];
+  error?: string;
+}> {
+  const client = window.electronAPI;
+  const empty = { success: false, count: 0, albums: [], skipped: [] };
+  if (!client) return { ...empty, error: 'Экспорт доступен только в настольном приложении' };
+  const paths = files.map((file) => file.path);
+  if (host === 'imgbb' || host === 'freeimage') {
+    const open = host === 'imgbb' ? client.openImgbb : client.openFreeimage;
+    const result = await open?.(paths);
+    return {
+      success: Boolean(result?.success),
+      count: result?.count ?? 0,
+      albums: [],
+      skipped: [],
+      error: result?.error,
+    };
+  }
+  const result = await client.openYapx?.(paths, options);
+  return {
+    success: Boolean(result?.success),
+    count: result?.count ?? 0,
+    albums: result?.albums ?? [],
+    skipped: result?.skipped ?? [],
+    error: result?.error,
+  };
+}
 
 export const IMGUR_CLIENT_ID_KEY = 'ws_imgur_client_id';
 
@@ -246,4 +355,63 @@ export async function gdriveUpload(
     return { success: false, uploaded: 0, failed: [], error: 'Google Drive недоступен' };
   }
   return client.gdriveUpload(paths, folderName);
+}
+
+/* ============================================================
+   Google: раздельные согласия, диагностика
+   ============================================================ */
+
+export type GoogleService = 'drive' | 'youtube';
+
+export interface GoogleFullStatus {
+  configured: boolean;
+  drive: { connected: boolean; email?: string; scopes?: string };
+  youtube: { connected: boolean; email?: string; scopes?: string };
+  email?: string;
+}
+
+export interface GoogleDiagnoseResult {
+  configured: boolean;
+  tokenValid: boolean;
+  driveApi: 'ok' | 'no-access' | 'error' | 'not-connected';
+  youtubeApi: 'ok' | 'no-access' | 'error' | 'not-connected';
+  quotaBytes?: number;
+  channelTitle?: string;
+  error?: string;
+}
+
+const EMPTY_GOOGLE_STATUS: GoogleFullStatus = {
+  configured: false,
+  drive: { connected: false },
+  youtube: { connected: false },
+};
+
+export async function googleFullStatus(): Promise<GoogleFullStatus> {
+  const client = window.electronAPI;
+  if (!client?.googleStatus) return EMPTY_GOOGLE_STATUS;
+  try {
+    return await client.googleStatus();
+  } catch {
+    return EMPTY_GOOGLE_STATUS;
+  }
+}
+
+export async function googleConnect(
+  service: GoogleService
+): Promise<{ success: boolean; email?: string; error?: string }> {
+  const client = window.electronAPI;
+  if (!client?.googleConnect) {
+    return { success: false, error: 'Google доступен только в настольном приложении' };
+  }
+  return client.googleConnect(service);
+}
+
+export async function googleDisconnectService(service: GoogleService): Promise<void> {
+  await window.electronAPI?.googleDisconnect?.(service);
+}
+
+export async function googleDiagnose(): Promise<GoogleDiagnoseResult | null> {
+  const client = window.electronAPI;
+  if (!client?.googleDiagnose) return null;
+  return client.googleDiagnose();
 }

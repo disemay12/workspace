@@ -44,7 +44,31 @@ function registerIpc() {
   ipcMain.handle('fs:showInExplorer', () => ({ success: true }));
   ipcMain.handle('fs:listDirectory', async () => ({ success: true, items: [] }));
   ipcMain.handle('fs:readFile', async () => ({ success: false, error: 'not used' }));
-  ipcMain.handle('fs:writeFile', async () => ({ success: true }));
+  ipcMain.handle('session:get', () => ({}));
+  ipcMain.handle('session:patch', () => ({}));
+  ipcMain.handle('fs:writeFile', async (_event: unknown, filePath: string, content: string, encoding = 'utf-8') => {
+    try {
+      const payload = encoding === 'base64' ? Buffer.from(content, 'base64') : content;
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, payload);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+  ipcMain.handle('fs:readPreview', async (_event: unknown, filePath: string, maxBytes = 65536) => {
+    try {
+      const stat = fs.statSync(filePath);
+      const handle = fs.openSync(filePath, 'r');
+      const size = Math.min(stat.size, Math.max(1, maxBytes));
+      const buffer = Buffer.alloc(size);
+      fs.readSync(handle, buffer, 0, size, 0);
+      fs.closeSync(handle);
+      return { success: true, base64: buffer.toString('base64'), size: stat.size };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
   ipcMain.handle('fs:createFile', async () => ({ success: true }));
   ipcMain.handle('fs:createDirectory', async () => ({ success: true }));
   ipcMain.handle('fs:deletePath', async () => ({ success: true }));
@@ -81,12 +105,19 @@ async function main() {
     const ready = await win.webContents.executeJavaScript('!!window.__documentModel');
     if (!ready) throw new Error('window.__documentModel не появился: тестовый мост не собран');
 
+    const samplePdfPath = path.join(ROOT, '.verify', 'sample.pdf');
+    const samplePdfBase64 = fs.existsSync(samplePdfPath) ? fs.readFileSync(samplePdfPath).toString('base64') : '';
+    const arialPath = 'C:/Windows/Fonts/arial.ttf';
+    const arialBase64 = fs.existsSync(arialPath) ? fs.readFileSync(arialPath).toString('base64') : '';
+
     const steps = await win.webContents.executeJavaScript(`
       (async () => {
         const M = window.__documentModel;
         const run = (html, tool, args) => M.applyDocumentTool(html, tool, args || {});
         const steps = [];
         const add = (name, value) => steps.push({ name, ...value });
+        const SAMPLE_PDF_B64 = ${JSON.stringify(samplePdfBase64)};
+        const ARIAL_B64 = ${JSON.stringify(arialBase64)};
 
         /* 1. replace_document тем же текстом отклоняется */
         const same = run('<p>Текст документа</p>', 'replace_document', { html: '<p>Текст документа</p>' });
@@ -876,6 +907,505 @@ async function main() {
           title: Boolean(blank && blank.slides[0]?.shapes.some((shape) => shape.text.includes('Новый слайд'))),
           layouts: Boolean(blank && blank.layouts.length > 0),
         });
+
+        // Сборка презентации из Markdown (конвертация md → pptx).
+        const BUILDER = window.__pptxBuilder;
+        const PPT_DOC = window.__pptxDoc;
+        if (BUILDER && PPT_DOC) {
+          const md = [
+            '# Слайд один',
+            '',
+            'Вводный абзац.',
+            '',
+            '- пункт списка',
+            '',
+            '## Слайд два',
+            '',
+            '| Формат | Статус |',
+            '| --- | --- |',
+            '| pptx | да |',
+          ].join('\\n');
+          const built64 = await BUILDER.markdownToPptxBase64(md, { title: 'Проверка сборки' });
+          const doc = await PPT_DOC.openPptxDocument(built64);
+          const slides = doc.model.slides;
+          const titleOf = (slide) => {
+            const title = slide.shapes.find((shape) => /заголовок|title/i.test(shape.name)) ?? slide.shapes[0];
+            return (title?.text?.paragraphs ?? [])
+              .map((p) => p.runs.map((r) => r.text).join(''))
+              .join(' ');
+          };
+          const again = await doc.toBase64();
+          const reopened = await PPT_DOC.openPptxDocument(again);
+          add('pptxFromMarkdown', {
+            built: built64.length > 20000,
+            slides: slides.length === 2,
+            firstTitle: titleOf(slides[0]).includes('Слайд один'),
+            secondTitle: titleOf(slides[1]).includes('Слайд два'),
+            table: slides.some((slide) => slide.shapes.some((shape) => shape.kind === 'table')),
+            wide: doc.model.width === 12192000,
+            reserialized: reopened.model.slides.length === slides.length,
+          });
+        } else {
+          add('pptxFromMarkdown', { skipped: true });
+        }
+
+        // Паритет инструментов и промпта (1.2): модель должна видеть то, что есть.
+        const TOOLS = window.__aiTools;
+        const ACTIONS = window.__aiActions;
+        if (TOOLS && ACTIONS) {
+          const pptxTools = TOOLS.buildDocumentTools(true, 'powerpoint').map((tool) => tool.function.name);
+          const imageTools = TOOLS.buildDocumentTools(true, 'image').map((tool) => tool.function.name);
+          const videoTools = TOOLS.buildDocumentTools(true, 'video').map((tool) => tool.function.name);
+          const pptxPrompt = TOOLS.buildDocumentSystemPrompt({
+            name: 'Тест.pptx',
+            type: 'powerpoint',
+            writeAccess: true,
+          });
+          const imagePrompt = TOOLS.buildDocumentSystemPrompt({
+            name: 'Фото.png',
+            type: 'image',
+            writeAccess: true,
+          });
+          const missingPptx = pptxTools.filter(
+            (name) => name.startsWith('pptx_') && !pptxPrompt.includes(name)
+          );
+          const parsed = ACTIONS.parseAIActions(
+            '{ "action": "create_presentation", "name": "Итог.pptx", "markdown": "# Раз\\\\n\\\\n- пункт" }'
+          );
+          console.log('PARSED_ACTIONS', JSON.stringify(parsed));
+          add('toolsParity', {
+            pptxTools: pptxTools.length >= 24,
+            imageTools: imageTools.length >= 5,
+            videoTools: videoTools.length >= 6,
+            createPresentation: pptxTools.includes('create_presentation'),
+            promptCoversTools: missingPptx.length === 0,
+            imagePrompt: imagePrompt.includes('image_transform'),
+            presentationParsed:
+              parsed.length === 1 &&
+              parsed[0].action === 'create_presentation' &&
+              parsed[0].markdown.includes('# Раз'),
+          });
+        } else {
+          console.log('PARSED_ACTIONS', JSON.stringify(parsed));
+          add('toolsParity', { skipped: true });
+        }
+
+        // Глубокие операции модели презентации (1.2): по утверждению на каждую.
+        const DOCAPI = window.__pptxDoc;
+        const TPL = window.__pptxTemplate;
+        if (DOCAPI && TPL) {
+          const doc = await DOCAPI.openPptxDocument(TPL.BLANK_PPTX_BASE64);
+          const first = doc.model.slides.length === 1;
+          doc.addSlide(doc.model.slides.length, undefined, 'Второй');
+          const added = doc.model.slides.length === 2;
+          const dup = doc.duplicateSlide(0);
+          const duplicated = doc.model.slides.length === 3 && dup === 1;
+          doc.moveSlide(2, 0);
+          const moved = doc.model.slides.length === 3;
+          doc.deleteSlide(2);
+          const deleted = doc.model.slides.length === 2;
+          doc.setSlideHidden(0, true);
+          const hidden = doc.model.slides[0].hidden === true;
+          doc.setSlideHidden(0, false);
+          doc.setSlideSize(12192000, 6858000);
+          const size = doc.model.width === 12192000;
+          doc.setSlideTransition(0, { type: 'fade', speed: 'med' });
+          const transition = doc.model.slides[0].transition?.type === 'fade';
+          doc.setSlideBackground(0, { color: '112233' });
+          const background = doc.model.slides[0].background === '112233';
+          doc.setNotes(0, 'Заметки докладчика');
+          const notes = doc.model.slides[0].notes.includes('Заметки');
+          const titleShape = doc.model.slides[0].shapes[0];
+          doc.setShapeText(0, titleShape.id, {
+            paragraphs: [{ runs: [{ text: 'Проверка операций', size: 28, bold: true, color: '1F2937' }] }],
+          });
+          const text = doc.model.slides[0].shapes[0].text?.paragraphs[0]?.runs[0]?.text === 'Проверка операций';
+          const shapeId = doc.addShape(0, { geom: 'ellipse', x: 100000, y: 100000, w: 500000, h: 400000, fill: 'FF0000', text: 'Фигура' });
+          const shapeAdded = Boolean(shapeId) && doc.model.slides[0].shapes.some((s) => s.id === shapeId);
+          doc.setShapeGeometry(0, shapeId, { x: 200000, y: 200000, w: 600000, h: 500000, rotation: 15 });
+          const geometry = doc.model.slides[0].shapes.find((s) => s.id === shapeId).rotation === 15;
+          doc.setShapeFill(0, shapeId, '00FF00');
+          const fresh = await DOCAPI.openPptxDocument(await doc.toBase64());
+          const style = doc.model.slides[0].shapes.find((s) => s.id === shapeId).fill === '00FF00';
+          doc.setShapeOutline(0, shapeId, { color: '000000', width: 2 });
+          doc.setShapeShadow(0, shapeId, true);
+          doc.reorderShape(0, shapeId, 'front');
+          const order = doc.model.slides[0].shapes[doc.model.slides[0].shapes.length - 1].id === shapeId;
+          const copyId = doc.duplicateShape(0, shapeId);
+          const shapeDup = Boolean(copyId) && doc.model.slides[0].shapes.length > 2;
+          doc.deleteShape(0, copyId);
+          const shapeDel = !doc.model.slides[0].shapes.some((s) => s.id === copyId);
+          const tableId = doc.addTable(1, { rows: 2, cols: 2, data: [['A', 'B'], ['C', 'D']] });
+          const tableAdded = Boolean(tableId) && doc.model.slides[1].shapes.some((s) => s.kind === 'table');
+          doc.setTableData(1, tableId, [['E', 'F'], ['G', 'H']]);
+          const tableCell = doc.model.slides[1].shapes.find((s) => s.id === tableId)?.table?.rows?.[0]?.[0];
+          const tableData =
+            tableCell?.text?.paragraphs?.[0]?.runs?.[0]?.text === 'E';
+          const replaced = doc.findReplace('Проверка операций', 'Проверка 1.2');
+          const findReplace = replaced.count >= 1 && doc.model.slides[0].shapes[0].text.paragraphs[0].runs[0].text === 'Проверка 1.2';
+          const before = doc.model.theme.colors.accent1;
+          doc.applyTheme({ presetId: 'ocean' });
+          const theme = doc.model.theme.colors.accent1 !== before;
+          const serialized = await doc.toBase64();
+          const reparsed = await DOCAPI.openPptxDocument(serialized);
+          add('pptxOps', {
+            first,
+            added,
+            duplicated,
+            moved,
+            deleted,
+            hidden,
+            size,
+            transition,
+            background,
+            notes,
+            text,
+            shapeAdded,
+            geometry,
+            style,
+            order,
+            shapeDup,
+            shapeDel,
+            tableAdded,
+            tableData,
+            findReplace,
+            theme,
+            reserialized: reparsed.model.slides.length === doc.model.slides.length,
+          });
+        } else {
+          add('pptxOps', { skipped: true });
+        }
+
+        // Операции над изображениями (1.2): canvas-пайплайн в реальном рендерере.
+        const IMGOPS = window.__imageOps;
+        if (IMGOPS) {
+          const canvas = document.createElement('canvas');
+          canvas.width = 200;
+          canvas.height = 100;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#3355ff';
+          ctx.fillRect(0, 0, 200, 100);
+          // Несимметричный маркер: иначе отражение даёт те же пиксели.
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(8, 8, 24, 24);
+          const base = canvas.toDataURL('image/png').split(',')[1];
+          const source = { base64: base, mime: 'image/png' };
+          const rotated = await IMGOPS.applyImageOps(source, [{ op: 'rotate', degrees: 90 }]);
+          const resized = await IMGOPS.applyImageOps(source, [
+            { op: 'resize', mode: 'fit', width: 120 },
+          ]);
+          const flipped = await IMGOPS.applyImageOps(source, [{ op: 'flip', axis: 'h' }]);
+          const cropped = await IMGOPS.applyImageOps(source, [
+            { op: 'crop', x: 150, y: 50, w: 100, h: 100 },
+          ]);
+          const converted = await IMGOPS.applyImageOps(source, [
+            { op: 'convert', format: 'jpeg', quality: 0.8 },
+          ]);
+          const compressed = await IMGOPS.applyImageOps(source, [
+            { op: 'compress', maxKb: 4 },
+          ]);
+          add('imageOps', {
+            rotate: rotated.width === 100 && rotated.height === 200,
+            resize: resized.width === 120 && resized.height === 60,
+            flipKeepsSize: flipped.width === 200 && flipped.height === 100 && flipped.base64 !== base,
+            cropClamped: cropped.width === 50 && cropped.height === 50,
+            convertJpeg: converted.mime === 'image/jpeg',
+            compressFits: compressed.bytes <= 4 * 1024,
+          });
+        } else {
+          add('imageOps', { skipped: true });
+        }
+
+        // Проводник: сортировка, скрытые, плоский список, конфликты имён, DnD, undo.
+        const EXP = window.__explorerOps;
+        if (EXP) {
+          const make = (name, isDirectory, size = 0, mtime = '2026-01-01T00:00:00Z') => ({
+            name,
+            path: 'C:\\\\ws\\\\' + name,
+            isDirectory,
+            size,
+            mtime,
+            extension: name.includes('.') ? name.split('.').pop() : '',
+          });
+          const files = [
+            make('b.txt', false, 200),
+            make('A.txt', false, 100),
+            make('folder', true),
+            make('node_modules', true),
+            make('.env', false, 10),
+          ];
+          const tree = {
+            'C:\\\\ws': files,
+            'C:\\\\ws\\\\folder': [make('inner.md', false, 5)],
+          };
+          const sorted = EXP.sortItems(files, { by: 'name', dir: 'asc', foldersFirst: true });
+          const sortedNames = sorted.map((item) => item.name);
+          const sortCheck =
+            sortedNames[0] === 'folder' &&
+            sortedNames[1] === 'node_modules' &&
+            sortedNames.indexOf('A.txt') < sortedNames.indexOf('b.txt');
+          const bySize = EXP.sortItems(files, { by: 'size', dir: 'desc', foldersFirst: false });
+          const sizeCheck = bySize[0].name === 'b.txt' && bySize[bySize.length - 1].size === 0;
+          const flat = EXP.flattenVisible(tree, new Set(['C:\\\\ws\\\\folder']), 'C:\\\\ws', {
+            sort: { by: 'name', dir: 'asc', foldersFirst: true },
+            showHidden: false,
+          });
+          const flatCheck =
+            flat.length === 4 &&
+            flat.some((item) => item.name === 'inner.md' && item.depth === 1) &&
+            !flat.some((item) => item.name === 'node_modules' || item.name === '.env');
+          const hiddenKept = EXP
+            .flattenVisible(tree, new Set(), 'C:\\\\ws', {
+              sort: { by: 'name', dir: 'asc', foldersFirst: true },
+              showHidden: true,
+            })
+            .map((item) => item.name);
+          const pasteCopy = EXP.resolvePasteName('a.txt', ['a.txt'], 'copy');
+          const pasteSeries = EXP.resolvePasteName('a.txt', ['a.txt', 'a (2).txt'], 'copy');
+          const pasteMove = EXP.resolvePasteName('a.txt', ['a.txt'], 'move');
+          const moveCheck =
+            pasteCopy === 'a (2).txt' && pasteSeries === 'a (3).txt' && pasteMove === 'a.txt';
+          const dropSelf = EXP.canDrop(
+            { path: 'C:\\\\ws\\\\folder', name: 'folder', isDirectory: true },
+            { path: 'C:\\\\ws\\\\folder', isDirectory: true }
+          );
+          const dropChild = EXP.canDrop(
+            { path: 'C:\\\\ws\\\\folder', name: 'folder', isDirectory: true },
+            { path: 'C:\\\\ws\\\\folder\\\\sub', isDirectory: true }
+          );
+          const dropOk = EXP.canDrop(
+            { path: 'C:\\\\ws\\\\a.txt', name: 'a.txt', isDirectory: false },
+            { path: 'C:\\\\ws\\\\folder', isDirectory: true }
+          );
+          const dropOnFile = EXP.canDrop(
+            { path: 'C:\\\\ws\\\\b.txt', name: 'b.txt', isDirectory: false },
+            { path: 'C:\\\\ws\\\\a.txt', isDirectory: false }
+          );
+          const renamed = EXP.applyRenamePattern(['a.txt', 'b.txt'], '{name}-{n}');
+          const renamedExt = EXP.applyRenamePattern(['photo.jpg'], 'img-{n:02}');
+          const renameCheck =
+            renamed[0].to === 'a-1.txt' &&
+            renamed[1].to === 'b-2.txt' &&
+            renamedExt[0].to === 'img-01.jpg';
+          const history = new EXP.ExplorerHistory(2);
+          history.push({ kind: 'move', from: 'C:\\\\ws\\\\a.txt', to: 'C:\\\\ws\\\\folder\\\\a.txt' });
+          history.push({ kind: 'rename', from: 'C:\\\\ws\\\\b.txt', to: 'C:\\\\ws\\\\c.txt' });
+          history.push({ kind: 'create', from: '', to: 'C:\\\\ws\\\\new.txt' });
+          const last = history.peek();
+          const undoCheck =
+            history.size === 2 &&
+            last &&
+            last.kind === 'create' &&
+            EXP.ExplorerHistory.invert(last).remove === 'C:\\\\ws\\\\new.txt';
+          add('explorerOps', {
+            sort: sortCheck,
+            sortBySize: sizeCheck,
+            flatten: flatCheck,
+            hidden: hiddenKept.includes('node_modules') && hiddenKept.includes('.env'),
+            paste: moveCheck,
+            dropGuards:
+              !dropSelf.ok && !dropChild.ok && !dropOnFile.ok && dropOk.ok,
+            undo: Boolean(undoCheck),
+            bytes: EXP.formatBytes(1536) === '2 КБ' && EXP.formatBytes(0) === '',
+            rename: renameCheck,
+          });
+        } else {
+          add('explorerOps', { skipped: true });
+        }
+
+        // Оформление и правила уведомлений (1.3).
+        const LOOK = window.__appearance;
+        const RULES = window.__notifyRules;
+        if (LOOK && RULES) {
+          const probe = document.createElement('div');
+          LOOK.applyAppearance(
+            {
+              theme: 'dark',
+              accent: '#2563eb',
+              density: 'compact',
+              uiScale: 1.15,
+              reduceMotion: true,
+            },
+            false,
+            probe
+          );
+          const darkApplied =
+            probe.classList.contains('dark') &&
+            probe.dataset.density === 'compact' &&
+            probe.dataset.motion === 'reduced' &&
+            probe.style.getPropertyValue('--ws-accent').toUpperCase() === '#2563EB' &&
+            probe.style.getPropertyValue('--ws-ui-scale') === '1.15';
+          const prefs = {
+            toasts: true,
+            sound: 'knock',
+            volume: 0.2,
+            events: { save: true, export: true, ai: true, update: true, error: true },
+            quietFrom: '23:00',
+            quietTo: '08:00',
+          };
+          const night = new Date(2026, 0, 1, 1, 30);
+          const noon = new Date(2026, 0, 1, 12, 0);
+          add('appearance', {
+            systemTheme: LOOK.resolveDark('system', true) && !LOOK.resolveDark('system', false),
+            explicitTheme: LOOK.resolveDark('light', true) === false && LOOK.resolveDark('dark', false) === true,
+            scaleClamped: LOOK.clampScale(2) === 1.3 && LOOK.clampScale(0.1) === 0.85 && LOOK.clampScale(Number.NaN) === 1,
+            accent: LOOK.normalizeAccent('abc') === '#AABBCC' && LOOK.normalizeAccent('zzz') === '',
+            rgba: LOOK.hexToRgba('#2563EB', 0.2) === 'rgba(37, 99, 235, 0.2)',
+            applied: darkApplied,
+            quietNight: RULES.inQuietHours('23:00', '08:00', night) === true,
+            quietNoon: RULES.inQuietHours('23:00', '08:00', noon) === false,
+            quietInvalid: RULES.inQuietHours('', '', noon) === false,
+            notifyOn: RULES.shouldNotify({ kind: 'save', prefs, now: noon }) === true,
+            notifyQuiet: RULES.shouldNotify({ kind: 'save', prefs, now: night }) === false,
+            notifyDisabled: RULES.shouldNotify({ kind: 'save', prefs: { ...prefs, toasts: false, sound: 'off' }, now: noon }) === false,
+            soundRules:
+              RULES.shouldPlaySound(prefs, 'save') === true &&
+              RULES.shouldPlaySound(prefs, 'error') === false &&
+              RULES.shouldPlaySound({ ...prefs, sound: 'off' }, 'save') === false,
+          });
+        } else {
+          add('appearance', { skipped: true });
+        }
+
+        // Автосохранение: идентификаторы, имена файлов и правила снимка.
+        const SNAP = window.__snapshot;
+        if (SNAP) {
+          const idA = SNAP.snapshotId('C:/ws/Docs/Report.DOCX');
+          const idB = SNAP.snapshotId('c:/ws/docs/report.docx');
+          add('autosave', {
+            deterministic: idA === idB,
+            shape: /^snap-[a-z0-9]+$/.test(idA),
+            distinct: SNAP.snapshotId('C:/ws/a.txt') !== SNAP.snapshotId('C:/ws/b.txt'),
+            safeName: SNAP.safeSnapshotName('snap-12_ab!@#$') === 'snap-12_ab',
+            dirtyOnly: SNAP.shouldSnapshot({ isDirty: false, content: 'x' }) === false,
+            emptySkipped: SNAP.shouldSnapshot({ isDirty: true, content: '' }) === false,
+            bigSkipped: SNAP.shouldSnapshot({ isDirty: true, content: 'x'.repeat(9000), maxBytes: 8192 }) === false,
+            saved: SNAP.shouldSnapshot({ isDirty: true, content: 'текст' }) === true,
+          });
+        } else {
+          add('autosave', { skipped: true });
+        }
+
+        // Раскладка окна и выборочное применение правок.
+        const LAYOUT = window.__layout;
+        const DIFF = window.__aiDiff;
+        if (LAYOUT && DIFF) {
+          const defaults = LAYOUT.normalizeLayout(null);
+          const garbage = LAYOUT.normalizeLayout({
+            aiPanelOpen: 'да',
+            terminalOpen: true,
+            searchPanelOpen: 0,
+            openPaths: ['C:/a.txt', '', 'C:/a.txt', 5, 'C:/b.txt'],
+            activePath: 42,
+          });
+          const many = LAYOUT.normalizeLayout({
+            openPaths: Array.from({ length: 20 }, (_, index) => 'C:/f' + index + '.txt'),
+          });
+          const fingerprintA = LAYOUT.layoutFingerprint({ ...defaults, terminalOpen: true });
+          const fingerprintB = LAYOUT.layoutFingerprint({ ...defaults, terminalOpen: false });
+
+          add('layoutAndDiff', {
+            defaults: defaults.aiPanelOpen === true && defaults.openPaths.length === 0,
+            garbageBooleans:
+              garbage.aiPanelOpen === true && garbage.terminalOpen === true && garbage.searchPanelOpen === false,
+            garbagePaths:
+              garbage.openPaths.length === 2 && garbage.openPaths[0] === 'C:/a.txt' && garbage.activePath === '',
+            capped: many.openPaths.length === LAYOUT.MAX_RESTORED_TABS,
+            fingerprintDiffers: fingerprintA !== fingerprintB,
+            toggleOn: JSON.stringify(DIFF.toggleExcluded([], 2)) === JSON.stringify([2]),
+            toggleOff: JSON.stringify(DIFF.toggleExcluded([1, 2, 3], 2)) === JSON.stringify([1, 3]),
+            toggleClean: JSON.stringify(DIFF.toggleExcluded([-1, 0, 0], 4)) === JSON.stringify([0, 4]),
+            filterKeeps: DIFF.filterOperations(['a', 'b', 'c'], [1]).join(',') === 'a,c',
+            filterOutOfRange: DIFF.filterOperations(['a', 'b'], [9, 9]).length === 2,
+            describe: DIFF.describeOperations(3, [0]) === '2 из 3' && DIFF.describeOperations(2, [7]) === '2 из 2',
+            summarize:
+              DIFF.summarizeOperations([{ tool: 'set_text' }, { tool: 'add_slide' }], [0]) ===
+                'Будет выполнено: add_slide' &&
+              DIFF.summarizeOperations([{ tool: 'set_text' }], [0]) === 'Правки не выбраны',
+          });
+        } else {
+          add('layoutAndDiff', { skipped: true });
+        }
+
+        // PDF в реальном рантайме: pdf.js, встраивание шрифта, аннотации, сессия.
+        const PDF_RENDER = window.__pdfRender;
+        const PDF_OPS = window.__pdfOps;
+        const PDF_ANN = window.__pdfAnnotate;
+        if (PDF_RENDER && PDF_OPS && PDF_ANN && SAMPLE_PDF_B64) {
+          try {
+            const preview = { base64: SAMPLE_PDF_B64 };
+            const pdfDoc = await PDF_RENDER.loadPdfDocument(preview.base64);
+            const png = await PDF_RENDER.renderPageToDataUrl(pdfDoc, 0, 200);
+            const pageText = await PDF_RENDER.extractPageText(pdfDoc, 1);
+            const found = await PDF_RENDER.findAllMatches(pdfDoc, 'Second page text');
+            const fontBytes = PDF_OPS.base64ToBytes(ARIAL_B64);
+            const highlighted = await PDF_ANN.addHighlight(preview.base64, { page: 0, x: 0.1, y: 0.2 });
+            const noted = await PDF_ANN.addNote(preview.base64, {
+              page: 2,
+              x: 0.08,
+              y: 0.1,
+              text: 'Проверка заметки WorkSpace',
+              fontBytes,
+            });
+            const highlightInfo = await PDF_OPS.inspectPdf(highlighted);
+            const noteInfo = await PDF_OPS.inspectPdf(noted);
+
+            // Двоичное сохранение: тот же путь, что у saveTab для base64-вкладок.
+            const savedPath = 'C:/Builders/Workspace/.verify/out.pdf';
+            const annotatedBytes = PDF_OPS.base64ToBytes(noted);
+            const writeResult = await window.electronAPI.writeFile(savedPath, noted, 'base64');
+            const readBack = await window.electronAPI.readPreview(savedPath, 8 * 1024 * 1024);
+            let binarySave = false;
+            if (readBack && readBack.success) {
+              const backBytes = PDF_OPS.base64ToBytes(readBack.base64);
+              binarySave =
+                Boolean(writeResult?.success) &&
+                backBytes.length === annotatedBytes.length &&
+                backBytes.every((value, index) => value === annotatedBytes[index]);
+            }
+            const click = PDF_ANN.normalizeClick(
+              { left: 100, top: 50, width: 200, height: 400 },
+              200,
+              250
+            );
+            const clickClamped = PDF_ANN.normalizeClick(
+              { left: 0, top: 0, width: 100, height: 100 },
+              -50,
+              500
+            );
+
+            add('pdfRuntime', {
+              rendered:
+                typeof png === 'string' &&
+                png.indexOf('data:image/png;base64,') === 0 &&
+                png.length > 4000,
+              pageCount: pdfDoc.numPages === 3,
+              textExtracted: /Second page text/i.test(pageText),
+              searchHighlight:
+                found.length > 0 &&
+                found[0].page === 1 &&
+                found[0].x >= 0 &&
+                found[0].x < 1 &&
+                found[0].y >= 0 &&
+                found[0].y < 1 &&
+                found[0].width > 0 &&
+                found[0].height > 0 &&
+                found[0].height < 0.2 &&
+                /second page text/i.test(found[0].text),
+              searchPlacement:
+                found[0].x > 0.05 && found[0].x < 0.2 && found[0].y > 0.03 && found[0].y < 0.2,
+              highlight: highlightInfo.pageCount === 3,
+              cyrillicNote: noteInfo.pageCount === 3,
+              click: Math.round(click.x * 100) === 50 && Math.round(click.y * 100) === 50,
+              clickClamped: clickClamped.x === 0 && clickClamped.y === 1,
+              binarySave,
+            });
+          } catch (error) {
+            add('pdfRuntime', { error: String((error && error.message) || error) });
+          }
+        } else {
+          add('pdfRuntime', { skipped: true });
+        }
 
         return steps;
       })()

@@ -114,9 +114,17 @@ const electronAPI = {
   exportPdf: (
     html: string,
     suggestedName?: string,
-    targetPath?: string
+    targetPath?: string,
+    pageSize?: { width: number; height: number }
   ): Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }> =>
-    ipcRenderer.invoke('pdf:export', html, suggestedName, targetPath),
+    ipcRenderer.invoke('pdf:export', html, suggestedName, targetPath, pageSize),
+  exportSlideImages: (
+    htmlPages: string[],
+    outDir: string,
+    width?: number,
+    height?: number
+  ): Promise<{ success: boolean; files?: string[]; dir?: string; error?: string }> =>
+    ipcRenderer.invoke('ppt:exportImages', htmlPages, outDir, width, height),
   uniquePath: (dirPath: string, fileName: string): Promise<string> =>
     ipcRenderer.invoke('fs:uniquePath', dirPath, fileName),
   showInExplorer: (filePath: string): Promise<{ success: boolean; error?: string }> =>
@@ -135,6 +143,49 @@ const electronAPI = {
     maxBytes?: number
   ): Promise<{ success: boolean; base64?: string; size?: number; error?: string }> =>
     ipcRenderer.invoke('fs:readPreview', filePath, maxBytes),
+  /** Размер и время изменения без чтения содержимого. */
+  statFile: (
+    filePath: string
+  ): Promise<{
+    success: boolean;
+    size?: number;
+    mtimeMs?: number;
+    isDirectory?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke('fs:statFile', filePath),
+  /** Бинарное чтение: большие таблицы не гоняются через base64. */
+  readBinary: (
+    filePath: string
+  ): Promise<{
+    success: boolean;
+    bytes?: ArrayBuffer;
+    size?: number;
+    tooLarge?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke('fs:readBinary', filePath),
+  /** Кусок файла — потоковый разбор CSV. */
+  readBinarySlice: (
+    filePath: string,
+    offset = 0,
+    length = 0
+  ): Promise<{
+    success: boolean;
+    bytes?: ArrayBuffer;
+    size?: number;
+    offset?: number;
+    total?: number;
+    eof?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke('fs:readBinarySlice', filePath, offset, length),
+  writeBinary: (
+    filePath: string,
+    bytes: ArrayBuffer | Uint8Array
+  ): Promise<{ success: boolean; size?: number; error?: string }> =>
+    ipcRenderer.invoke('fs:writeBinary', filePath, bytes),
+  guessEncoding: (
+    filePath: string
+  ): Promise<{ success: boolean; encoding?: string; hasBom?: boolean; error?: string }> =>
+    ipcRenderer.invoke('fs:guessEncoding', filePath),
   /** Текст устаревшего .doc: разбор OLE2 в главном процессе. */
   extractDocText: (payload: { path?: string; base64?: string }): Promise<{
     success: boolean;
@@ -169,6 +220,28 @@ const electronAPI = {
     ipcRenderer.invoke('fs:pickDirectory', defaultDir),
   renamePath: (oldPath: string, newPath: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('fs:renamePath', oldPath, newPath),
+  copyPath: (source: string, target: string): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('fs:copyPath', source, target),
+  autosaveWrite: (name: string, payload: unknown): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('autosave:write', name, payload),
+  autosaveList: (): Promise<{ success: boolean; items?: unknown[]; error?: string }> =>
+    ipcRenderer.invoke('autosave:list'),
+  autosaveRead: (name: string): Promise<{ success: boolean; snapshot?: unknown; error?: string }> =>
+    ipcRenderer.invoke('autosave:read', name),
+  autosaveRemove: (name: string): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('autosave:remove', name),
+  diagnosticsLog: (level: string, message: string): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('diagnostics:log', level, message),
+  diagnosticsReport: (): Promise<{ success: boolean; report?: unknown; error?: string }> =>
+    ipcRenderer.invoke('diagnostics:report'),
+  windowNew: (): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('window:new'),
+  sessionGet: (): Promise<unknown> => ipcRenderer.invoke('session:get'),
+  sessionPatch: (patch: unknown): Promise<unknown> => ipcRenderer.invoke('session:patch', patch),
+  onSessionChanged: (cb: (session: unknown) => void): (() => void) => {
+    const listener = (_event: unknown, session: unknown) => cb(session);
+    ipcRenderer.on('session:changed', listener);
+    return () => ipcRenderer.removeListener('session:changed', listener);
+  },
 
   /* ---------- Прокси запросов к AI ---------- */
   /**
@@ -337,8 +410,38 @@ const electronAPI = {
     speedSegments?: { start: number; end: number; speed: number }[];
     duration?: number;
     hasAudio?: boolean;
+    zoom?: { scale?: number; x?: number; y?: number };
   }): Promise<{ success: boolean; outputPath?: string; error?: string }> =>
     ipcRenderer.invoke('video:edit', req),
+  /** Прогресс кодирования: проценты по `-progress` от ffmpeg. */
+  onVideoProgress: (cb: (data: { filePath: string; percent: number }) => void): (() => void) => {
+    const listener = (_e: unknown, data: { filePath: string; percent: number }) => cb(data);
+    ipcRenderer.on('video:progress', listener);
+    return () => ipcRenderer.removeListener('video:progress', listener);
+  },
+  /** Отмена активного кодирования файла. */
+  videoCancel: (filePath: string): Promise<{ success: boolean; error?: string }> =>
+    ipcRenderer.invoke('video:cancel', filePath),
+  videoExtractAudio: (
+    filePath: string,
+    req?: { format?: 'mp3' | 'aac' | 'copy'; outputPath?: string }
+  ): Promise<{ success: boolean; outputPath?: string; error?: string }> =>
+    ipcRenderer.invoke('video:extractAudio', filePath, req),
+  videoFrames: (
+    filePath: string,
+    req?: { count?: number; at?: number[]; maxWidth?: number; dir?: string }
+  ): Promise<{ success: boolean; files?: string[]; error?: string }> =>
+    ipcRenderer.invoke('video:frames', filePath, req),
+  videoConvert: (
+    filePath: string,
+    req?: { format?: 'mp4' | 'webm' | 'gif'; quality?: 'low' | 'medium' | 'high'; outputPath?: string }
+  ): Promise<{ success: boolean; outputPath?: string; error?: string }> =>
+    ipcRenderer.invoke('video:convert', filePath, req),
+  videoGif: (
+    filePath: string,
+    req?: { start?: number; duration?: number; fps?: number; width?: number; outputPath?: string }
+  ): Promise<{ success: boolean; outputPath?: string; error?: string }> =>
+    ipcRenderer.invoke('video:gif', filePath, req),
   youtubeCategories: (): Promise<{ success: boolean; categories: { id: string; title: string }[]; error?: string }> =>
     ipcRenderer.invoke('youtube:categories'),
   youtubePlaylists: (): Promise<{ success: boolean; playlists: { id: string; title: string }[]; error?: string }> =>
@@ -360,10 +463,65 @@ const electronAPI = {
     }
   ): Promise<{ success: boolean; id?: string; url?: string; error?: string }> =>
     ipcRenderer.invoke('youtube:upload', filePath, meta),
+  /* ---------- Google: Диск и YouTube по отдельности ---------- */
+  googleConnect: (
+    service: 'drive' | 'youtube'
+  ): Promise<{ success: boolean; email?: string; scopes?: string[]; error?: string }> =>
+    ipcRenderer.invoke('google:connect', service),
+  googleStatus: (): Promise<{
+    configured: boolean;
+    drive: { connected: boolean; email?: string; scopes?: string };
+    youtube: { connected: boolean; email?: string; scopes?: string };
+    email?: string;
+  }> => ipcRenderer.invoke('google:status'),
+  googleDisconnect: (service: 'drive' | 'youtube'): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke('google:disconnect', service),
+  googleDiagnose: (): Promise<{
+    configured: boolean;
+    tokenValid: boolean;
+    driveApi: 'ok' | 'no-access' | 'error' | 'not-connected';
+    youtubeApi: 'ok' | 'no-access' | 'error' | 'not-connected';
+    quotaBytes?: number;
+    channelTitle?: string;
+    error?: string;
+  }> => ipcRenderer.invoke('google:diagnose'),
+  onGdriveProgress: (cb: (data: { filePath: string; sent: number; total: number }) => void): (() => void) => {
+    const listener = (_e: unknown, data: { filePath: string; sent: number; total: number }) =>
+      cb(data);
+    ipcRenderer.on('gdrive:progress', listener);
+    return () => ipcRenderer.removeListener('gdrive:progress', listener);
+  },
   openImgbb: (paths: string[]): Promise<{ success: boolean; count?: number; error?: string }> =>
     ipcRenderer.invoke('imagehost:open', 'imgbb', paths),
   openFreeimage: (paths: string[]): Promise<{ success: boolean; count?: number; error?: string }> =>
     ipcRenderer.invoke('imagehost:open', 'freeimage', paths),
+  /** Япикс: загрузка в альбом, большие наборы — пачками. */
+  openYapx: (
+    paths: string[],
+    options?: { authorized?: boolean; perAlbum?: number }
+  ): Promise<{
+    success: boolean;
+    count?: number;
+    albums?: string[];
+    skipped?: { path: string; reason: string }[];
+    error?: string;
+  }> => ipcRenderer.invoke('imagehost:open', 'yapx', paths, options ?? {}),
+  /** Лимиты и форматы сайтов-хостингов: их читает интерфейс для валидации. */
+  imageHostLimits: (): Promise<
+    Record<
+      string,
+      {
+        id: string;
+        title: string;
+        formats: string[];
+        maxFileMb: number;
+        perAlbum: number;
+        perAlbumAuthorized?: number;
+        perHour?: number;
+        resultPattern?: string;
+      }
+    >
+  > => ipcRenderer.invoke('imagehost:hosts'),
   onYoutubeProgress: (cb: (data: { filePath: string; sent: number; total: number }) => void): (() => void) => {
     const listener = (_e: unknown, data: { filePath: string; sent: number; total: number }) => cb(data);
     ipcRenderer.on('youtube:progress', listener);
@@ -492,8 +650,15 @@ const electronAPI = {
   },
 
   /* ---------- Интеграция с Проводником Windows ---------- */
-  getContextMenuStatus: (): Promise<{ installed: boolean; exePath: string; error?: string }> =>
-    ipcRenderer.invoke('system:getContextMenuStatus'),
+  getContextMenuStatus: (): Promise<{
+    installed: boolean;
+    exePath: string;
+    labels?: Record<string, string>;
+    command?: string;
+    icon?: string;
+    iconMatches?: boolean;
+    error?: string;
+  }> => ipcRenderer.invoke('system:getContextMenuStatus'),
   installContextMenu: (): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('system:installContextMenu'),
   removeContextMenu: (): Promise<{ success: boolean; error?: string }> =>

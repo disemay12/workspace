@@ -350,3 +350,31 @@
 [data-comment-text] { background: rgba(250, 204, 21, 0.16); border-bottom: 1px dashed #ca8a04; }
 sup[data-footnote-ref] { font-size: 0.7em; vertical-align: super; color: #2563eb; cursor: help; }
 [data-field='TOC'] { white-space: pre-wrap; }
+
+/* Файл, открытый из контекстного меню Windows, коротко подсвечивается в дереве. */
+@keyframes ws-reveal {
+  0% { background-color: var(--ws-accent-soft); box-shadow: inset 0 0 0 1px var(--ws-accent); }
+  70% { background-color: var(--ws-accent-soft); box-shadow: inset 0 0 0 1px var(--ws-accent); }
+  100% { background-color: transparent; box-shadow: none; }
+}
+.ws-reveal-flash {
+  animation: ws-reveal 1.6s ease-out;
+  border-radius: 4px;
+}
+/* Оформление из настроек: плотность, масштаб и «меньше анимации». */
+html[data-density='compact'] {
+  --ws-row-height: 20px;
+}
+
+html[data-motion='reduced'] *,
+html[data-motion='reduced'] *::before,
+html[data-motion='reduced'] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+html {
+  font-size: calc(14px * var(--ws-ui-scale, 1));
+}

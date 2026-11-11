@@ -125,6 +125,13 @@ export interface ProviderPreset {
   requiresKey: boolean;
 }
 
+export interface PromptProfile {
+  id: string;
+  label: string;
+  /** Дополнительные инструкции; пустой профиль ничего не добавляет. */
+  prompt: string;
+}
+
 export interface AISettings {
   provider: AIProvider;
   /** Ключ активного провайдера. В localStorage не пишется — хранится в keyVault. */
@@ -134,6 +141,10 @@ export interface AISettings {
   temperature: number;
   maxTokens: number;
   systemPrompt: string;
+  /** Профили промптов: наборы дополнительных инструкций под задачи. */
+  promptProfiles?: PromptProfile[];
+  /** Активный профиль; применяется поверх systemPrompt. */
+  activeProfileId?: string;
   activePresetId?: string;
   modelsCache?: Record<string, string[]>;
 }
@@ -287,7 +298,13 @@ declare global {
       saveFileDialog: (defaultName: string, filters?: { name: string; extensions: string[] }[], defaultDir?: string) => Promise<string | null>;
       /** Существует ли путь — для предупреждения о перезаписи в «Сохранить как». */
       pathExists?: (targetPath: string) => Promise<boolean>;
-      exportPdf: (html: string, suggestedName?: string, targetPath?: string) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
+      exportPdf: (html: string, suggestedName?: string, targetPath?: string, pageSize?: { width: number; height: number }) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
+  exportSlideImages?: (
+    htmlPages: string[],
+    outDir: string,
+    width?: number,
+    height?: number
+  ) => Promise<{ success: boolean; files?: string[]; dir?: string; error?: string }>;
       uniquePath: (dirPath: string, fileName: string) => Promise<string>;
       showInExplorer: (filePath: string) => Promise<{ success: boolean; error?: string }>;
       setWorkspaceRoot: (dirPath: string) => Promise<{ success: boolean }>;
@@ -297,6 +314,11 @@ declare global {
       listDirectory: (dirPath: string) => Promise<{ success: boolean; items: FileItem[]; error?: string }>;
       readFile: (filePath: string, encoding?: string) => Promise<{ success: boolean; content?: string; isBinary?: boolean; error?: string }>;
       readPreview: (filePath: string, maxBytes?: number) => Promise<{ success: boolean; base64?: string; size?: number; error?: string }>;
+      statFile: (filePath: string) => Promise<{ success: boolean; size?: number; mtimeMs?: number; isDirectory?: boolean; error?: string }>;
+      readBinary: (filePath: string) => Promise<{ success: boolean; bytes?: ArrayBuffer; size?: number; tooLarge?: boolean; error?: string }>;
+      readBinarySlice: (filePath: string, offset?: number, length?: number) => Promise<{ success: boolean; bytes?: ArrayBuffer; size?: number; offset?: number; total?: number; eof?: boolean; error?: string }>;
+      writeBinary: (filePath: string, bytes: ArrayBuffer | Uint8Array) => Promise<{ success: boolean; size?: number; error?: string }>;
+      guessEncoding: (filePath: string) => Promise<{ success: boolean; encoding?: string; hasBom?: boolean; error?: string }>;
       /** Текст устаревшего .doc (Word 97-2003): разбор OLE2 в главном процессе. */
       extractDocText: (payload: { path?: string; base64?: string }) => Promise<{
         success: boolean;
@@ -313,6 +335,17 @@ declare global {
       /** Выбрать папку: диалог сохранения на Low integrity отказывает в записи. */
       pickDirectory: (defaultDir?: string) => Promise<string | null>;
       renamePath: (oldPath: string, newPath: string) => Promise<{ success: boolean; error?: string }>;
+  copyPath: (source: string, target: string) => Promise<{ success: boolean; error?: string }>;
+  autosaveWrite?: (name: string, payload: unknown) => Promise<{ success: boolean; error?: string }>;
+  autosaveList?: () => Promise<{ success: boolean; items?: unknown[]; error?: string }>;
+  autosaveRead?: (name: string) => Promise<{ success: boolean; snapshot?: unknown; error?: string }>;
+  autosaveRemove?: (name: string) => Promise<{ success: boolean; error?: string }>;
+  diagnosticsLog?: (level: string, message: string) => Promise<{ success: boolean }>;
+  diagnosticsReport?: () => Promise<{ success: boolean; report?: unknown; error?: string }>;
+  windowNew?: () => Promise<{ success: boolean; error?: string }>;
+  sessionGet?: () => Promise<unknown>;
+  sessionPatch?: (patch: unknown) => Promise<unknown>;
+  onSessionChanged?: (cb: (session: unknown) => void) => () => void;
 
       searchWorkspace: (
         rootDir: string,
@@ -338,12 +371,37 @@ declare global {
       gdriveUpload: (paths: string[], folderName?: string) => Promise<{ success: boolean; uploaded: number; failed: string[]; link?: string; error?: string }>;
       videoCapabilities: () => Promise<{ ffmpeg: string | null; ffprobe: string | null }>;
       videoProbe: (filePath: string) => Promise<{ success: boolean; duration?: number; width?: number; height?: number; hasAudio?: boolean; videoCodec?: string; audioCodec?: string; size?: number; mime?: string; error?: string }>;
-      videoEdit: (req: { filePath: string; start?: number; end?: number; stripAudio?: boolean; compress?: boolean; outputPath?: string; speed?: number; speedSegments?: { start: number; end: number; speed: number }[]; duration?: number; hasAudio?: boolean }) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
+      videoEdit: (req: { filePath: string; start?: number; end?: number; stripAudio?: boolean; compress?: boolean; outputPath?: string; speed?: number; speedSegments?: { start: number; end: number; speed: number }[]; duration?: number; hasAudio?: boolean; zoom?: { scale?: number; x?: number; y?: number } }) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
+      onVideoProgress?: (cb: (data: { filePath: string; percent: number }) => void) => () => void;
+      videoCancel?: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  videoExtractAudio?: (
+    filePath: string,
+    req?: { format?: 'mp3' | 'aac' | 'copy'; outputPath?: string }
+  ) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
+  videoFrames?: (
+    filePath: string,
+    req?: { count?: number; at?: number[]; maxWidth?: number; dir?: string }
+  ) => Promise<{ success: boolean; files?: string[]; error?: string }>;
+  videoConvert?: (
+    filePath: string,
+    req?: { format?: 'mp4' | 'webm' | 'gif'; quality?: 'low' | 'medium' | 'high'; outputPath?: string }
+  ) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
+  videoGif?: (
+    filePath: string,
+    req?: { start?: number; duration?: number; fps?: number; width?: number; outputPath?: string }
+  ) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
       youtubeCategories: () => Promise<{ success: boolean; categories: { id: string; title: string }[]; error?: string }>;
       youtubePlaylists: () => Promise<{ success: boolean; playlists: { id: string; title: string }[]; error?: string }>;
       youtubeUpload: (filePath: string, meta: { title: string; description?: string; tags?: string[]; categoryId?: string; privacyStatus: 'public' | 'unlisted' | 'private'; madeForKids: boolean; embeddable?: boolean; license?: 'youtube' | 'creativeCommon'; defaultLanguage?: string; publishAt?: string; playlistId?: string }) => Promise<{ success: boolean; id?: string; url?: string; error?: string }>;
+      googleConnect: (service: 'drive' | 'youtube') => Promise<{ success: boolean; email?: string; scopes?: string[]; error?: string }>;
+      googleStatus: () => Promise<{ configured: boolean; drive: { connected: boolean; email?: string; scopes?: string }; youtube: { connected: boolean; email?: string; scopes?: string }; email?: string }>;
+      googleDisconnect: (service: 'drive' | 'youtube') => Promise<{ success: boolean }>;
+      googleDiagnose: () => Promise<{ configured: boolean; tokenValid: boolean; driveApi: 'ok' | 'no-access' | 'error' | 'not-connected'; youtubeApi: 'ok' | 'no-access' | 'error' | 'not-connected'; quotaBytes?: number; channelTitle?: string; error?: string }>;
+      onGdriveProgress?: (cb: (data: { filePath: string; sent: number; total: number }) => void) => () => void;
       openImgbb: (paths: string[]) => Promise<{ success: boolean; count?: number; error?: string }>;
       openFreeimage: (paths: string[]) => Promise<{ success: boolean; count?: number; error?: string }>;
+      openYapx: (paths: string[], options?: { authorized?: boolean; perAlbum?: number }) => Promise<{ success: boolean; count?: number; albums?: string[]; skipped?: { path: string; reason: string }[]; error?: string }>;
+      imageHostLimits: () => Promise<Record<string, { id: string; title: string; formats: string[]; maxFileMb: number; perAlbum: number; perAlbumAuthorized?: number; perHour?: number; resultPattern?: string }>>;
       onYoutubeProgress: (cb: (data: { filePath: string; sent: number; total: number }) => void) => () => void;
 
       /** Постоянные настройки AI из профиля пользователя. */
@@ -441,7 +499,7 @@ declare global {
       onTerminalExit?: (cb: (data: { id: string; code: number }) => void) => () => void;
 
       /* ---------- Интеграция с Проводником Windows ---------- */
-      getContextMenuStatus?: () => Promise<{ installed: boolean; exePath: string; error?: string }>;
+      getContextMenuStatus?: () => Promise<{ installed: boolean; exePath: string; labels?: Record<string, string>; command?: string; icon?: string; iconMatches?: boolean; error?: string }>;
       installContextMenu?: () => Promise<{ success: boolean; error?: string }>;
       removeContextMenu?: () => Promise<{ success: boolean; error?: string }>;
       createDesktopShortcut?: () => Promise<{ success: boolean; shortcutPath?: string; error?: string }>;

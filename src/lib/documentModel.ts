@@ -180,6 +180,8 @@ export interface DocumentToolResult {
   }>;
   /** Служебные данные пагинации/выделения. */
   meta?: Record<string, unknown>;
+  /** Путь созданного или изменённого файла (конвертация, медиа, экспорт). */
+  path?: string;
   /** Новые параметры страницы: применяются к .docx через контроллер редактора. */
   page?: PageSetup;
   selection?: {

@@ -9,7 +9,7 @@ import { registerShare } from './share';
 import { registerGDrive } from './gdrive';
 import { registerVideo } from './video';
 import { registerYoutube } from './youtube';
-import { registerHostedImageUpload } from './imageHost';
+import { registerImageHosts } from './imageHost';
 import { registerAiSettings } from './aiSettings';
 import { docBufferToText } from './docText';
 import { setWatchRoot } from './watcher';
@@ -329,6 +329,32 @@ app.on('will-quit', () => {
    Управление окном
    ============================================================ */
 
+/** Второе окно: отдельный рендерер для второго монитора, состояние своё. */
+ipcMain.handle('window:new', async () => {
+  try {
+    const win = new BrowserWindow({
+      width: 1280,
+      height: 820,
+      minWidth: 960,
+      minHeight: 600,
+      backgroundColor: '#0b0f17',
+      show: false,
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+      },
+    });
+    win.once('ready-to-show', () => win.show());
+    const devUrl = process.env.VITE_DEV_SERVER_URL;
+    if (devUrl) await win.loadURL(devUrl);
+    else await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
 ipcMain.handle('window:minimize', () => {
   mainWindow?.minimize();
 });
@@ -621,6 +647,16 @@ function writeSession(patch: Partial<WorkspaceSession>): WorkspaceSession {
   return next;
 }
 
+ipcMain.handle('session:get', () => readSession());
+
+/** Сохраняет раскладку и рассылает её остальным окнам. */
+ipcMain.handle('session:patch', (_event, patch: Partial<WorkspaceSession>) => {
+  const next = writeSession(patch);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('session:changed', next);
+  }
+  return next;
+});
 ipcMain.handle('fs:getCurrentWorkspace', () => {
   if (!workspaceRoot) {
     const saved = readSession().lastPath;
@@ -878,6 +914,77 @@ ipcMain.handle('system:openPath', async (_event, filePath: string) => {
   return error ? { success: false, error } : { success: true };
 });
 
+/**
+ * Атомарная запись: временный файл рядом с целевым и переименование.
+ * Если переименование не удалось (антивирус, занятый файл), пробуем копирование
+ * и повторную прямую запись — но только для текстовых файлов: недописанный ZIP
+ * Excel/Word считают повреждённым.
+ */
+async function writeFileAtomic(
+  filePath: string,
+  payload: Buffer | string,
+  binaryFile: boolean
+): Promise<void> {
+  const writeWithRetry = async (target: string): Promise<void> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        await fs.promises.writeFile(target, payload);
+        return;
+      } catch (err) {
+        lastError = err;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw err;
+        await new Promise((resolve) => setTimeout(resolve, 200 + attempt * 200));
+      }
+    }
+    throw lastError;
+  };
+
+  const lockedError = (code?: string) =>
+    new Error(
+      code === 'EACCES' && isLowIntegrity()
+        ? 'Не удалось сохранить файл: ' + LOW_INTEGRITY_HINT
+        : code === 'EACCES'
+          ? 'Нет прав на запись в эту папку. Выберите другую папку или запустите WorkSpace от администратора.'
+          : 'Файл открыт в другой программе (Excel/Word). Закройте его и повторите сохранение.'
+    );
+
+  // Уникальное имя: два параллельных сохранения не должны открывать
+  // один и тот же .ws-tmp (иначе Windows возвращает EPERM).
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.ws-tmp`;
+  try {
+    await fs.promises.writeFile(tmpPath, payload);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
+      // Временный файл создать нельзя (антивирус/блокировка).
+      if (binaryFile) throw lockedError(code);
+      await writeWithRetry(filePath);
+      return;
+    }
+    throw err;
+  }
+
+  try {
+    await fs.promises.rename(tmpPath, filePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY' && code !== 'EACCES') throw err;
+    try {
+      await fs.promises.copyFile(tmpPath, filePath);
+    } catch (copyErr) {
+      const copyCode = (copyErr as NodeJS.ErrnoException).code;
+      if (copyCode !== 'EPERM' && copyCode !== 'EBUSY' && copyCode !== 'EACCES') {
+        throw copyErr;
+      }
+      if (binaryFile) throw lockedError(copyCode);
+      await writeWithRetry(filePath);
+    }
+    await fs.promises.unlink(tmpPath).catch(() => undefined);
+  }
+}
+
 ipcMain.handle(
   'fs:writeFile',
   async (_event, filePath: string, content: string, encoding = 'utf-8') => {
@@ -891,68 +998,12 @@ ipcMain.handle(
               ? iconv.encode(content, encoding)
               : content;
 
-      const writeWithRetry = async (target: string): Promise<void> => {
-        let lastError: unknown;
-        for (let attempt = 0; attempt < 4; attempt++) {
-          try {
-            await fs.promises.writeFile(target, payload);
-            return;
-          } catch (err) {
-            lastError = err;
-            const code = (err as NodeJS.ErrnoException).code;
-            if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw err;
-            await new Promise((resolve) => setTimeout(resolve, 200 + attempt * 200));
-          }
-        }
-        throw lastError;
-      };
-
       // Бинарные офисные файлы нельзя писать поверх открытого файла:
       // Excel/Word видят недописанный ZIP и сообщают «недопустимый формат».
       const binaryFile = /\.(xlsx|xlsm|xlsb|docx|doc|pptx|ppt|zip|7z|pdf|png|jpe?g)$/i.test(
         filePath
       );
-      const lockedError = (code?: string) =>
-        new Error(
-          code === 'EACCES' && isLowIntegrity()
-            ? 'Не удалось сохранить файл: ' + LOW_INTEGRITY_HINT
-            : code === 'EACCES'
-              ? 'Нет прав на запись в эту папку. Выберите другую папку или запустите WorkSpace от администратора.'
-              : 'Файл открыт в другой программе (Excel/Word). Закройте его и повторите сохранение.'
-        );
-
-      // Уникальное имя: два параллельных сохранения не должны открывать
-      // один и тот же .ws-tmp (иначе Windows возвращает EPERM).
-      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.ws-tmp`;
-      try {
-        await fs.promises.writeFile(tmpPath, payload);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
-          // Временный файл создать нельзя (антивирус/блокировка).
-          if (binaryFile) throw lockedError(code);
-          await writeWithRetry(filePath);
-          return { success: true };
-        }
-        throw err;
-      }
-
-      try {
-        await fs.promises.rename(tmpPath, filePath);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY' && code !== 'EACCES') throw err;
-        try {
-          await fs.promises.copyFile(tmpPath, filePath);
-        } catch (copyErr) {
-          const copyCode = (copyErr as NodeJS.ErrnoException).code;
-          if (copyCode !== 'EPERM' && copyCode !== 'EBUSY' && copyCode !== 'EACCES') {
-            throw copyErr;
-          }
-          if (binaryFile) throw lockedError(copyCode);
-          await writeWithRetry(filePath);
-        }
-        await fs.promises.unlink(tmpPath).catch(() => undefined);      }
+      await writeFileAtomic(filePath, payload, binaryFile);
       return { success: true };
     } catch (err) {
       return { success: false, error: (err as Error).message };
@@ -960,16 +1011,229 @@ ipcMain.handle(
   }
 );
 
+/** Предельный размер файла для бинарного чтения в рендерер (воркер разбора таблиц). */
+const MAX_BINARY_BYTES = 512 * 1024 * 1024;
+
+/** Приводит то, что пришло через IPC, к Buffer. */
+function toBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof Uint8Array) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
+  if (Array.isArray(data)) return Buffer.from(data as number[]);
+  throw new Error('Ожидались байты файла');
+}
+
+/** ArrayBuffer ровно по границам буфера: лишние байты пула не клонируются. */
+function toArrayBuffer(buffer: Buffer | Uint8Array): ArrayBuffer {
+  return buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength
+  ) as ArrayBuffer;
+}
+
+ipcMain.handle('fs:statFile', async (_event, filePath: string) => {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    return {
+      success: true,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      isDirectory: stat.isDirectory(),
+    };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+/**
+ * Бинарное чтение файла для больших офисных документов и воркера разбора
+ * таблиц: base64 для файла в 100 МБ — это лишние +33 % и копия в JS-строку.
+ */
+ipcMain.handle('fs:readBinary', async (_event, filePath: string) => {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    if (stat.size > MAX_BINARY_BYTES) {
+      return {
+        success: false,
+        tooLarge: true,
+        size: stat.size,
+        error:
+          'Файл больше ' +
+          Math.round(MAX_BINARY_BYTES / (1024 * 1024)) +
+          ' МБ — откройте его в системном приложении.',
+      };
+    }
+    const buffer = await fs.promises.readFile(filePath);
+    return { success: true, bytes: toArrayBuffer(buffer), size: buffer.byteLength };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+/** Кусок файла: CSV разбирается потоково, без чтения всего файла в память рендерера. */
+ipcMain.handle(
+  'fs:readBinarySlice',
+  async (_event, filePath: string, offset = 0, length = 0) => {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      const start = Math.max(0, Math.min(Number(offset) || 0, stat.size));
+      const size = Math.max(0, Math.min(Number(length) || 0, stat.size - start));
+      const handle = await fs.promises.open(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(size);
+        const { bytesRead } = await handle.read(buffer, 0, size, start);
+        const slice = buffer.subarray(0, bytesRead);
+        return {
+          success: true,
+          bytes: toArrayBuffer(slice),
+          size: bytesRead,
+          offset: start,
+          total: stat.size,
+          eof: start + bytesRead >= stat.size,
+        };
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  }
+);
+
+/** Запись байтов с той же атомарностью, что и текстовая запись. */
+ipcMain.handle('fs:writeBinary', async (_event, filePath: string, data: unknown) => {
+  try {
+    const buffer = toBuffer(data);
+    await writeFileAtomic(filePath, buffer, true);
+    return { success: true, size: buffer.byteLength };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+/**
+ * Определение кодировки по первым 64 КБ: BOM, UTF-16 без BOM,
+ * валидность UTF-8, иначе windows-1251 (русская ANSI-ветка этого приложения).
+ */
+ipcMain.handle('fs:guessEncoding', async (_event, filePath: string) => {
+  try {
+    const handle = await fs.promises.open(filePath, 'r');
+    let sample: Buffer;
+    try {
+      const buffer = Buffer.alloc(65536);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      sample = buffer.subarray(0, bytesRead);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+
+    if (sample.length >= 3 && sample[0] === 0xef && sample[1] === 0xbb && sample[2] === 0xbf) {
+      return { success: true, encoding: 'utf-8', hasBom: true };
+    }
+    if (sample.length >= 2 && sample[0] === 0xff && sample[1] === 0xfe) {
+      return { success: true, encoding: 'utf-16le', hasBom: true };
+    }
+    if (sample.length >= 2 && sample[0] === 0xfe && sample[1] === 0xff) {
+      return { success: true, encoding: 'utf-16be', hasBom: true };
+    }
+
+    // UTF-16 без BOM: половина байтов нулевые.
+    if (sample.length >= 4) {
+      let evenZeros = 0;
+      let oddZeros = 0;
+      for (let i = 0; i < Math.min(sample.length, 4096); i++) {
+        if (sample[i] !== 0) continue;
+        if (i % 2 === 0) evenZeros++;
+        else oddZeros++;
+      }
+      const checked = Math.floor(Math.min(sample.length, 4096) / 2);
+      if (checked > 0 && oddZeros / checked > 0.35) {
+        return { success: true, encoding: 'utf-16le', hasBom: false };
+      }
+      if (checked > 0 && evenZeros / checked > 0.35) {
+        return { success: true, encoding: 'utf-16be', hasBom: false };
+      }
+    }
+
+    let validUtf8 = true;
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(sample);
+    } catch {
+      validUtf8 = false;
+    }
+    if (validUtf8) return { success: true, encoding: 'utf-8', hasBom: false };
+
+    // Старшие байты в русских текстах — кириллица cp1251, иначе западная ANSI.
+    let highBytes = 0;
+    for (const byte of sample) if (byte >= 0xc0) highBytes++;
+    const encoding = highBytes / Math.max(1, sample.length) > 0.02 ? 'windows-1251' : 'windows-1252';
+    return { success: true, encoding, hasBom: false };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+/** PNG по слайдам: каждая страница htmlPages рендерится в окно размера слайда. */
+ipcMain.handle(
+  'ppt:exportImages',
+  async (_event, htmlPages: string[], outDir: string, width = 1280, height = 720) => {
+    if (!Array.isArray(htmlPages) || htmlPages.length === 0) {
+      return { success: false, error: 'Нет слайдов для экспорта' };
+    }
+    const dir =
+      outDir ||
+      path.join(app.getPath('downloads'), `WorkSpace-slides-${new Date().toISOString().slice(0, 10)}`);
+    let win: BrowserWindow | null = null;
+    const files: string[] = [];
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      win = new BrowserWindow({
+        show: false,
+        width: Math.max(320, Math.min(3840, Math.round(width))),
+        height: Math.max(240, Math.min(2160, Math.round(height))),
+      });
+      for (let index = 0; index < htmlPages.length; index += 1) {
+        await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(htmlPages[index])}`);
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        const image = await win.webContents.capturePage();
+        const file = path.join(dir, `slide-${String(index + 1).padStart(2, '0')}.png`);
+        fs.writeFileSync(file, image.toPNG());
+        files.push(file);
+      }
+      return { success: true, files, dir };
+    } catch (err) {
+      return { success: false, files, error: (err as Error).message };
+    } finally {
+      if (win) win.destroy();
+    }
+  }
+);
+
 ipcMain.handle(
   'pdf:export',
-  async (_event, html: string, suggestedName = 'document.pdf', targetPath?: string) => {
+  async (
+    _event,
+    html: string,
+    suggestedName = 'document.pdf',
+    targetPath?: string,
+    pageSize?: { width: number; height: number }
+  ) => {
     let win: BrowserWindow | null = null;
     try {
       win = new BrowserWindow({ show: false });
       await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+      // Размер страницы в микронах: презентация печатается своим форматом,
+      // иначе слайд 16:9 попадёт на A4 с полями.
+      const hasCustomSize = Boolean(pageSize && pageSize.width > 0 && pageSize.height > 0);
       const pdf = await win.webContents.printToPDF({
         printBackground: true,
-        pageSize: 'A4',
+        ...(hasCustomSize && pageSize
+          ? {
+              pageSize: { width: Math.round(pageSize.width), height: Math.round(pageSize.height) },
+              margins: { top: 0, bottom: 0, left: 0, right: 0 },
+              preferCSSPageSize: true,
+            }
+          : { pageSize: 'A4' as const }),
       });
       let output = targetPath || '';
       if (!output) {
@@ -1083,6 +1347,135 @@ ipcMain.handle('fs:renamePath', async (_event, oldPath: string, newPath: string)
       return { success: false, error: 'Объект с таким именем уже существует' };
     }
     await fs.promises.rename(oldPath, newPath);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+/* ============================================================
+   Автосохранение: снимки несохранённых документов
+   ============================================================ */
+
+const autosaveDir = () => path.join(app.getPath('userData'), 'autosave');
+
+function autosaveFile(name: string): string {
+  const safe = String(name || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 64);
+  if (!safe) throw new Error('Некорректное имя снимка');
+  return path.join(autosaveDir(), `${safe}.json`);
+}
+
+/* ============================================================
+   Диагностика: кольцевой буфер ошибок и отчёт о системе
+   ============================================================ */
+
+const diagLog: { at: number; level: string; message: string }[] = [];
+const DIAG_LIMIT = 200;
+
+function pushDiag(level: string, message: string): void {
+  diagLog.push({ at: Date.now(), level, message: String(message).slice(0, 2000) });
+  if (diagLog.length > DIAG_LIMIT) diagLog.shift();
+}
+
+ipcMain.handle('diagnostics:log', (_event, level: string, message: string) => {
+  pushDiag(level || 'error', message);
+  return { success: true };
+});
+
+ipcMain.handle('diagnostics:report', async () => {
+  try {
+    const autosaveDirPath = autosaveDir();
+    let snapshots = 0;
+    try {
+      snapshots = (await fs.promises.readdir(autosaveDirPath)).filter((name) => name.endsWith('.json')).length;
+    } catch {
+      snapshots = 0;
+    }
+    return {
+      success: true,
+      report: {
+        app: {
+          version: app.getVersion(),
+          name: app.getName(),
+          packaged: app.isPackaged,
+          locale: app.getLocale(),
+        },
+        system: {
+          platform: process.platform,
+          arch: process.arch,
+          release: process.getSystemVersion?.() ?? '',
+          versions: {
+            electron: process.versions.electron,
+            chrome: process.versions.chrome,
+            node: process.versions.node,
+          },
+          paths: { userData: app.getPath('userData'), home: app.getPath('home'), appData: app.getPath('appData') },
+          memoryMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+        },
+        autosave: { dir: autosaveDirPath, snapshots },
+        logs: [...diagLog],
+      },
+    };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+ipcMain.handle('autosave:write', async (_event, name: string, payload: unknown) => {
+  try {
+    fs.mkdirSync(autosaveDir(), { recursive: true });
+    const target = autosaveFile(name);
+    const temp = `${target}.tmp`;
+    await fs.promises.writeFile(temp, JSON.stringify(payload), 'utf8');
+    await fs.promises.rename(temp, target);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+ipcMain.handle('autosave:list', async () => {
+  try {
+    fs.mkdirSync(autosaveDir(), { recursive: true });
+    const files = await fs.promises.readdir(autosaveDir());
+    const items: unknown[] = [];
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const raw = await fs.promises.readFile(path.join(autosaveDir(), file), 'utf8');
+        items.push(JSON.parse(raw));
+      } catch {
+        // битый снимок пропускаем
+      }
+    }
+    return { success: true, items };
+  } catch (err) {
+    return { success: false, items: [], error: (err as Error).message };
+  }
+});
+
+ipcMain.handle('autosave:read', async (_event, name: string) => {
+  try {
+    const raw = await fs.promises.readFile(autosaveFile(name), 'utf8');
+    return { success: true, snapshot: JSON.parse(raw) };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+
+ipcMain.handle('autosave:remove', async (_event, name: string) => {
+  try {
+    await fs.promises.rm(autosaveFile(name), { force: true });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
+ipcMain.handle('fs:copyPath', async (_event, source: string, target: string) => {
+  try {
+    if (fs.existsSync(target)) {
+      return { success: false, error: 'Объект с таким именем уже существует' };
+    }
+    await fs.promises.cp(source, target, { recursive: true, errorOnExist: true, force: false });
     return { success: true };
   } catch (err) {
     return { success: false, error: (err as Error).message };
@@ -1311,4 +1704,4 @@ ipcMain.handle('clipboard:write', async (_event, text: string) => {
 registerShare();
 registerGDrive();
 registerYoutube();
-registerHostedImageUpload();
+registerImageHosts();
