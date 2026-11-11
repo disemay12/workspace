@@ -289,14 +289,13 @@ code {
   align-items: center;
   gap: var(--space-lg);
   min-height: 56px;
-  padding-inline: var(--space-sm) var(--space-2xs);
+  padding-inline: var(--space-sm);
 }
 
 .brand {
   display: inline-flex;
   align-items: center;
   gap: var(--space-sm);
-  padding-inline-start: var(--space-xs);
   font-weight: 500;
   font-size: var(--text-md);
   text-decoration: none;

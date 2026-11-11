@@ -111,9 +111,9 @@
             <h3>Таблицы</h3>
             <p>Формулы, несколько листов, объединение ячеек и экспорт в CSV. Заливка, шрифт и границы остаются нативными стилями Excel.</p>
           </li>
-          <li class="step" data-shot="slides">
-            <h3>Презентации</h3>
-            <p>Слайды, заметки докладчика и изображения. Новый файл собирается из пустого шаблона, сохранение идёт патчем XML.</p>
+          <li class="step" data-shot="markdown">
+            <h3>Markdown</h3>
+            <p>Код и готовый документ рядом: предпросмотр обновляется на ходу, слэш-команды вставляют таблицы и списки, история правок хранится рядом с файлом.</p>
           </li>
         </ol>
       </div>
@@ -122,7 +122,7 @@
         <figure class="shot shot--pin" data-gallery>
           <img class="pin__img is-active" data-shot-img="word" src="assets/screens/word.webp" alt="Редактор Word в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
           <img class="pin__img" data-shot-img="excel" src="assets/screens/excel.webp" alt="Редактор таблиц в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
-          <img class="pin__img" data-shot-img="slides" src="assets/screens/slides.webp" alt="Редактор презентаций в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
+          <img class="pin__img" data-shot-img="markdown" src="assets/screens/markdown.webp" alt="Markdown в разделённом режиме: исходник слева, готовый документ справа" width="1600" height="1000" loading="lazy" decoding="async">
           <button class="shot__open" type="button" aria-label="Открыть скриншот редактора крупно"></button>
         </figure>
       </div>
@@ -154,7 +154,7 @@
           <tr class="reveal" style="--i:2">
             <th scope="row">Презентации</th>
             <td class="measured">.pptx .ppt</td>
-            <td>Слайды и заметки; <code>.ppt</code> не редактируется</td>
+            <td>Текст слайдов и заметки; дизайн не редактируется</td>
           </tr>
           <tr class="reveal" style="--i:3">
             <th scope="row">Заметки</th>
@@ -208,7 +208,7 @@
         </article>
         <article class="automation__item reveal" style="--i:2">
           <h3>PowerPoint</h3>
-          <p>Слайды, порядок, заметки докладчика и макеты: правка идёт патчем XML без пересборки файла.</p>
+          <p>Текст фигур, порядок слайдов и заметки докладчика. Дизайн и графика не правятся: редактор меняет содержание, а не вёрстку.</p>
         </article>
         <article class="automation__item reveal" style="--i:3">
           <h3>Файлы и форматы</h3>
