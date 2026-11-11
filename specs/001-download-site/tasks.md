@@ -37,7 +37,7 @@
 - [x] T019 `sloplint.mjs --render` на 1280×800, 1440×900, 1920×1080 и 375 px: 0 FAIL, 0 REFLEX, 0 WARN
 - [x] T020 Локальный просмотр всех брейкпоинтов, проверка скриншотов на личные данные
 - [x] T021 Проверка работы из подпути GitHub Pages (относительные пути) и отсутствия 404 по ресурсам
-- [ ] T022 После публикации: включить Pages (Settings → Pages → GitHub Actions) и открыть `https://disemay12.github.io/workspace/`
+- [x] T022 Pages включён (Settings → Pages → GitHub Actions), публикация прошла, страница открывается по `https://disemay12.github.io/workspace/`
 
 ## Обновление после релиза
 
