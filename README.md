@@ -11,6 +11,20 @@
 Готовая portable-сборка для Windows x64 — в разделе
 [Releases](https://github.com/disemay12/workspace/releases/latest).
 
+## Сайт проекта
+
+Страница скачивания с описанием и скриншотами лежит в `docs/` и публикуется
+GitHub Pages: `https://disemay12.github.io/workspace/`.
+
+- Включение: **Settings → Pages → Source: GitHub Actions** (workflow
+  `.github/workflows/pages.yml`) либо **Deploy from a branch → `master` → `/docs`**.
+- Страница статическая: только относительные пути, без сборки и внешних CDN.
+- Скриншоты и демонстрационные документы создаются скриптами `scripts/site/`:
+  `make-demo-data.py` → запуск приложения с CDP → `shoot-app.py`. Личных файлов
+  на кадрах нет: съёмка идёт на чистом профиле поверх синтетической папки.
+- После нового релиза обновите версию, размер архива и три ссылки на скачивание
+  в `docs/index.html` (порядок — в `specs/001-download-site/tasks.md`).
+
 ---
 
 ## Возможности

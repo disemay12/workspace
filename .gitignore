@@ -76,3 +76,6 @@ gdrive.json
 
 graphify-out/
 
+# ---------- Артефакты сайта ----------
+.hallmark/
+docs/.hallmark/

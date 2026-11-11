@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkSpace, офисные документы и AI-ассистент для Windows</title>
+<meta name="description" content="WorkSpace открывает Word, Excel, PowerPoint, Markdown и код в одном окне для Windows и не требует Microsoft Office.">
+<meta name="theme-color" content="#0b0d12">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:title" content="WorkSpace, офис в одном окне без Microsoft Office">
+<meta property="og:description" content="Документы, таблицы, презентации, код и AI-ассистент по вашему ключу. Portable-сборка для Windows x64.">
+<meta property="og:image" content="https://disemay12.github.io/workspace/assets/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/icon.png" type="image/png">
+<link rel="preload" as="image" href="assets/screens/word.webp" fetchpriority="high">
+<link rel="stylesheet" href="styles.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "WorkSpace",
+  "applicationCategory": "BusinessApplication",
+  "operatingSystem": "Windows 10, Windows 11",
+  "softwareVersion": "1.0.15",
+  "fileSize": "252MB",
+  "downloadUrl": "https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip"
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Перейти к содержимому</a>
+
+<header class="nav">
+  <div class="container nav__row">
+    <a class="brand" href="./" aria-label="WorkSpace, к началу страницы">
+      <img src="assets/icon.png" alt="" width="26" height="26">
+      <span>WorkSpace</span>
+    </a>
+    <nav class="nav__links" aria-label="Разделы страницы">
+      <a href="#screens">Экраны</a>
+      <a href="#formats">Форматы</a>
+      <a href="#needs">Запуск</a>
+      <a href="#questions">Вопросы</a>
+    </nav>
+    <a class="btn btn--primary" href="https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip">Скачать</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="container hero__grid">
+      <div class="hero__text">
+        <h1 id="hero-title">Офис в одном окне</h1>
+        <p class="lead">Документы, таблицы, презентации, код и <span class="nowrap">AI-ассистент</span>. Microsoft Office не нужен.</p>
+        <div class="hero__actions">
+          <a class="btn btn--primary btn--lg" href="https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip">Скачать для Windows</a>
+          <a class="link" href="https://github.com/disemay12/workspace/releases/latest">Все релизы</a>
+        </div>
+      </div>
+
+      <figure class="shot shot--hero">
+        <img src="assets/screens/word.webp" alt="Открытый DOCX в WorkSpace: дерево файлов, структура документа, полотно с заголовками и таблица показателей" width="1600" height="1000" fetchpriority="high" decoding="async">
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="screens" aria-labelledby="screens-title">
+    <div class="container">
+      <div class="head">
+        <h2 id="screens-title">Четыре редактора над одним списком файлов</h2>
+        <p class="head__line">Вкладки, несохранённые правки и переключение без потери курсора.</p>
+      </div>
+
+      <div class="bento">
+        <figure class="tile tile--wide">
+          <img src="assets/screens/excel.webp" alt="Таблица бюджета в WorkSpace: формулы отклонения, несколько листов, панель формул" width="1600" height="1000" loading="lazy" decoding="async">
+          <figcaption>
+            <h3>Таблицы</h3>
+            <p>Формулы, несколько листов, объединение ячеек и экспорт в CSV. Стили Excel сохраняются как нативные.</p>
+          </figcaption>
+        </figure>
+
+        <figure class="tile">
+          <img src="assets/screens/markdown.webp" alt="Markdown-файл в разделённом режиме: исходник слева, готовый документ справа" width="1600" height="1000" loading="lazy" decoding="async">
+          <figcaption>
+            <h3>Markdown</h3>
+            <p>Код и результат рядом, слэш-команды и история правок.</p>
+          </figcaption>
+        </figure>
+
+        <figure class="tile">
+          <img src="assets/screens/code.webp" alt="Файл Python в редакторе кода: подсветка синтаксиса, номера строк, миникарта" width="1600" height="1000" loading="lazy" decoding="async">
+          <figcaption>
+            <h3>Код и логи</h3>
+            <p>Monaco со 100+ языками, поиск по RegEx и разбор логов по <code>ERROR</code>.</p>
+          </figcaption>
+        </figure>
+
+        <figure class="tile tile--wide">
+          <img src="assets/screens/slides.webp" alt="Презентация в WorkSpace: список слайдов, полотно слайда и заметки докладчика" width="1600" height="1000" loading="lazy" decoding="async">
+          <figcaption>
+            <h3>Презентации</h3>
+            <p>Слайды, заметки докладчика и изображения; новый файл собирается из пустого шаблона.</p>
+          </figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--split" id="ai" aria-labelledby="ai-title">
+    <div class="container split">
+      <div class="split__text">
+        <h2 id="ai-title">Свой ключ и свой провайдер</h2>
+        <p>Ассистент работает по вашему API-ключу и только с той моделью, которую вы выбрали.</p>
+        <dl class="facts">
+          <div><dt>Провайдеры</dt><dd>OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, OpenCode, Ollama</dd></div>
+          <div><dt>Где живёт ключ</dt><dd>На этом компьютере, в зашифрованном виде</dd></div>
+          <div><dt>Что умеет</dt><dd>Правка текста, формулы для таблиц, разбор логов, правка документов</dd></div>
+        </dl>
+      </div>
+      <figure class="shot shot--split">
+        <img src="assets/screens/settings.webp" alt="Настройки WorkSpace: выбор провайдера, поле ключа и базового URL" width="1600" height="1000" loading="lazy" decoding="async">
+        <figcaption>Настройки провайдера: ключ хранится рядом с приложением и уходит только выбранному сервису.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="formats" aria-labelledby="formats-title">
+    <div class="container">
+      <div class="head head--tight">
+        <h2 id="formats-title">Что открывается без конвертации</h2>
+      </div>
+      <table class="table">
+        <caption class="visually-hidden">Поддерживаемые форматы файлов и редакторы</caption>
+        <thead>
+          <tr><th scope="col">Файлы</th><th scope="col">Форматы</th><th scope="col">Что можно делать</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Документы Word</th><td class="measured">.docx .doc</td><td>Заголовки, таблицы, картинки, сноски, колонтитулы</td></tr>
+          <tr><th scope="row">Таблицы</th><td class="measured">.xlsx .xls .csv .tsv</td><td>Формулы, листы, форматирование, CSV</td></tr>
+          <tr><th scope="row">Презентации</th><td class="measured">.pptx .ppt</td><td>Слайды, заметки докладчика, изображения; <code>.ppt</code> не редактируется</td></tr>
+          <tr><th scope="row">Заметки</th><td class="measured">.md .note .markdown</td><td>Код и предпросмотр, слэш-команды</td></tr>
+          <tr><th scope="row">Код и конфиги</th><td class="measured">.json .yaml .py .ts .sql и ещё 100</td><td>Подсветка, поиск по RegEx, миникарта</td></tr>
+          <tr><th scope="row">Текст и логи</th><td class="measured">.txt .log .ini .bat</td><td>Кодировки UTF-8, UTF-16, Windows-1251, KOI8-R</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section" id="update" aria-labelledby="update-title">
+    <div class="container">
+      <div class="head head--rows">
+        <h2 id="update-title">Обновление ставится само</h2>
+        <p class="head__line">Что изменилось в версии 1.0.15.</p>
+      </div>
+      <ol class="rows">
+        <li class="row">
+          <h3>Загрузчик дожидается выхода</h3>
+          <p>Обновление применяет сам <code>WorkSpace.exe</code>: приложение закрывается, файлы копируются, окно поднимается заново.</p>
+        </li>
+        <li class="row">
+          <h3>Формулы Excel 2019 и массивы</h3>
+          <p>Движок таблиц считает массивы в <code>SUMPRODUCT</code> и функции поздних версий Excel.</p>
+        </li>
+        <li class="row">
+          <h3>Настройки остаются на месте</h3>
+          <p>Ключи и параметры лежат в <code>%APPDATA%\WorkSpace</code> и перед установкой резервируются.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="section" id="needs" aria-labelledby="needs-title">
+    <div class="container">
+      <div class="head head--rows">
+        <h2 id="needs-title">Что нужно для запуска</h2>
+        <p class="head__line">Ни установки, ни Office, ни постоянной сети.</p>
+      </div>
+      <ul class="rows rows--plain">
+        <li class="row">
+          <h3>Windows 10 или 11, x64</h3>
+          <p>Архив распаковывается в папку и запускается одним файлом.</p>
+        </li>
+        <li class="row">
+          <h3>Microsoft Office не нужен</h3>
+          <p>Редакторы встроены, файлы <code>.docx</code>, <code>.xlsx</code> и <code>.pptx</code> правятся напрямую.</p>
+        </li>
+        <li class="row">
+          <h3>Сеть нужна для обновлений и AI-запросов</h3>
+          <p>Новая версия загружается с GitHub Releases, запросы ассистента уходят выбранному провайдеру.</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="questions" aria-labelledby="questions-title">
+    <div class="container">
+      <div class="head head--rows">
+        <h2 id="questions-title">Частые вопросы</h2>
+      </div>
+      <dl class="faq">
+        <div class="faq__item">
+          <dt>Куда уходят мои файлы?</dt>
+          <dd>Никуда: документы читаются с диска. В сеть уходит только запрос к выбранному провайдеру, и только если вы его отправили.</dd>
+        </div>
+        <div class="faq__item">
+          <dt>Что с <code>.doc</code> и <code>.ppt</code>?</dt>
+          <dd><code>.doc</code> читается как текст, <code>.ppt</code> не разбирается: нужен <code>.pptx</code>. Сохранение создаёт <code>.docx</code> рядом с исходным файлом.</dd>
+        </div>
+        <div class="faq__item">
+          <dt>Можно перенести на другой компьютер?</dt>
+          <dd>Да, папка portable: на новом месте ключ вводится заново или импортируется из файла.</dd>
+        </div>
+        <div class="faq__item">
+          <dt>Что с приватностью ключа?</dt>
+          <dd>Ключ шифруется средствами Windows и привязан к профилю; в открытом виде он не покидает машину.</dd>
+        </div>
+      </dl>
+    </div>
+  </section>
+
+  <section class="section section--close" aria-labelledby="close-title">
+    <div class="container split split--close">
+      <div class="split__text">
+        <h2 id="close-title">Скачайте и откройте первый файл</h2>
+        <p>Ассистент разберёт лог, поправит документ и покажет diff до сохранения.</p>
+        <a class="btn btn--primary btn--lg" href="https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip">Скачать для Windows</a>
+        <dl class="meta">
+          <div class="meta__item">
+            <dt>Версия</dt>
+            <dd class="measured">1.0.15</dd>
+          </div>
+          <div class="meta__item">
+            <dt>Архив</dt>
+            <dd class="measured">252 МБ</dd>
+          </div>
+          <div class="meta__item">
+            <dt>Сборка</dt>
+            <dd class="measured">win-x64</dd>
+          </div>
+        </dl>
+      </div>
+      <figure class="shot shot--close">
+        <img src="assets/screens/log.webp" alt="Лог-файл в WorkSpace: уровни INFO, WARN и ERROR, кнопка «Анализ лога»" width="1600" height="1000" loading="lazy" decoding="async">
+        <figcaption>Кнопка «Анализ лога» находит <code>ERROR</code> и предлагает шаги исправления.</figcaption>
+      </figure>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="container footer__mast">
+    <a class="brand brand--footer" href="./">WorkSpace</a>
+    <nav class="footer__links" aria-label="Ссылки">
+      <a href="https://github.com/disemay12/workspace">Репозиторий</a>
+      <a href="https://github.com/disemay12/workspace/releases">Релизы</a>
+      <a href="https://github.com/disemay12/workspace#readme">Документация</a>
+    </nav>
+  </div>
+  <div class="container footer__line">
+    <p>Portable-сборка для Windows x64. Ключи и настройки остаются на вашем компьютере.</p>
+    <p>Скриншоты сняты на демонстрационных документах: личных файлов на кадрах нет.</p>
+  </div>
+</footer>
+</body>
+</html>
