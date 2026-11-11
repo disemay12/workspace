@@ -31,6 +31,7 @@
 </script>
 </head>
 <body>
+<div class="bg" aria-hidden="true"><span class="bg__cool"></span><span class="bg__warm"></span></div>
 <a class="skip" href="#main">Перейти к содержимому</a>
 
 <header class="nav" id="nav">
@@ -63,8 +64,9 @@
         </div>
       </div>
 
-      <figure class="hero__shot rise" style="--i:3">
-        <img src="assets/screens/word.webp" alt="Открытый DOCX в WorkSpace: дерево файлов, структура документа, полотно с заголовками и таблица показателей" width="1600" height="1000" fetchpriority="high" decoding="async">
+      <figure class="hero__shot rise" style="--i:3" data-gallery>
+        <img class="hero__parallax" src="assets/screens/word.webp" alt="Открытый DOCX в WorkSpace: дерево файлов, структура документа, полотно с заголовками и таблица показателей" width="1600" height="1000" fetchpriority="high" decoding="async">
+        <button class="shot__open" type="button" aria-label="Открыть скриншот крупно"></button>
       </figure>
     </div>
   </section>
@@ -117,10 +119,11 @@
       </div>
 
       <div class="steps__screen">
-        <figure class="shot shot--pin">
+        <figure class="shot shot--pin" data-gallery>
           <img class="pin__img is-active" data-shot-img="word" src="assets/screens/word.webp" alt="Редактор Word в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
           <img class="pin__img" data-shot-img="excel" src="assets/screens/excel.webp" alt="Редактор таблиц в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
           <img class="pin__img" data-shot-img="slides" src="assets/screens/slides.webp" alt="Редактор презентаций в WorkSpace" width="1600" height="1000" loading="lazy" decoding="async">
+          <button class="shot__open" type="button" aria-label="Открыть скриншот редактора крупно"></button>
         </figure>
       </div>
     </div>
@@ -186,8 +189,9 @@
           <div><dt>Что умеет</dt><dd>Правка текста, формулы, разбор логов, правка документов</dd></div>
         </dl>
       </div>
-      <figure class="shot shot--split reveal" style="--i:1">
+      <figure class="shot shot--split reveal" style="--i:1" data-gallery>
         <img src="assets/screens/settings.webp" alt="Настройки WorkSpace: выбор провайдера, поле ключа и базового URL" width="1600" height="1000" loading="lazy" decoding="async">
+        <button class="shot__open" type="button" aria-label="Открыть скриншот настроек крупно"></button>
         <figcaption>Настройки провайдера: ключ уходит только выбранному сервису.</figcaption>
       </figure>
     </div>
@@ -262,8 +266,9 @@
         <a class="btn btn--primary btn--lg" href="https://github.com/disemay12/workspace/releases/download/v1.0.15/WorkSpace-1.0.15-win-x64.zip">Скачать для Windows</a>
         <p class="measured close__file">WorkSpace-1.0.15-win-x64.zip, 252 МБ</p>
       </div>
-      <figure class="shot shot--close reveal" style="--i:1">
+      <figure class="shot shot--close reveal" style="--i:1" data-gallery>
         <img src="assets/screens/log.webp" alt="Лог-файл в WorkSpace: уровни INFO, WARN и ERROR, кнопка «Анализ лога»" width="1600" height="1000" loading="lazy" decoding="async">
+        <button class="shot__open" type="button" aria-label="Открыть скриншот лога крупно"></button>
         <figcaption>Кнопка «Анализ лога» находит <code>ERROR</code> и предлагает шаги исправления.</figcaption>
       </figure>
     </div>
@@ -283,6 +288,26 @@
     <p>Portable-сборка для Windows x64. Скриншоты сняты на демонстрационных документах: личных файлов на кадрах нет.</p>
   </div>
 </footer>
+
+<dialog class="viewer" id="viewer" aria-label="Скриншот крупным планом">
+  <div class="viewer__frame">
+    <img class="viewer__img" src="assets/screens/word.webp" alt="" width="1600" height="1000" decoding="async">
+  </div>
+  <div class="viewer__bar">
+    <p class="viewer__cap"></p>
+    <div class="viewer__nav">
+      <button class="viewer__btn" type="button" data-dir="-1" aria-label="Предыдущий скриншот">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <button class="viewer__btn" type="button" data-dir="1" aria-label="Следующий скриншот">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 6l6 6-6 6"/></svg>
+      </button>
+      <button class="viewer__btn viewer__btn--close" type="button" data-close aria-label="Закрыть просмотр">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+  </div>
+</dialog>
 
 <script src="site.js" defer></script>
 </body>

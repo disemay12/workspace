@@ -1,16 +1,15 @@
 /**
- * Движение страницы: класс .js открывает появление блоков, наблюдатели
- * включают их, шапка реагирует на прокрутку, липкий кадр меняется по шагам,
- * измеренные величины один раз досчитываются до настоящего значения.
- * Без JS весь контент виден сразу, в липкой секции остаётся первый кадр.
+ * Страница: появление блоков, шапка по прокрутке, липкий кадр по шагам,
+ * отсчёт измеренных величин, фон за курсором и просмотр скриншотов.
+ * Без JS весь контент виден, первый кадр секции остаётся на месте,
+ * а скриншоты открываются обычной ссылкой на файл.
  */
 (() => {
   const root = document.documentElement;
   const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const all = (selector) => [...document.querySelectorAll(selector)];
 
   if (!calm) root.classList.add('js');
-
-  const all = (selector) => [...document.querySelectorAll(selector)];
 
   // появление блоков
   if (calm || !('IntersectionObserver' in window)) {
@@ -29,7 +28,7 @@
     for (const el of all('.reveal')) reveal.observe(el);
   }
 
-  // шапка: уплотняется после прокрутки
+  // шапка
   const nav = document.getElementById('nav');
   if (nav) {
     const sync = () => nav.classList.toggle('is-scrolled', window.scrollY > 6);
@@ -37,7 +36,7 @@
     window.addEventListener('scroll', sync, { passive: true });
   }
 
-  // текущий раздел подсвечивается в шапке
+  // текущий раздел в шапке
   const links = all('.nav__links a[href^="#"]');
   const sections = links
     .map((link) => document.getElementById(link.getAttribute('href').slice(1)))
@@ -61,7 +60,7 @@
     sections.forEach((section) => spy.observe(section));
   }
 
-  // липкий кадр в секции редакторов меняется по шагам
+  // липкий кадр по шагам
   const steps = all('.step[data-shot]');
   const pins = all('.pin__img[data-shot-img]');
   const activate = (name) => {
@@ -113,5 +112,152 @@
       { threshold: 0.6 }
     );
     counters.forEach((el) => watcher.observe(el));
+  }
+
+  // фон, который ходит за курсором
+  const bg = document.querySelector('.bg');
+  const parallax = document.querySelector('.hero__parallax');
+  const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+  if (bg && finePointer && !calm) {
+    let targetX = window.innerWidth / 2;
+    let targetY = window.innerHeight * 0.32;
+    let warmX = targetX;
+    let warmY = targetY;
+    let coolX = targetX;
+    let coolY = targetY;
+    let shiftX = 0;
+    let shiftY = 0;
+
+    window.addEventListener(
+      'pointermove',
+      (event) => {
+        if (event.pointerType !== 'mouse') return;
+        targetX = event.clientX;
+        targetY = event.clientY;
+        bg.classList.add('is-live');
+      },
+      { passive: true }
+    );
+
+    const frame = () => {
+      warmX += (targetX - warmX) * 0.24;
+      warmY += (targetY - warmY) * 0.24;
+      coolX += (targetX - coolX) * 0.07;
+      coolY += (targetY - coolY) * 0.07;
+      shiftX += ((targetX / window.innerWidth - 0.5) * 18 - shiftX) * 0.1;
+      shiftY += ((targetY / window.innerHeight - 0.5) * 14 - shiftY) * 0.1;
+
+      bg.style.setProperty('--mx', `${warmX.toFixed(1)}px`);
+      bg.style.setProperty('--my', `${warmY.toFixed(1)}px`);
+      bg.style.setProperty('--lx', `${coolX.toFixed(1)}px`);
+      bg.style.setProperty('--ly', `${coolY.toFixed(1)}px`);
+
+      if (parallax) {
+        parallax.style.setProperty('--hx', `${shiftX.toFixed(2)}px`);
+        parallax.style.setProperty('--hy', `${shiftY.toFixed(2)}px`);
+      }
+
+      requestAnimationFrame(frame);
+    };
+
+    requestAnimationFrame(frame);
+  }
+
+  // просмотр скриншотов
+  const viewer = document.getElementById('viewer');
+  const gallery = all('[data-gallery]');
+
+  if (viewer && gallery.length && typeof viewer.showModal === 'function') {
+    const vImage = viewer.querySelector('.viewer__img');
+    const vCaption = viewer.querySelector('.viewer__cap');
+    const shotOf = (figure) => figure.querySelector('.pin__img.is-active') || figure.querySelector('img');
+    const captionOf = (figure) => {
+      const caption = figure.querySelector('figcaption');
+      return (caption ? caption.textContent : shotOf(figure).alt).trim();
+    };
+    let current = 0;
+
+    const source = (figure) => {
+      const image = shotOf(figure);
+      return image.currentSrc || image.src;
+    };
+
+    const paint = (index) => {
+      current = (index + gallery.length) % gallery.length;
+      const image = shotOf(gallery[current]);
+      vImage.src = source(gallery[current]);
+      vImage.alt = image.alt;
+      vCaption.textContent = captionOf(gallery[current]);
+    };
+
+    // один и тот же кадр может стоять дважды (первый экран и шаг секции)
+    const shift = (direction) => {
+      for (let step = 1; step <= gallery.length; step += 1) {
+        const index = (((current + direction * step) % gallery.length) + gallery.length) % gallery.length;
+        if (source(gallery[index]) === vImage.src) continue;
+        paint(index);
+        return;
+      }
+    };
+
+    const grow = (origin) => {
+      if (calm || !origin || !vImage.animate) return;
+      const from = origin.getBoundingClientRect();
+      const to = vImage.getBoundingClientRect();
+      if (!from.width || !to.width) return;
+      const scaleX = from.width / to.width;
+      const scaleY = from.height / to.height;
+      const dx = from.left + from.width / 2 - (to.left + to.width / 2);
+      const dy = from.top + from.height / 2 - (to.top + to.height / 2);
+      vImage.animate(
+        [
+          { transform: `translate(${dx}px, ${dy}px) scale(${scaleX}, ${scaleY})` },
+          { transform: 'none' },
+        ],
+        { duration: 460, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' }
+      );
+    };
+
+    const open = (index, origin) => {
+      paint(index);
+      viewer.showModal();
+      root.classList.add('is-locked');
+      grow(origin);
+      const next = viewer.querySelector('[data-dir="1"]');
+      if (next) next.focus({ preventScroll: true });
+    };
+
+    gallery.forEach((figure, index) => {
+      const trigger = figure.querySelector('.shot__open');
+      if (!trigger) return;
+      trigger.addEventListener('click', () => open(index, trigger));
+    });
+
+    viewer.addEventListener('click', (event) => {
+      if (event.target === viewer) viewer.close();
+    });
+
+    for (const button of all('.viewer__btn')) {
+      button.addEventListener('click', () => {
+        if (button.hasAttribute('data-close')) {
+          viewer.close();
+          return;
+        }
+        shift(Number(button.dataset.dir));
+      });
+    }
+
+    viewer.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowRight') {
+        shift(1);
+        event.preventDefault();
+      } else if (event.key === 'ArrowLeft') {
+        shift(-1);
+        event.preventDefault();
+      }
+    });
+
+    viewer.addEventListener('close', () => root.classList.remove('is-locked'));
   }
 })();

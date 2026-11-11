@@ -16,7 +16,55 @@
 /* токены страницы: то, что появилось поверх темы */
 :root {
   --color-scrim: oklch(9% 0.008 250 / 0.5);
-  --color-lift: oklch(8% 0.01 250 / 0.9);
+  --pool-warm: oklch(82% 0.15 80 / 0.10);
+  --pool-cool: oklch(77% 0.12 245 / 0.07);
+  --pool-size: 980px;
+}
+
+/* фон, который ходит за курсором */
+.bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 700ms var(--ease-out);
+  --mx: 50vw;
+  --my: 30vh;
+  --lx: 50vw;
+  --ly: 30vh;
+}
+
+.bg.is-live {
+  opacity: 1;
+}
+
+.bg__warm,
+.bg__cool {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--pool-size);
+  height: var(--pool-size);
+  border-radius: 50%;
+}
+
+.bg__warm {
+  background: radial-gradient(circle, var(--pool-warm), transparent 70%);
+  transform: translate3d(calc(var(--mx) - var(--pool-size) / 2), calc(var(--my) - var(--pool-size) / 2), 0);
+}
+
+.bg__cool {
+  width: calc(var(--pool-size) * 1.7);
+  height: calc(var(--pool-size) * 1.7);
+  background: radial-gradient(circle, var(--pool-cool), transparent 68%);
+  transform: translate3d(calc(var(--lx) - var(--pool-size) * 0.85), calc(var(--ly) - var(--pool-size) * 0.85), 0);
+}
+
+main,
+footer {
+  position: relative;
+  z-index: 1;
 }
 
 /* ---------- общее ---------- */
@@ -26,11 +74,15 @@ body {
   background: var(--color-paper);
 }
 
+html {
+  scrollbar-gutter: stable;
+}
+
 body::before {
   content: "";
   position: fixed;
   inset: 0;
-  z-index: 2;
+  z-index: 3;
   pointer-events: none;
   opacity: 0.05;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
@@ -40,7 +92,7 @@ body::after {
   content: "";
   position: fixed;
   inset: 0;
-  z-index: 1;
+  z-index: 0;
   pointer-events: none;
   background: radial-gradient(120% 70% at 50% -10%, transparent 55%, var(--color-scrim) 100%);
 }
@@ -361,6 +413,10 @@ code {
   object-position: top center;
 }
 
+.hero__parallax {
+  transform: translate3d(var(--hx, 0), var(--hy, 0), 0);
+}
+
 /* ---------- полоса со statement ---------- */
 
 .band--statement {
@@ -439,6 +495,166 @@ code {
   font-size: var(--text-sm);
   color: var(--color-muted);
   max-width: 62ch;
+}
+
+.shot__open {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: zoom-in;
+  transition: background-color var(--dur-short) var(--ease-out);
+}
+
+.shot__open:hover {
+  background: color-mix(in oklab, var(--color-ink) 4%, transparent);
+}
+
+.shot__open:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -2px;
+}
+
+html:not(.js) .shot__open {
+  display: none;
+}
+
+/* ---------- просмотр скриншота ---------- */
+
+.viewer {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: var(--space-lg) var(--space-xl);
+  border: 0;
+  background: transparent;
+  color: var(--color-ink);
+  overflow: hidden;
+}
+
+.viewer:not([open]) {
+  display: none;
+}
+
+.viewer[open] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-md);
+}
+
+.viewer::backdrop {
+  background: color-mix(in oklab, var(--color-paper-3) 88%, transparent);
+  backdrop-filter: blur(14px);
+  animation: fade-in 240ms var(--ease-out) both;
+}
+
+.viewer__frame {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  width: min(1400px, 100%);
+  max-height: 76svh;
+}
+
+.viewer__img {
+  max-width: 100%;
+  max-height: 76svh;
+  width: auto;
+  height: auto;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  border-radius: var(--radius-card);
+  background: var(--color-paper-2);
+}
+
+.viewer[open] .viewer__img {
+  animation: viewer-in 340ms var(--ease-out) both;
+}
+
+@keyframes viewer-in {
+  from {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.viewer__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-md) var(--space-lg);
+  width: min(1400px, 100%);
+}
+
+.viewer__cap {
+  flex: 1 1 18rem;
+  min-width: 0;
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+  max-width: 68ch;
+}
+
+.viewer__nav {
+  display: flex;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+}
+
+.viewer__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: var(--rule-hair) solid var(--color-rule);
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--color-paper-2) 80%, transparent);
+  color: var(--color-muted);
+  cursor: pointer;
+  transition: color var(--dur-short) var(--ease-out), background-color var(--dur-short) var(--ease-out),
+    border-color var(--dur-short) var(--ease-out);
+}
+
+.viewer__btn:hover {
+  color: var(--color-ink);
+  border-color: var(--color-rule-2);
+  background: var(--color-paper-2);
+}
+
+.viewer__btn:active {
+  transform: translateY(1px);
+}
+
+.viewer__btn:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.viewer__btn--close:hover {
+  color: var(--color-accent-ink);
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+html.is-locked {
+  overflow: hidden;
 }
 
 /* ---------- секции ---------- */
@@ -827,6 +1043,32 @@ code {
 /* ---------- узкие экраны ---------- */
 
 @media (max-width: 60rem) {
+  .bg {
+    display: none;
+  }
+
+  .viewer {
+    padding: var(--space-md);
+  }
+
+  .viewer[open] {
+    justify-content: flex-start;
+    padding-top: var(--space-2xl);
+  }
+
+  .viewer__img {
+    max-height: 62svh;
+  }
+
+  .viewer__bar {
+    justify-content: flex-end;
+  }
+
+  .viewer__cap {
+    flex-basis: 100%;
+    order: -1;
+  }
+
   body {
     padding-top: 84px;
   }
@@ -991,7 +1233,21 @@ code {
 
 /* ---------- без анимаций ---------- */
 
+@media (hover: none) {
+  .bg {
+    display: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .bg {
+    display: none;
+  }
+
+  .hero__parallax {
+    transform: none !important;
+  }
+
   .rise,
   .faq__item p {
     animation: none !important;
