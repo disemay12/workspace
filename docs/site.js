@@ -298,6 +298,69 @@
         value.trim().length >= 10 && value.trim().length <= 1200 ? '' : 'Опишите предложение: от 10 до 1200 символов.',
     };
 
+    // одноразовые почты: такие адреса не принимаем
+    const disposable = [
+      '10minutemail.com', '20minutemail.com', '33mail.com', 'anonbox.net', 'burnermail.io',
+      'discard.email', 'dispostable.com', 'emailondeck.com', 'fakeinbox.com', 'getnada.com',
+      'guerrillamail.com', 'guerrillamail.net', 'inboxkitten.com', 'mail.tm', 'mail7.io',
+      'mailcatch.com', 'maildrop.cc', 'mailinator.com', 'mailnesia.com', 'mintemail.com',
+      'mohmal.com', 'mytemp.email', 'sharklasers.com', 'spam4.me', 'spamgourmet.com',
+      'temp-mail.io', 'temp-mail.org', 'tempail.com', 'tempmail.com', 'tempmailo.com',
+      'tempr.email', 'throwawaymail.com', 'trashmail.com', 'yopmail.com', 'yopmail.fr',
+    ];
+
+    // домен должен уметь принимать почту: спрашиваем MX через DNS-over-HTTPS
+    const checkDomain = async (email) => {
+      const domain = email.split('@')[1].toLowerCase();
+      if (disposable.includes(domain)) return 'Одноразовая почта не подойдёт: укажите постоянный адрес.';
+
+      const ask = async (url) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4000);
+        try {
+          const response = await fetch(url, { headers: { Accept: 'application/dns-json' }, signal: controller.signal });
+          if (!response.ok) return null;
+          const data = await response.json();
+          return (data.Answer || []).some((record) => record.type === 15);
+        } catch {
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      const hasMail =
+        (await ask(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`)) ??
+        (await ask(`https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=MX`));
+
+      if (hasMail === false) return 'У этого домена нет почтового сервера: письмо не дойдёт. Проверьте адрес.';
+      return '';
+    };
+
+    const readSent = () => {
+      try {
+        return JSON.parse(localStorage.getItem('workspace-feedback-mails') || '{}') || {};
+      } catch {
+        return {};
+      }
+    };
+
+    const alreadySent = (email) => {
+      const map = readSent();
+      const key = email.trim().toLowerCase();
+      return Object.prototype.hasOwnProperty.call(map, key) && Date.now() - map[key] < 30 * 24 * 3600 * 1000;
+    };
+
+    const rememberSent = (email) => {
+      const map = readSent();
+      map[email.trim().toLowerCase()] = Date.now();
+      try {
+        localStorage.setItem('workspace-feedback-mails', JSON.stringify(map));
+      } catch {
+        // приватный режим: отметку сохранить не удалось
+      }
+    };
+
     if (idea && counter) {
       counter.textContent = String(idea.value.length);
       idea.addEventListener('input', () => {
@@ -331,6 +394,24 @@
         return;
       }
 
+      const emailValue = form.elements.email.value.trim();
+
+      if (alreadySent(emailValue)) {
+        setError('email', 'С этого адреса уже отправляли: одно обращение на почту.');
+        form.elements.email.focus();
+        setStatus('Одно обращение на адрес.', 'error');
+        return;
+      }
+
+      setStatus('Проверяем адрес…');
+      const domainProblem = await checkDomain(emailValue);
+      if (domainProblem) {
+        setError('email', domainProblem);
+        form.elements.email.focus();
+        setStatus('Проверьте адрес почты.', 'error');
+        return;
+      }
+
       let last = 0;
       try {
         last = Number(localStorage.getItem(storageKey) || 0);
@@ -344,6 +425,7 @@
 
       submit.disabled = true;
       setStatus('Отправляем…');
+      if (form.elements._replyto) form.elements._replyto.value = emailValue;
 
       try {
         const response = await fetch(endpoint, {
@@ -360,6 +442,9 @@
         } catch {
           // приватный режим: ограничение частоты не сохранится
         }
+        rememberSent(emailValue);
+
+        if (form.elements._replyto) form.elements._replyto.value = '';
 
         form.reset();
         if (counter) counter.textContent = '0';
