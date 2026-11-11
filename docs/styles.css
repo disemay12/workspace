@@ -289,7 +289,7 @@ code {
   align-items: center;
   gap: var(--space-lg);
   min-height: 56px;
-  padding-inline: var(--space-sm);
+  padding-inline: var(--space-sm) var(--space-lg);
 }
 
 .brand {
@@ -1033,6 +1033,151 @@ html.is-locked {
   animation: fade-in var(--dur-long) var(--ease-out) both;
 }
 
+/* ---------- форма обращения ---------- */
+
+.support {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  align-items: start;
+  gap: var(--space-2xl);
+}
+
+.support .faq {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.feedback__intro p {
+  margin-top: var(--space-sm);
+  color: var(--color-ink-2);
+  max-width: 36ch;
+}
+
+.feedback__intro h3 {
+  font-size: var(--text-title);
+  margin-bottom: var(--space-xs);
+}
+
+.feedback__note {
+  font-size: var(--text-sm);
+  color: var(--color-muted) !important;
+}
+
+.form {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-2xs);
+}
+
+.field label {
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+}
+
+.field input,
+.field textarea {
+  width: 100%;
+  padding: var(--space-sm) var(--space-md);
+  min-height: 48px;
+  border: var(--rule-hair) solid var(--color-muted);
+  border-radius: var(--radius-pill);
+  background: var(--color-paper-3);
+  color: var(--color-ink);
+  font: inherit;
+  font-size: var(--text-md);
+  transition: border-color var(--dur-short) var(--ease-out), background-color var(--dur-short) var(--ease-out);
+}
+
+.field textarea {
+  resize: vertical;
+  min-height: 132px;
+  line-height: 1.5;
+}
+
+.field input::placeholder,
+.field textarea::placeholder {
+  color: var(--color-muted);
+  opacity: 0.7;
+}
+
+.field input:hover,
+.field textarea:hover {
+  border-color: var(--color-rule-2);
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.field input[aria-invalid="true"],
+.field textarea[aria-invalid="true"] {
+  border-color: var(--color-bad);
+}
+
+.field__hint {
+  font-family: var(--font-outlier);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.field__error {
+  font-size: var(--text-sm);
+  color: var(--color-bad);
+  min-height: 1lh;
+}
+
+.field__error:empty {
+  min-height: 0;
+}
+
+.field--trap {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.form__foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-md) var(--space-lg);
+}
+
+.form__status {
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+  max-width: 46ch;
+}
+
+.form__status.is-error {
+  color: var(--color-bad);
+}
+
+.form__status.is-ok {
+  color: var(--color-ok);
+}
+
+.form__fallback {
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+}
+
+.form__fallback a {
+  color: var(--color-ink-2);
+}
+
 /* ---------- подвал ---------- */
 
 .footer {
@@ -1140,8 +1285,13 @@ html.is-locked {
   .split,
   .split--close,
   .figures,
-  .grid-facts {
+  .grid-facts,
+  .support {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .support {
+    gap: var(--space-xl);
   }
 
   .head {

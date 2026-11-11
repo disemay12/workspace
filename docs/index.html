@@ -256,25 +256,74 @@
   <section class="section" id="questions" aria-labelledby="questions-title">
     <div class="container">
       <div class="head reveal">
-        <h2 id="questions-title">Частые вопросы</h2>
+        <h2 id="questions-title">Вопросы и предложения</h2>
+        <p class="head__line">Ответы на частые вопросы и форма для идей: что добавить или починить.</p>
       </div>
-      <div class="faq">
-        <details class="faq__item reveal" style="--i:0">
-          <summary><span>Что с <code>.doc</code> и <code>.ppt</code>?</span></summary>
-          <p><code>.doc</code> читается как текст, <code>.ppt</code> не разбирается: нужен <code>.pptx</code>. Сохранение создаёт <code>.docx</code> рядом с исходным файлом.</p>
-        </details>
-        <details class="faq__item reveal" style="--i:1">
-          <summary><span>Можно перенести на другой компьютер?</span></summary>
-          <p>Да, папка portable: на новом месте ключ вводится заново или импортируется из файла секретов.</p>
-        </details>
-        <details class="faq__item reveal" style="--i:2">
-          <summary><span>Куда уходят мои файлы?</span></summary>
-          <p>Никуда: документы читаются с диска. В сеть уходит только запрос к выбранному провайдеру, и только если вы его отправили.</p>
-        </details>
-        <details class="faq__item reveal" style="--i:3">
-          <summary><span>Что с приватностью ключа?</span></summary>
-          <p>Ключ шифруется средствами Windows и привязан к профилю; в открытом виде он не покидает машину.</p>
-        </details>
+
+      <div class="support">
+        <div class="faq">
+          <details class="faq__item reveal" style="--i:0">
+            <summary><span>Что с <code>.doc</code> и <code>.ppt</code>?</span></summary>
+            <p><code>.doc</code> читается как текст, <code>.ppt</code> не разбирается: нужен <code>.pptx</code>. Сохранение создаёт <code>.docx</code> рядом с исходным файлом.</p>
+          </details>
+          <details class="faq__item reveal" style="--i:1">
+            <summary><span>Можно перенести на другой компьютер?</span></summary>
+            <p>Да, папка portable: на новом месте ключ вводится заново или импортируется из файла секретов.</p>
+          </details>
+          <details class="faq__item reveal" style="--i:2">
+            <summary><span>Куда уходят мои файлы?</span></summary>
+            <p>Никуда: документы читаются с диска. В сеть уходит только запрос к выбранному провайдеру, и только если вы его отправили.</p>
+          </details>
+          <details class="faq__item reveal" style="--i:3">
+            <summary><span>Что с приватностью ключа?</span></summary>
+            <p>Ключ шифруется средствами Windows и привязан к профилю; в открытом виде он не покидает машину.</p>
+          </details>
+        </div>
+
+        <div class="feedback">
+          <div class="feedback__intro reveal">
+            <h3>Предложение по улучшению</h3>
+            <p>Обращение уходит на почту разработчика, ответим на указанный адрес.</p>
+            <p class="feedback__note">Форма проверяет поля и отсекает автоматические отправки.</p>
+          </div>
+
+          <form class="form reveal" id="feedback-form" action="https://formsubmit.co/getup322@gmail.com" method="POST" novalidate>
+            <input type="hidden" name="_subject" value="WorkSpace: предложение по улучшению">
+            <input type="hidden" name="_template" value="table">
+            <input type="hidden" name="_captcha" value="false">
+
+            <div class="field">
+              <label for="f-name">Имя</label>
+              <input id="f-name" name="name" type="text" autocomplete="name" required minlength="2" maxlength="60" placeholder="Как к вам обращаться">
+              <p class="field__error" data-error-for="name" aria-live="polite"></p>
+            </div>
+
+            <div class="field">
+              <label for="f-email">Почта</label>
+              <input id="f-email" name="email" type="email" inputmode="email" autocomplete="email" required maxlength="120" placeholder="name@example.com">
+              <p class="field__error" data-error-for="email" aria-live="polite"></p>
+            </div>
+
+            <div class="field">
+              <label for="f-idea">Предложение</label>
+              <textarea id="f-idea" name="idea" rows="4" required minlength="10" maxlength="1200" placeholder="Что сделать, чтобы стало удобнее"></textarea>
+              <p class="field__hint"><span id="f-count">0</span> из 1200</p>
+              <p class="field__error" data-error-for="idea" aria-live="polite"></p>
+            </div>
+
+            <div class="field field--trap" aria-hidden="true">
+              <label for="f-honey">Не заполняйте это поле</label>
+              <input id="f-honey" name="_honey" type="text" tabindex="-1" autocomplete="off">
+            </div>
+
+            <div class="form__foot">
+              <button class="btn btn--primary btn--lg" type="submit">Отправить</button>
+              <p class="form__status" id="f-status" role="status" aria-live="polite"></p>
+            </div>
+
+            <p class="form__fallback">Если форма не отправилась, напишите на <a href="mailto:getup322@gmail.com">getup322@gmail.com</a>.</p>
+          </form>
+        </div>
       </div>
     </div>
   </section>

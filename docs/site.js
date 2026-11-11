@@ -260,4 +260,114 @@
 
     viewer.addEventListener('close', () => root.classList.remove('is-locked'));
   }
+  // форма предложений: проверка полей и отправка на почту через FormSubmit
+  const form = document.getElementById('feedback-form');
+
+  if (form) {
+    const endpoint = 'https://formsubmit.co/ajax/getup322@gmail.com';
+    const status = document.getElementById('f-status');
+    const submit = form.querySelector('button[type="submit"]');
+    const idea = form.elements.idea;
+    const counter = document.getElementById('f-count');
+    const readyAt = Date.now();
+    const cooldown = 90_000;
+    const storageKey = 'workspace-feedback-sent';
+
+    const setStatus = (text, kind) => {
+      status.textContent = text;
+      status.className = `form__status${kind ? ` is-${kind}` : ''}`;
+    };
+
+    const setError = (name, text) => {
+      const box = form.querySelector(`[data-error-for="${name}"]`);
+      if (box) box.textContent = text;
+      if (form.elements[name]) form.elements[name].setAttribute('aria-invalid', text ? 'true' : 'false');
+    };
+
+    const rules = {
+      name: (value) => (value.trim().length >= 2 && value.trim().length <= 60 ? '' : 'Напишите имя: от 2 до 60 символов.'),
+      email: (value) =>
+        /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(value.trim()) ? '' : 'Проверьте адрес: нужен вид name@example.com.',
+      idea: (value) =>
+        value.trim().length >= 10 && value.trim().length <= 1200 ? '' : 'Опишите предложение: от 10 до 1200 символов.',
+    };
+
+    if (idea && counter) {
+      counter.textContent = String(idea.value.length);
+      idea.addEventListener('input', () => {
+        counter.textContent = String(idea.value.length);
+      });
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      if (form.elements._honey && form.elements._honey.value) {
+        setStatus('Проверка не пройдена: похоже на автоматическую отправку.', 'error');
+        return;
+      }
+
+      if (Date.now() - readyAt < 2500) {
+        setStatus('Слишком быстро. Проверьте текст и отправьте ещё раз.', 'error');
+        return;
+      }
+
+      let firstInvalid = null;
+      for (const [name, rule] of Object.entries(rules)) {
+        const message = rule(form.elements[name].value);
+        setError(name, message);
+        if (message && !firstInvalid) firstInvalid = form.elements[name];
+      }
+
+      if (firstInvalid) {
+        firstInvalid.focus();
+        setStatus('Проверьте поля формы.', 'error');
+        return;
+      }
+
+      let last = 0;
+      try {
+        last = Number(localStorage.getItem(storageKey) || 0);
+      } catch {
+        last = 0;
+      }
+      if (Date.now() - last < cooldown) {
+        setStatus('Обращение уже отправлено. Подождите полторы минуты.', 'error');
+        return;
+      }
+
+      submit.disabled = true;
+      setStatus('Отправляем…');
+
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { Accept: 'application/json' },
+          body: new FormData(form),
+        });
+        const data = await response.json().catch(() => ({}));
+        const ok = response.ok && String(data.success) !== 'false';
+        if (!ok) throw new Error(data.message || `HTTP ${response.status}`);
+
+        try {
+          localStorage.setItem(storageKey, String(Date.now()));
+        } catch {
+          // приватный режим: ограничение частоты не сохранится
+        }
+
+        form.reset();
+        if (counter) counter.textContent = '0';
+        for (const name of Object.keys(rules)) setError(name, '');
+        setStatus('Отправлено. Спасибо, ответим на указанную почту.', 'ok');
+      } catch (error) {
+        const reason = String((error && error.message) || error);
+        const text = /activation/i.test(reason)
+          ? 'Форма ждёт подтверждения владельца: письмо с кнопкой Activate уже ушло на getup322@gmail.com. Пока можно написать туда напрямую.'
+          : `Не отправилось: ${reason.slice(0, 140)}. Напишите на getup322@gmail.com.`;
+        setStatus(text, 'error');
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  }
 })();
