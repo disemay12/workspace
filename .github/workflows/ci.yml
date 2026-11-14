@@ -1,0 +1,66 @@
+name: CI
+
+# Сборка и статические проверки для Windows-кода приложения.
+# Функциональные наборы (npm run checks) сюда не входят: они открывают окна
+# Electron и требуют интерактивной сессии — на hosted-раннерах это нестабильно.
+# Публикация docs/ живёт в отдельном workflow (pages.yml).
+
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+  push:
+    branches: [master]
+    paths-ignore:
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # npm ci вместо npm install: lock-файл обязателен, дерево зависимостей
+      # должно совпадать с локальным.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (renderer + main)
+        run: npm run typecheck
+
+      # build:vite отдельным шагом, а не через npm run build: prebuild-хук
+      # собирает иконку через PowerShell, а она нужна только релизной сборке.
+      - name: Build renderer
+        run: npm run build:vite
+
+      - name: Build main process
+        run: npm run build:electron
+
+      - name: Build check scripts
+        run: npm run checks:build
+
+      # Сборка не должна оставлять изменений в рабочем дереве: иначе
+      # незамеченный правленый артефакт (dist-electron, .checks.lock,
+      # сгенерированный файл) уедет в следующий коммит.
+      - name: Verify clean worktree after build
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::Сборка изменила рабочее дерево (список выше)"
+            exit 1
+          fi

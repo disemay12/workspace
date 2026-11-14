@@ -22,7 +22,6 @@ import {
   ExternalLink,
   Settings,
   PanelLeft,
-  PanelBottom,
   FolderPlus,
   Pencil,
   Save,
@@ -55,7 +54,10 @@ import {
   requiresConfirmation,
   stripActionBlocks,
 } from '../../services/aiActions';
-import { AIBadge, Button, IconButton, Spinner, Textarea } from '../ui';
+import { Button, IconButton, Spinner, Textarea } from '../ui';
+
+/** Сколько последних сообщений просматриваем на автозапуск действий. */
+const AUTO_RUN_SCAN = 8;
 
 /** Действия, меняющие содержимое открытого документа. */
 const DOC_WRITE_ACTIONS = new Set<string>([
@@ -322,6 +324,12 @@ export const AIChatPanel: React.FC<Props> = ({
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  /**
+   * Синхронный гейт отправки: isStreaming выставляется уже после await сборки
+   * вложения, поэтому два быстрых Enter запускали два стрима, и второй
+   * AbortController терял первый.
+   */
+  const inFlightRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const activeSession = useMemo(
@@ -339,8 +347,10 @@ export const AIChatPanel: React.FC<Props> = ({
   /* ---------- Отслеживание выделения в активном документе ---------- */
   useEffect(() => {
     const handler = () => {
-      const sel = window.getSelection()?.toString() ?? '';
-      setSelectionText(sel.trim());
+      const next = (window.getSelection()?.toString() ?? '').trim();
+      // selectionchange приходит на каждое движение каретки: без сверки
+      // значения панель перерисовывалась бы на каждое выделение в документе.
+      setSelectionText((prev) => (prev === next ? prev : next));
     };
     document.addEventListener('selectionchange', handler);
     return () => document.removeEventListener('selectionchange', handler);
@@ -881,6 +891,26 @@ export const AIChatPanel: React.FC<Props> = ({
     ]
   );
 
+  /**
+   * Отправка под синхронным гейтом — для входов без сборки вложения
+   * (внешний запрос, пресет): второй вызов в том же тике не стартует стрим.
+   */
+  const sendGuarded = (
+    text: string,
+    attached?: ChatMessage['attachedFile'],
+    mode: 'chat' | 'inline' = 'chat'
+  ) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    void (async () => {
+      try {
+        await submit(text, attached, undefined, mode);
+      } finally {
+        inFlightRef.current = false;
+      }
+    })();
+  };
+
   /* ---------- Выполнение действий управления программой ---------- */
 
   const executeAction = useCallback(
@@ -911,35 +941,53 @@ export const AIChatPanel: React.FC<Props> = ({
     [onRunAction]
   );
 
+  /**
+   * Разбор новых ответов — в memo: во время стрима панель перерисовывается на
+   * каждый чанк, и гонять parseAIActions по всей истории на каждый paint нельзя.
+   */
+  const autoRunCandidates = useMemo(() => {
+    const recent = messages.slice(-AUTO_RUN_SCAN);
+    const list: { action: AIActionPayload; key: string; preciseEdit: boolean }[] = [];
+    for (const msg of recent) {
+      if (msg.role !== 'assistant' || msg.streaming) continue;
+      if (msg.timestamp < mountedAtRef.current) continue;
+      parseAIActions(msg.content).forEach((action, index) => {
+        list.push({
+          action,
+          key: `${msg.id}_${index}`,
+          preciseEdit: Boolean(msg.preciseEdit),
+        });
+      });
+    }
+    return list;
+  }, [messages]);
+
   // Автоматическое выполнение безопасных действий из новых ответов модели.
   // Действия из истории и разрушительные операции ждут явного клика.
   useEffect(() => {
     if (autoRunBusyRef.current) return;
 
     const pending: { action: AIActionPayload; key: string }[] = [];
-    for (const msg of messages) {
-      if (msg.role !== 'assistant' || msg.streaming) continue;
-      if (msg.timestamp < mountedAtRef.current) continue;
-      parseAIActions(msg.content).forEach((act, idx) => {
-        const key = `${msg.id}_${idx}`;
-        if (executedActionsRef.current.has(key)) return;
-        if (msg.preciseEdit && actionReplacesWholeDocument(act)) {
-          executedActionsRef.current.add(key);
-          setActionStates((prev) => ({
-            ...prev,
-            [key]: {
-              status: 'error',
-              error: 'Точечная правка: полная замена документа запрещена',
-            },
-          }));
-          return;
-        }
-        if (requiresConfirmation(act)) return;
-        if (DOC_WRITE_ACTIONS.has(act.action) && !docWriteAccess) return;
-        pending.push({ action: act, key });
-      });
+    /** Запрещённые точечной правкой действия помечаем пачкой, а не в цикле. */
+    const rejected: Record<string, { status: 'error'; error: string }> = {};
+    for (const item of autoRunCandidates) {
+      if (executedActionsRef.current.has(item.key)) continue;
+      if (item.preciseEdit && actionReplacesWholeDocument(item.action)) {
+        executedActionsRef.current.add(item.key);
+        rejected[item.key] = {
+          status: 'error',
+          error: 'Точечная правка: полная замена документа запрещена',
+        };
+        continue;
+      }
+      if (requiresConfirmation(item.action)) continue;
+      if (DOC_WRITE_ACTIONS.has(item.action.action) && !docWriteAccess) continue;
+      pending.push({ action: item.action, key: item.key });
     }
 
+    if (Object.keys(rejected).length > 0) {
+      setActionStates((prev) => ({ ...prev, ...rejected }));
+    }
     if (pending.length === 0) return;
 
     autoRunBusyRef.current = true;
@@ -953,7 +1001,7 @@ export const AIChatPanel: React.FC<Props> = ({
       autoRunBusyRef.current = false;
       setActionTick((v) => v + 1);
     });
-  }, [messages, executeAction, actionTick, docWriteAccess]);
+  }, [autoRunCandidates, executeAction, actionTick, docWriteAccess]);
 
   const handleCreateTableFromMarkdown = useCallback(
     async (table: ParsedMarkdownTable, format: 'xlsx' | 'csv' = 'xlsx') => {
@@ -979,7 +1027,7 @@ export const AIChatPanel: React.FC<Props> = ({
   useEffect(() => {
     if (!pendingPrompt) return;
     const { prompt, context } = pendingPrompt;
-    void submit(
+    sendGuarded(
       prompt,
       context
         ? {
@@ -989,7 +1037,6 @@ export const AIChatPanel: React.FC<Props> = ({
             truncated: context.length > 40000,
           }
         : undefined,
-      undefined,
       'inline'
     );
     onPendingPromptConsumed();
@@ -1023,11 +1070,19 @@ export const AIChatPanel: React.FC<Props> = ({
   const handleSend = () => {
     const text = input.trim() || (droppedFiles.length > 0 ? 'Проанализируй приложенные файлы' : '');
     if (!text) return;
+    // Гейт ставится до первого await: иначе второй Enter проходит проверку
+    // isStreaming, пока собирается вложение.
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     const dropped = droppedFiles.length > 0 ? droppedFiles : undefined;
     setDroppedFiles([]);
     void (async () => {
-      const attachment = await buildAttachment();
-      await submit(text, attachment, dropped);
+      try {
+        const attachment = await buildAttachment();
+        await submit(text, attachment, dropped);
+      } finally {
+        inFlightRef.current = false;
+      }
     })();
   };
 
@@ -1076,13 +1131,15 @@ export const AIChatPanel: React.FC<Props> = ({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // isComposing: Enter подтверждает ввод IME (русская/китайская раскладка),
+    // и отправлять в этот момент недописанный текст нельзя.
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSend();
     }
   };
 
-  const copyMessage = async (id: string, content: string) => {
+  const copyMessage = useCallback(async (id: string, content: string) => {
     try {
       await navigator.clipboard.writeText(content);
       setCopiedId(id);
@@ -1090,7 +1147,52 @@ export const AIChatPanel: React.FC<Props> = ({
     } catch {
       // Буфер обмена недоступен
     }
-  };
+  }, []);
+
+  // Колбэки пузырей должны быть стабильными, иначе memo не работает и стрим
+  // одного ответа перерисовывает всю ленту сообщений.
+  const handleCopyMessage = useCallback(
+    (id: string, content: string) => {
+      void copyMessage(id, content);
+    },
+    [copyMessage]
+  );
+
+  const handleInsertText = useCallback(
+    (text: string) => {
+      if (!docWriteAccess) onToggleDocWriteAccess(true);
+      onInsertIntoEditor(text);
+    },
+    [docWriteAccess, onToggleDocWriteAccess, onInsertIntoEditor]
+  );
+
+  const handleReplaceText = useCallback(
+    (text: string) => {
+      if (!docWriteAccess) onToggleDocWriteAccess(true);
+      onApplyToDocument(text);
+    },
+    [docWriteAccess, onToggleDocWriteAccess, onApplyToDocument]
+  );
+
+  const handleExecuteAction = useCallback(
+    (action: AIActionPayload, key: string) => {
+      // Ручной запуск действия — это и есть согласие на запись:
+      // фиксируем ключ, чтобы автозапуск не выполнил его повторно.
+      executedActionsRef.current.add(key);
+      if (DOC_WRITE_ACTIONS.has(action.action) && !docWriteAccess) {
+        onToggleDocWriteAccess(true);
+      }
+      void executeAction(action, key);
+    },
+    [docWriteAccess, executeAction, onToggleDocWriteAccess]
+  );
+
+  const handleOpenActionFile = useCallback(
+    (path: string) => {
+      void onRunAction({ action: 'open_file', path });
+    },
+    [onRunAction]
+  );
 
   const providerLabel = PROVIDER_PRESETS[settings.provider]?.label ?? settings.provider;
 
@@ -1234,7 +1336,7 @@ export const AIChatPanel: React.FC<Props> = ({
                 <button
                   key={preset.id}
                   onClick={() => {
-                    void submit(preset.prompt);
+                    sendGuarded(preset.prompt);
                   }}
                   className="w-full rounded-lg border border-ws bg-ws-surface p-2.5 text-left transition-colors hover:border-ws-accent hover:bg-ws-hover"
                 >
@@ -1275,35 +1377,14 @@ export const AIChatPanel: React.FC<Props> = ({
                 ? contextFiles
                 : msg.contextFiles
             }
-            onCopy={() =>
-              copyMessage(
-                msg.id,
-                msg.role === 'user' ? msg.content : stripEmoji(stripActionBlocks(msg.content))
-              )
-            }
-            onInsert={(text) => {
-              if (!docWriteAccess) onToggleDocWriteAccess(true);
-              onInsertIntoEditor(text);
-            }}
-            onReplace={(text) => {
-              if (!docWriteAccess) onToggleDocWriteAccess(true);
-              onApplyToDocument(text);
-            }}
+            onCopy={handleCopyMessage}
+            onInsert={handleInsertText}
+            onReplace={handleReplaceText}
             hasActiveTab={Boolean(activeTab)}
             documentTab={Boolean(activeTab && AGENT_TAB_TYPES.has(activeTab.type))}
             actionStates={actionStates}
-            onExecuteAction={(action, key) => {
-              // Ручной запуск действия — это и есть согласие на запись:
-              // фиксируем ключ, чтобы автозапуск не выполнил его повторно.
-              executedActionsRef.current.add(key);
-              if (DOC_WRITE_ACTIONS.has(action.action) && !docWriteAccess) {
-                onToggleDocWriteAccess(true);
-              }
-              void executeAction(action, key);
-            }}
-            onOpenFile={(path) => {
-              void onRunAction({ action: 'open_file', path });
-            }}
+            onExecuteAction={handleExecuteAction}
+            onOpenFile={handleOpenActionFile}
             onCreateTableFromMarkdown={handleCreateTableFromMarkdown}
           />
         ))}
@@ -2006,7 +2087,7 @@ const AIActionCard: React.FC<{
    Пузырь сообщения
    ============================================================ */
 
-const MessageBubble: React.FC<{
+interface MessageBubbleProps {
   message: ChatMessage;
   isCopied: boolean;
   /** Текущий шаг агента, пока ответ ещё пуст. */
@@ -2017,7 +2098,7 @@ const MessageBubble: React.FC<{
   toolTrace?: string[];
   /** Файлы, прочитанные ассистентом ради ответа. */
   contextFiles?: string[];
-  onCopy: () => void;
+  onCopy: (id: string, content: string) => void;
   onInsert: (text: string) => void;
   onReplace: (text: string) => void;
   hasActiveTab: boolean;
@@ -2030,7 +2111,10 @@ const MessageBubble: React.FC<{
   onExecuteAction: (action: AIActionPayload, actionKey: string) => void;
   onOpenFile?: (path: string) => void;
   onCreateTableFromMarkdown?: (table: ParsedMarkdownTable, format: 'xlsx' | 'csv') => void;
-}> = ({
+}
+
+/** memo: при стриме меняется только последний ответ, лента не перерисовывается. */
+const MessageBubble = React.memo(function MessageBubble({
   message,
   isCopied,
   agentStatus,
@@ -2046,7 +2130,7 @@ const MessageBubble: React.FC<{
   onExecuteAction,
   onOpenFile,
   onCreateTableFromMarkdown,
-}) => {
+}: MessageBubbleProps) {
   const isUser = message.role === 'user';
   // Правки документа можно применять выборочно: индексы отключённых операций.
   const [excludedOps, setExcludedOps] = useState<Record<string, number[]>>({});
@@ -2309,7 +2393,7 @@ const MessageBubble: React.FC<{
         {message.content && !message.streaming && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1 opacity-60 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
             <button
-              onClick={onCopy}
+              onClick={() => onCopy(message.id, isUser ? message.content : answerText)}
               title="Скопировать ответ"
               className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-ws-faint hover:bg-ws-hover hover:text-ws"
             >
@@ -2380,7 +2464,7 @@ const MessageBubble: React.FC<{
       </div>
     </div>
   );
-};
+});
 
 /* ============================================================
    Продвинутый Markdown-рендерер для ответов модели (KaTeX + Prism + Mermaid)
@@ -2396,15 +2480,23 @@ export const MarkdownLite: React.FC<{ content: string }> = ({ content }) => {
 
   const handleClick = (e: React.MouseEvent) => {
     const target = (e.target as HTMLElement).closest('.copy-code-btn') as HTMLElement;
-    if (!target) return;
-    const raw = target.getAttribute('data-code');
-    if (!raw) return;
-    void navigator.clipboard.writeText(decodeURIComponent(raw));
-    const orig = target.innerText;
-    target.innerText = 'Скопировано!';
-    setTimeout(() => {
-      target.innerText = orig;
-    }, 1500);
+    if (target) {
+      const raw = target.getAttribute('data-code');
+      if (!raw) return;
+      void navigator.clipboard.writeText(decodeURIComponent(raw));
+      const orig = target.innerText;
+      target.innerText = 'Скопировано!';
+      setTimeout(() => {
+        target.innerText = orig;
+      }, 1500);
+      return;
+    }
+    // renderRichMarkdown отбрасывает небезопасные схемы, но клик — последний
+    // рубеж: в окне с мостом electronAPI javascript:/data: исполняют код.
+    const link = (e.target as HTMLElement).closest('a');
+    if (!link) return;
+    const href = link.getAttribute('href') || '';
+    if (/^\s*(javascript|data|vbscript):/i.test(href)) e.preventDefault();
   };
 
   return (

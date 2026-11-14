@@ -2461,14 +2461,22 @@ function replaceAcrossNodes(
   all: boolean
 ): number {
   let replaced = 0;
+  // Курсор поиска: без него replace-all каждый раз искал с начала и
+  // при replacement, содержащем find («а» → «аа»), находил только что
+  // вставленный текст и рос до OOM.
+  let searchFrom = 0;
+  // Жёсткий предел: любая правка сдвигает курсор минимум на символ, так что
+  // итераций не может быть больше длины текста; лимит страхует от патологий.
+  const maxIterations =
+    nodes.reduce((sum, node) => sum + (node.textContent ?? '').length, 0) + 1000;
 
-  while (true) {
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
     const combined = nodes.map((node) => node.textContent ?? '').join('');
-    if (!combined) break;
+    if (!combined || searchFrom >= combined.length) break;
 
     const haystack = matchCase ? combined : combined.toLowerCase();
     const needle = matchCase ? find : find.toLowerCase();
-    let at = haystack.indexOf(needle);
+    let at = haystack.indexOf(needle, searchFrom);
     let length = find.length;
 
     // Модель может прислать ту же фразу с другим числом пробелов.
@@ -2478,7 +2486,11 @@ function replaceAcrossNodes(
       if (normalizedFind) {
         const normalizedHaystack = matchCase ? normalized.text : normalized.text.toLowerCase();
         const normalizedNeedle = matchCase ? normalizedFind : normalizedFind.toLowerCase();
-        const normalizedAt = normalizedHaystack.indexOf(normalizedNeedle);
+        let normalizedAt = normalizedHaystack.indexOf(normalizedNeedle);
+        // Тот же курсор: иначе после первой правки находка начиналась заново.
+        while (normalizedAt !== -1 && normalized.map[normalizedAt] < searchFrom) {
+          normalizedAt = normalizedHaystack.indexOf(normalizedNeedle, normalizedAt + 1);
+        }
         if (normalizedAt !== -1) {
           at = normalized.map[normalizedAt];
           length =
@@ -2532,6 +2544,8 @@ function replaceAcrossNodes(
 
     replaced += 1;
     if (!all) break;
+    // Продолжаем искать сразу за вставленным фрагментом.
+    searchFrom = at + replacement.length;
   }
 
   return replaced;

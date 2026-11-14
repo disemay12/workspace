@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Загрузка видео на YouTube через тот же Google-аккаунт, что и Drive.
  *
  * Используется resumable upload: файл уходит кусками, а не целиком в память.
@@ -8,7 +8,6 @@
 import { ipcMain } from 'electron';
 import { mapGoogleError } from './googleAuth';
 import * as fs from 'fs';
-import * as path from 'path';
 
 interface YoutubeVideo {
   title: string;

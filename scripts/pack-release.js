@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Собирает релизный архив только из основных файлов сборки:
+ * Собирает релизный архив (release/) только из основных файлов сборки:
  *   WorkSpace.exe, README.txt и app\** (Electron + app.asar).
  *
  * Настройки, ключи и сессии в архив не попадают ни при каких условиях:
@@ -18,8 +18,15 @@ const pkg = require('../package.json');
 
 const root = path.resolve(__dirname, '..');
 const buildDir = path.join(root, 'WorkSpace');
-const outDir = path.join(root, 'dist');
+// Архив в release/, а не в dist/: vite build запускается с emptyOutDir:true
+// и стирал dist целиком вместе с уже собранным релизом.
+const outDir = path.join(root, 'release');
 const outFile = path.join(outDir, `WorkSpace-${pkg.version}-win-x64.zip`);
+// Упаковка идёт во временный файл: неудачный запуск не должен уничтожать
+// предыдущий релиз (раньше outFile удалялся до запуска архиватора).
+// Суффикс .zip обязателен: резервный Compress-Archive другие расширения
+// отвергает (".tmp — неподдерживаемый формат файла архива").
+const tempFile = `${outFile}.tmp.zip`;
 
 const ROOT_FILES = ['WorkSpace.exe', 'README.txt'];
 const FORBIDDEN = [
@@ -71,7 +78,7 @@ function packWith7z(files, sevenZip) {
   const listFile = path.join(os.tmpdir(), `workspace-pack-${process.pid}.txt`);
   fs.writeFileSync(listFile, files.join('\r\n'), 'utf8');
   try {
-    execFileSync(sevenZip, ['a', '-tzip', '-mx=5', outFile, `@${listFile}`], {
+    execFileSync(sevenZip, ['a', '-tzip', '-mx=5', tempFile, `@${listFile}`], {
       cwd: root,
       stdio: 'inherit',
     });
@@ -101,7 +108,7 @@ function packWithPowerShell(files) {
         '-ExecutionPolicy',
         'Bypass',
         '-Command',
-        `Compress-Archive -Path '${path.join(stage, 'WorkSpace')}' -DestinationPath '${outFile}' -CompressionLevel Optimal -Force`,
+        `Compress-Archive -Path '${path.join(stage, 'WorkSpace')}' -DestinationPath '${tempFile}' -CompressionLevel Optimal -Force`,
       ],
       { stdio: 'inherit' }
     );
@@ -117,15 +124,23 @@ function main() {
 
   const files = collect();
   fs.mkdirSync(outDir, { recursive: true });
-  if (fs.existsSync(outFile)) fs.unlinkSync(outFile);
+  try { fs.unlinkSync(tempFile); } catch {}
+  try {
+    const sevenZip = find7z();
+    if (sevenZip) packWith7z(files, sevenZip);
+    else packWithPowerShell(files);
 
-  const sevenZip = find7z();
-  if (sevenZip) packWith7z(files, sevenZip);
-  else packWithPowerShell(files);
+    const sizeBytes = fs.statSync(tempFile).size;
+    if (!sizeBytes) throw new Error('Архив получился пустым');
+    // Предыдущий релиз заменяется только после проверки размера.
+    fs.renameSync(tempFile, outFile);
 
-  const size = (fs.statSync(outFile).size / (1024 * 1024)).toFixed(1);
-  console.log(`Готово: ${path.relative(root, outFile)} (${size} МБ, ${files.length} файлов)`);
-  console.log('В архив не входят: ai-settings.json, secrets*.ps1, gdrive.json, workspace-session.json, логи.');
+    const size = (sizeBytes / (1024 * 1024)).toFixed(1);
+    console.log(`Готово: ${path.relative(root, outFile)} (${size} МБ, ${files.length} файлов)`);
+    console.log('В архив не входят: ai-settings.json, secrets*.ps1, gdrive.json, workspace-session.json, логи.');
+  } finally {
+    try { fs.unlinkSync(tempFile); } catch {}
+  }
 }
 
 main();

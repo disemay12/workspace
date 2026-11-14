@@ -1,13 +1,13 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const srcRoot = path.resolve(__dirname, '..');
-const stage = path.join(process.env.TEMP || 'C:/Temp', 'ws-app-stage');
-
-fs.rmSync(stage, { recursive: true, force: true });
-fs.mkdirSync(stage, { recursive: true });
+// Уникальный каталог в системном tmp: фиксированное имя позволяло двум запускам
+// сборки одновременно писать и удалять один и тот же stage.
+const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-app-stage-'));
 
 function copyFile(from, to) {
   fs.mkdirSync(path.dirname(to), { recursive: true });
@@ -48,6 +48,11 @@ const keep = new Set([
   'secrets.js',
   'contextMenu.js',
   'updater.js',
+  // Импортируется main.ts, googleAuth.ts и imageHost.ts; без него пакет
+  // падал бы на старте (проверка полноты ниже ловит такие пропуски).
+  'safeOpen.js',
+  // Границы путей: main.ts, video.ts, imageHost.ts.
+  'fsGuard.js',
 ]);
 
 for (const entry of fs.readdirSync(path.join(srcRoot, 'dist-electron'), { withFileTypes: true })) {
@@ -67,6 +72,39 @@ const skipDocs = (name) =>
 
 copyDir(path.join(srcRoot, 'node_modules', 'iconv-lite'), path.join(stage, 'node_modules', 'iconv-lite'), skipDocs);
 copyDir(path.join(srcRoot, 'node_modules', 'safer-buffer'), path.join(stage, 'node_modules', 'safer-buffer'), skipDocs);
+
+/**
+ * Контроль полноты пакета: список keep — ручной allowlist, поэтому новый модуль
+ * electron/ молча выпадал из asar и приложение падало уже у пользователя.
+ * Обход BFS по require('./X') от main.js и preload.js: проверка только main.js
+ * не видела модули, которые подключают googleAuth.js/imageHost.js/video.js.
+ */
+const entryPoints = ['main.js', 'preload.js'];
+const visited = new Set();
+const queue = [...entryPoints];
+const missing = [];
+while (queue.length > 0) {
+  const name = queue.shift();
+  if (visited.has(name)) continue;
+  visited.add(name);
+  const base = path.join(stage, 'dist-electron', name);
+  const file = fs.existsSync(base) ? base : `${base}.js`;
+  if (!fs.existsSync(file)) {
+    missing.push(name);
+    break;
+  }
+  const source = fs.readFileSync(file, 'utf-8');
+  for (const match of source.matchAll(/require\(\s*['"]\.\/([\w.-]+)['"]\s*\)/g)) {
+    const dependency = match[1].replace(/\.js$/, '');
+    if (!visited.has(dependency)) queue.push(dependency);
+  }
+}
+if (missing.length > 0) {
+  throw new Error(
+    `В пакет не попал модуль, который требуется из dist-electron/${entryPoints.join('/')}: ${missing.join(', ')}. ` +
+      'Добавьте его в список keep в scripts/stage-portable.js.'
+  );
+}
 
 const { version } = require(path.join(srcRoot, 'package.json'));
 

@@ -10,7 +10,7 @@ import {
   Maximize2,
   Minimize2,
 } from 'lucide-react';
-import { cn } from '../../lib/utils';
+import { cn, uid } from '../../lib/utils';
 import { IconButton } from '../ui';
 
 interface Props {
@@ -37,7 +37,12 @@ export const TerminalPanel: React.FC<Props> = ({
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const sentCommandRef = useRef('');
-  const sessionIdRef = useRef<string>('term_default');
+  /**
+   * У каждой панели своя сессия: с общим 'term_default' второе окно и
+   * перезапуск панели перехватывали вывод и ввод друг друга. Живой id
+   * выдаёт initTerminal — до первой инициализации он пуст.
+   */
+  const sessionIdRef = useRef<string>('');
   const [isMaximized, setIsMaximized] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [ready, setReady] = useState(false);
@@ -48,6 +53,12 @@ export const TerminalPanel: React.FC<Props> = ({
   const initTerminal = useCallback(async () => {
     if (!containerRef.current) return;
     setReady(false);
+
+    // Перезапуск панели не должен оставлять живой прежний процесс.
+    const previousId = sessionIdRef.current;
+    if (previousId) void window.electronAPI?.terminalKill?.(previousId);
+    const id = uid('term');
+    sessionIdRef.current = id;
 
     // Очищаем предыдущий терминал если был
     if (terminalRef.current) {
@@ -105,9 +116,24 @@ export const TerminalPanel: React.FC<Props> = ({
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    const id = sessionIdRef.current;
     if (window.electronAPI?.terminalCreate) {
-      await window.electronAPI.terminalCreate({ id, cwd });
+      try {
+        await window.electronAPI.terminalCreate({ id, cwd });
+        // Пока шёл IPC, панель могли перезапустить (StrictMode делает это на
+        // монтировании): осиротевшую сессию гасим сразу, иначе PowerShell
+        // остаётся жить без слушателя.
+        if (sessionIdRef.current !== id) {
+          void window.electronAPI.terminalKill?.(id);
+          return;
+        }
+      } catch (err) {
+        // Без catch отклонённый промис оставался необработанным, а панель
+        // навсегда застревала в состоянии «не готово».
+        void window.electronAPI.terminalKill?.(id);
+        const reason = (err as Error)?.message || 'неизвестная ошибка';
+        term.write(`\r\n[Не удалось запустить терминал: ${reason}]\r\n`);
+        return;
+      }
     }
 
     setReady(true);
@@ -147,6 +173,10 @@ export const TerminalPanel: React.FC<Props> = ({
       unsubData?.();
       unsubExit?.();
       window.removeEventListener('resize', handleResize);
+      // PTY не должен переживать панель: иначе PowerShell остаётся в памяти
+      // и висит без слушателя.
+      const sessionId = sessionIdRef.current;
+      if (sessionId) void window.electronAPI?.terminalKill?.(sessionId);
       if (terminalRef.current) {
         terminalRef.current.dispose();
         terminalRef.current = null;

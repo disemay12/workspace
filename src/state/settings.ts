@@ -155,6 +155,11 @@ const PRESET_URLS = new Set(
  * Произвольные адреса (свой endpoint) не трогаем.
  */
 export function normalizeSettings(input: AISettings): AISettings {
+  // Неизвестный провайдер (старый или испорченный файл настроек) ронял
+  // обращение к PROVIDER_PRESETS и оставлял приложение с белым экраном.
+  if (!PROVIDER_PRESETS[input.provider]) {
+    return { ...input, provider: DEFAULT_AI_SETTINGS.provider };
+  }
   // Свой endpoint и локальная Ollama — адрес задаёт пользователь.
   if (input.provider === 'custom' || input.provider === 'ollama') return input;
   const preset = PROVIDER_PRESETS[input.provider];
@@ -233,52 +238,56 @@ const SESSIONS_KEY = 'workspace_ai_sessions';
    ============================================================ */
 
 const KEY_STORE = 'workspace_api_keys';
-const CRYPTO_KEY_NAME = 'workspace_key_encryption_v1';
+/** Ключ шифрования прежних версий лежал в localStorage рядом с шифротекстом. */
+const LEGACY_CRYPTO_KEY_NAME = 'workspace_key_encryption_v1';
+
+/** Ключ шифрования держим только в памяти вкладки: в localStorage он лежал бы
+ *  рядом с шифротекстом, и шифрование не защищало бы ни от чего. */
+let cryptoKeyCache: CryptoKey | null = null;
+/** Обещание кэшируется, а не результат: два параллельных вызова иначе
+ *  генерировали два разных ключа, и первый шифротекст становился нечитаемым. */
+let cryptoKeyPromise: Promise<CryptoKey | null> | null = null;
 
 async function getCryptoKey(): Promise<CryptoKey | null> {
-  try {
-    if (!window.crypto?.subtle) return null;
-    const raw = window.localStorage.getItem(CRYPTO_KEY_NAME);
-    if (raw) {
-      const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
-      return await window.crypto.subtle.importKey('raw', bytes, 'AES-GCM', true, [
-        'encrypt',
-        'decrypt',
-      ]);
-    }
-    const key = await window.crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, [
-      'encrypt',
-      'decrypt',
-    ]);
-    const exported = await window.crypto.subtle.exportKey('raw', key);
-    window.localStorage.setItem(
-      CRYPTO_KEY_NAME,
-      btoa(String.fromCharCode(...new Uint8Array(exported)))
-    );
-    return key;
-  } catch {
-    return null;
+  if (cryptoKeyCache) return cryptoKeyCache;
+  if (!window.crypto?.subtle) return null;
+  if (!cryptoKeyPromise) {
+    cryptoKeyPromise = (async () => {
+      try {
+        // Одноразовый перенос: старый ключ забираем в память и стираем с диска,
+        // иначе пара «ключ + шифротекст» остаётся в одном хранилище.
+        const legacy = window.localStorage.getItem(LEGACY_CRYPTO_KEY_NAME);
+        if (legacy) {
+          const bytes = Uint8Array.from(atob(legacy), (c) => c.charCodeAt(0));
+          const imported = await window.crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, [
+            'encrypt',
+            'decrypt',
+          ]);
+          window.localStorage.removeItem(LEGACY_CRYPTO_KEY_NAME);
+          return imported;
+        }
+        return await window.crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, [
+          'encrypt',
+          'decrypt',
+        ]);
+      } catch {
+        // Web Crypto недоступен — ключ не создаём и открытый текст не пишем.
+        return null;
+      }
+    })();
   }
+  cryptoKeyCache = await cryptoKeyPromise;
+  return cryptoKeyCache;
 }
 
-/** Шифрование строки. При недоступности Web Crypto возвращает plain-строку. */
-async function encryptString(plain: string): Promise<string> {
-  const key = await getCryptoKey();
-  if (!key) return `plain:${plain}`;
-  try {
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encoded = new TextEncoder().encode(plain);
-    const cipher = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
-    const ivB64 = btoa(String.fromCharCode(...iv));
-    const dataB64 = btoa(String.fromCharCode(...new Uint8Array(cipher)));
-    return `enc:${ivB64}:${dataB64}`;
-  } catch {
-    return `plain:${plain}`;
-  }
-}
-
-/** Расшифровка строки, созданной encryptString. */
+/**
+ * Расшифровка значения прежних версий (`enc:` — AES-GCM ключом из памяти,
+ * `plain:` — открытый текст). Новые ключи сюда не пишутся: постоянное
+ * хранилище в профиле шифрует их средствами Windows.
+ */
 async function decryptString(stored: string): Promise<string> {
+  // Открытое значение могла записать прежняя версия: читаем его, но новые
+  // ключи на диск без шифрования больше не попадают.
   if (stored.startsWith('plain:')) return stored.slice(6);
   if (!stored.startsWith('enc:')) return stored;
   const key = await getCryptoKey();
@@ -303,33 +312,59 @@ export const keyVault = {
       const map = JSON.parse(raw) as Record<string, string>;
       const stored = map[provider];
       if (!stored) return '';
-      return await decryptString(stored);
+      const plain = await decryptString(stored);
+      if (!plain && stored.startsWith('enc:')) {
+        // Ключ шифрования живёт только в памяти вкладки, поэтому значение
+        // прошлого запуска не прочитать. Запись НЕ удаляем: так пользователь
+        // хотя бы видит, что ключ был, и восстановит его сам.
+        return '';
+      }
+      return plain;
     } catch {
       return '';
     }
   },
 
-  async set(provider: AIProvider, apiKey: string): Promise<void> {
+  /**
+   * Сохранение ключа. В этом хранилище остаются только ключи шифрования,
+   * которые можно прочитать после перезапуска, — их приносит постоянный файл
+   * настроек. Без него ключ живёт до перезапуска, о чём и сообщаем.
+   */
+  async set(provider: AIProvider, apiKey: string): Promise<{ ok: boolean; error?: string }> {
     try {
       const raw = window.localStorage.getItem(KEY_STORE);
       const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
       if (apiKey) {
-        map[provider] = await encryptString(apiKey);
-      } else {
-        delete map[provider];
+        return {
+          ok: false,
+          error:
+            'Ключ API работает до перезапуска приложения: постоянное хранилище настроек ' +
+            'недоступно, а ключ шифрования localStorage между запусками не сохраняется.',
+        };
       }
+      delete map[provider];
       window.localStorage.setItem(KEY_STORE, JSON.stringify(map));
-    } catch {
-      // Игнорируем ошибки записи
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        error: `API-ключ не сохранён в локальном хранилище: ${(err as Error).message}`,
+      };
     }
   },
 
+  /** Провайдеры, ключ которых действительно читается прямо сейчас. */
   async listConfigured(): Promise<AIProvider[]> {
     try {
       const raw = window.localStorage.getItem(KEY_STORE);
       if (!raw) return [];
       const map = JSON.parse(raw) as Record<string, string>;
-      return Object.keys(map).filter((k) => Boolean(map[k])) as AIProvider[];
+      const readable: AIProvider[] = [];
+      for (const [provider, stored] of Object.entries(map)) {
+        if (!stored) continue;
+        if (await decryptString(stored)) readable.push(provider as AIProvider);
+      }
+      return readable;
     } catch {
       return [];
     }
@@ -345,13 +380,13 @@ function loadSettings(): AISettings {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<AISettings>;
-    return normalizeSettings({
-      ...DEFAULT_AI_SETTINGS,
-      ...parsed,
-      // Системные профили не должны пропадать из сохранённых настроек.
-      promptProfiles: mergeProfiles(parsed.promptProfiles),
-      activeProfileId: parsed.activeProfileId || DEFAULT_PROFILES[0].id,
-    });
+      return normalizeSettings({
+        ...DEFAULT_AI_SETTINGS,
+        ...parsed,
+        // Системные профили не должны пропадать из сохранённых настроек.
+        promptProfiles: mergeProfiles(parsed.promptProfiles),
+        activeProfileId: parsed.activeProfileId || DEFAULT_PROFILES[0].id,
+      });
     }
   } catch {
     // повреждённые настройки — используем значения по умолчанию
@@ -366,12 +401,20 @@ function persistentStore() {
     : null;
 }
 
-/** Пишет настройки и, если передан, ключ активного провайдера на диск. */
+/**
+ * Пишет настройки и, если передан, ключ активного провайдера на диск.
+ * Отказ IPC не должен превращаться в unhandled rejection: функция вызывается
+ * из эффектов, где обработать ошибку некому.
+ */
 async function persistPersistent(settings: AISettings, apiKey?: string): Promise<void> {
   const store = persistentStore();
   if (!store?.saveAiSettings) return;
   const { apiKey: _omit, ...safe } = settings;
-  await store.saveAiSettings(apiKey === undefined ? safe : { ...safe, apiKey });
+  try {
+    await store.saveAiSettings(apiKey === undefined ? safe : { ...safe, apiKey });
+  } catch (err) {
+    console.error('Не удалось сохранить настройки AI', err);
+  }
 }
 
 export function useAISettings() {
@@ -379,22 +422,38 @@ export function useAISettings() {
   /** Актуальные настройки для колбэков, вызываемых сразу после смены провайдера. */
   const settingsRef = useRef<AISettings>(settings);
   settingsRef.current = settings;
+
   const [keyLoaded, setKeyLoaded] = useState(false);
+  /**
+   * Номер последней смены провайдера/ключа. Асинхронное чтение ключа может
+   * завершиться уже после того, как пользователь сохранил другой ключ: без
+   * счётчика устаревший результат затирал свежий (импорт ключа из файла
+   * секретов оставлял приложение «не настроенным»).
+   */
+  const providerChangeSeq = useRef(0);
+
+  // Запись настроек — побочный эффект, а не часть апдейтера: StrictMode
+  // вызывает апдейтер дважды, и каждый проход ходил бы в IPC. До окончания
+  // загрузки не пишем: иначе значения по умолчанию затрут файл настроек.
+  useEffect(() => {
+    if (!keyLoaded) return;
+    try {
+      const { apiKey: _omit, ...safe } = settings;
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
+    } catch {
+      // localStorage может быть недоступен — постоянный файл важнее
+    }
+    void persistPersistent(settings);
+  }, [settings, keyLoaded]);
 
   // Ключ активного провайдера подгружается из защищённого хранилища
   const [providerKey, setProviderKey] = useState('');
   /** Сообщение о нечитаемом ключе — показывается один раз при старте. */
   const [keyProblem, setKeyProblem] = useState('');
 
+  /** Сохранить готовый набор настроек; запись на диск делает эффект выше. */
   const persist = useCallback((next: AISettings) => {
     setSettingsState(next);
-    try {
-      const { apiKey: _omit, ...safe } = next;
-      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
-    } catch {
-      // игнорируем
-    }
-    persistPersistent(next);
   }, []);
 
   // Загрузка ключа при смене провайдера
@@ -405,22 +464,9 @@ export function useAISettings() {
     setKeyLoaded(true);
   }, []);
 
-  const updateSettings = useCallback(
-    (patch: Partial<AISettings>) => {
-      setSettingsState((prev) => {
-        const next = { ...prev, ...patch };
-        try {
-          const { apiKey: _omit, ...safe } = next;
-          window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
-        } catch {
-          // игнорируем
-        }
-        persistPersistent(next);
-        return next;
-      });
-    },
-    []
-  );
+  const updateSettings = useCallback((patch: Partial<AISettings>) => {
+    setSettingsState((prev) => ({ ...prev, ...patch }));
+  }, []);
 
   // Кэш моделей, загруженных от API провайдеров
   const [modelsCache, setModelsCache] = useState<Record<string, string[]>>(() => {
@@ -430,6 +476,9 @@ export function useAISettings() {
     } catch {}
     return {};
   });
+  /** Актуальный кэш моделей: колбэк fetchModels не пересоздаётся при его смене. */
+  const modelsCacheRef = useRef(modelsCache);
+  modelsCacheRef.current = modelsCache;
 
   const fetchModels = useCallback(
     async (override?: Partial<AISettings>) => {
@@ -438,14 +487,14 @@ export function useAISettings() {
         const { aiService } = await import('../services/aiService');
         const res = await aiService.fetchModels(target);
         if (res.success && res.models && res.models.length > 0) {
-          setModelsCache((prev) => {
-            const next = { ...prev, [target.provider]: res.models };
-            try {
-              window.localStorage.setItem('workspace_ai_models_cache', JSON.stringify(next));
-            } catch {}
-            persistPersistent({ ...target, modelsCache: next });
-            return next;
-          });
+          // Снимок кэша считаем снаружи апдейтера: запись на диск — не дело
+          // функции обновления состояния.
+          const nextModels = { ...modelsCacheRef.current, [target.provider]: res.models };
+          setModelsCache(nextModels);
+          try {
+            window.localStorage.setItem('workspace_ai_models_cache', JSON.stringify(nextModels));
+          } catch {}
+          void persistPersistent({ ...target, modelsCache: nextModels });
 
           // Если текущей модели нет в новом списке, автоматически выбираем первую модель
           if (
@@ -453,15 +502,7 @@ export function useAISettings() {
             (!res.models.includes(target.model) &&
               !PROVIDER_PRESETS[target.provider]?.models.includes(target.model))
           ) {
-            setSettingsState((prev) => {
-              const updated = { ...prev, model: res.models[0] };
-              try {
-                const { apiKey: _omit, ...safe } = updated;
-                window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
-              } catch {}
-              persistPersistent(updated);
-              return updated;
-            });
+            setSettingsState((prev) => ({ ...prev, model: res.models[0] }));
           }
         }
         return res;
@@ -485,29 +526,32 @@ export function useAISettings() {
   /** Смена провайдера с подстановкой базового URL и модели по умолчанию. */
   const changeProvider = useCallback(
     async (provider: AIProvider) => {
+      const seq = ++providerChangeSeq.current;
       const preset = PROVIDER_PRESETS[provider];
       const store = persistentStore();
-      const key = store?.loadAiSettings
-        ? (await store.loadAiSettings()).keys?.[provider] || (await keyVault.get(provider))
-        : await keyVault.get(provider);
+      // Ключ конкретного провайдера: `aiSettings:load` отдаёт только активный.
+      // Отказ канала не должен ломать смену провайдера.
+      let persisted = '';
+      if (store?.aiSettingsKey) {
+        persisted = await store
+          .aiSettingsKey(provider)
+          .then((result) => result.key)
+          .catch(() => '');
+      }
+      const key = persisted || (await keyVault.get(provider));
+      // Пока читали ключ, его могли сохранить (импорт из файла секретов):
+      // устаревший результат не должен затирать свежий.
+      if (seq !== providerChangeSeq.current) return;
       setProviderKey(key);
       setSettingsState((prev) => {
         const cached = modelsCache[provider] || [];
-        const next: AISettings = {
+        return {
           ...prev,
           provider,
           apiKey: key,
           baseUrl: preset.baseUrl,
           model: cached[0] || preset.models[0] || prev.model,
         };
-        try {
-          const { apiKey: _omit, ...safe } = next;
-          window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(safe));
-        } catch {
-          // игнорируем
-        }
-        persistPersistent(next);
-        return next;
       });
       setKeyLoaded(true);
     },
@@ -517,13 +561,27 @@ export function useAISettings() {
   /** Сохранение ключа: в профиль пользователя и в локальный кэш. */
   const saveApiKey = useCallback(
     async (apiKey: string, patch?: Partial<AISettings>) => {
+      // Отменяем незавершённое чтение ключа при смене провайдера: иначе оно
+      // завершится позже и перезапишет только что сохранённый ключ пустым.
+      providerChangeSeq.current += 1;
       setKeyProblem('');
       // Патч нужен при импорте из файла секретов: провайдер и адрес меняются
       // в том же обработчике, до перерисовки состояния.
       const snapshot = normalizeSettings({ ...settingsRef.current, ...patch, apiKey });
-      void keyVault.set(snapshot.provider, apiKey);
       setProviderKey(apiKey);
       setSettingsState(snapshot);
+      // Локальный кэш получает только шифротекст. Если зашифровать не удалось,
+      // ключ туда не пишется вовсе, а пользователь видит предупреждение —
+      // но лишь когда постоянного хранилища нет: в приложении ключ уже на диске
+      // под защитой Windows.
+      // Локальный кэш нужен только как запасное хранилище: с постоянным файлом
+      // ключ уже на диске, а шифротекст в localStorage стал бы нерасшифровываемым
+      // после перезапуска (ключ шифрования живёт в памяти вкладки).
+      const store = persistentStore();
+      const local = store ? null : await keyVault.set(snapshot.provider, apiKey);
+      if (local && !local.ok) {
+        setKeyProblem(local.error ?? 'API-ключ не сохранён в локальном хранилище');
+      }
       await persistPersistent(snapshot, apiKey);
       // При сохранении ключа сразу автоматически опрашиваем API на список моделей
       if (apiKey.trim()) {
@@ -551,6 +609,13 @@ export function useAISettings() {
       const provider = (saved.provider as AIProvider) || settings.provider;
       let key = stored.keys?.[provider] ?? '';
       let problem = '';
+      if (stored.encryptionUnavailable) {
+        // Без шифрования ОС ключ лежит в файле кодированным base64: это не
+        // защита, и пользователь должен знать.
+        problem =
+          'Шифрование средствами Windows недоступно: API-ключ хранится в файле ' +
+          'без защиты. Проверьте права профиля пользователя.';
+      }
 
       // Ключ хранится в зашифрованном виде и привязан к профилю Windows.
       // После переноса portable-папки на другой компьютер он не читается —
@@ -576,15 +641,21 @@ export function useAISettings() {
           }
           return;
         }
-        problem =
+        problem = [
+          problem,
           'Ключ API сохранён на другом компьютере и не читается здесь. ' +
-          'Откройте Настройки → AI и вставьте ключ заново.';
+            'Откройте Настройки → AI и вставьте ключ заново.',
+        ]
+          .filter(Boolean)
+          .join(' ');
       }
 
       // Ключ из старого хранилища переносим в постоянное один раз.
       if (!key) {
         key = await keyVault.get(provider);
-        if (key) persistPersistent({ ...DEFAULT_AI_SETTINGS, ...saved, provider, apiKey: key }, key);
+        if (key) {
+          void persistPersistent({ ...DEFAULT_AI_SETTINGS, ...saved, provider, apiKey: key }, key);
+        }
       }
       if (cancelled) return;
       if (problem) setKeyProblem(problem);
@@ -601,7 +672,10 @@ export function useAISettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const preset = useMemo(() => PROVIDER_PRESETS[settings.provider], [settings.provider]);
+  const preset = useMemo(
+    () => PROVIDER_PRESETS[settings.provider] ?? PROVIDER_PRESETS[DEFAULT_AI_SETTINGS.provider],
+    [settings.provider]
+  );
 
   const isConfigured = useMemo(
     () => !preset.requiresKey || Boolean(providerKey),
@@ -628,10 +702,21 @@ export function useAISettings() {
    История чатов
    ============================================================ */
 
+/** Сколько диалогов держим и в состоянии, и в localStorage. */
+const SESSIONS_LIMIT = 40;
+
+function writeSessions(sessions: ChatSession[]): void {
+  try {
+    window.localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions.slice(0, SESSIONS_LIMIT)));
+  } catch {
+    // Переполнение localStorage не должно ронять чат: история останется в памяти
+  }
+}
+
 function loadSessions(): ChatSession[] {
   try {
     const raw = window.localStorage.getItem(SESSIONS_KEY);
-    if (raw) return JSON.parse(raw) as ChatSession[];
+    if (raw) return (JSON.parse(raw) as ChatSession[]).slice(0, SESSIONS_LIMIT);
   } catch {
     // игнорируем
   }
@@ -641,15 +726,23 @@ function loadSessions(): ChatSession[] {
 export function useChatSessions() {
   const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
   const [activeId, setActiveId] = useState<string>('');
+  /** Список для синхронной записи при закрытии окна. */
+  const sessionsRef = useRef<ChatSession[]>(sessions);
+  sessionsRef.current = sessions;
 
-  const persistSessions = useCallback((next: ChatSession[]) => {
-    setSessions(next);
-    try {
-      // Ограничиваем историю, чтобы не переполнить localStorage
-      window.localStorage.setItem(SESSIONS_KEY, JSON.stringify(next.slice(0, 40)));
-    } catch {
-      // игнорируем
-    }
+  // Стрим переписывает последнее сообщение десятки раз в секунду. Писать весь
+  // JSON на каждый апдейт слишком дорого, поэтому запись откладывается на
+  // секунду после последнего изменения.
+  useEffect(() => {
+    const timer = window.setTimeout(() => writeSessions(sessions), 1000);
+    return () => window.clearTimeout(timer);
+  }, [sessions]);
+
+  // Последняя порция правок не должна пропасть при закрытии окна.
+  useEffect(() => {
+    const flush = () => writeSessions(sessionsRef.current);
+    window.addEventListener('beforeunload', flush);
+    return () => window.removeEventListener('beforeunload', flush);
   }, []);
 
   const createSession = useCallback(
@@ -661,15 +754,7 @@ export function useChatSessions() {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
-      setSessions((prev) => {
-        const next = [session, ...prev];
-        try {
-          window.localStorage.setItem(SESSIONS_KEY, JSON.stringify(next.slice(0, 40)));
-        } catch {
-          // игнорируем
-        }
-        return next;
-      });
+      setSessions((prev) => [session, ...prev].slice(0, SESSIONS_LIMIT));
       setActiveId(session.id);
       return session.id;
     },
@@ -678,8 +763,8 @@ export function useChatSessions() {
 
   const updateSessionMessages = useCallback(
     (sessionId: string, messages: ChatMessage[]) => {
-      setSessions((prev) => {
-        const next = prev.map((s) =>
+      setSessions((prev) =>
+        prev.map((s) =>
           s.id === sessionId
             ? {
                 ...s,
@@ -692,38 +777,21 @@ export function useChatSessions() {
                 updatedAt: Date.now(),
               }
             : s
-        );
-        try {
-          window.localStorage.setItem(SESSIONS_KEY, JSON.stringify(next.slice(0, 40)));
-        } catch {
-          // игнорируем
-        }
-        return next;
-      });
+        )
+      );
     },
     []
   );
 
-  const deleteSession = useCallback(
-    (sessionId: string) => {
-      setSessions((prev) => {
-        const next = prev.filter((s) => s.id !== sessionId);
-        try {
-          window.localStorage.setItem(SESSIONS_KEY, JSON.stringify(next));
-        } catch {
-          // игнорируем
-        }
-        return next;
-      });
-      setActiveId((prev) => (prev === sessionId ? '' : prev));
-    },
-    []
-  );
+  const deleteSession = useCallback((sessionId: string) => {
+    setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+    setActiveId((prev) => (prev === sessionId ? '' : prev));
+  }, []);
 
   const clearAll = useCallback(() => {
-    persistSessions([]);
+    setSessions([]);
     setActiveId('');
-  }, [persistSessions]);
+  }, []);
 
   return {
     sessions,

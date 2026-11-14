@@ -10,6 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const http = require('http');
 const { registerCommonCheckIpc } = require('./common-ipc');
+const { createCheckSandbox } = require('./sandbox');
 
 
 /** Корень проекта — поиск каталога с package.json и dist/ (устойчиво к глубине). */
@@ -26,9 +27,32 @@ function resolveProjectRoot() {
   return path.join(__dirname, '..');
 }
 const ROOT = resolveProjectRoot();
-const SANDBOX = process.env.WS_CHECK_SANDBOX || path.join(os.tmpdir(), 'ws-insert-test-' + Date.now());
+const SANDBOX = process.env.WS_CHECK_SANDBOX || createCheckSandbox('insert', ROOT);
 const out: any = { steps: [], errors: [] };
-const step = (name, value) => out.steps.push({ name, ...value });
+const step = (name, value) => {
+  out.steps.push({ name, ...value });
+  try {
+    fs.writeFileSync(path.join(ROOT, 'insert-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // запись диагностики не должна ломать прогон
+  }
+};
+
+/**
+ * Необработанный reject раньше оставлял процесс висеть без результата:
+ * набор «зависал» без единой подсказки. Пишем причину в JSON и выходим.
+ */
+function failFast(error: unknown): void {
+  out.fatal = (error as Error)?.stack || String(error);
+  try {
+    fs.writeFileSync(path.join(ROOT, 'insert-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // даже диагностика может не записаться
+  }
+  app.exit(1);
+}
+process.on('unhandledRejection', failFast);
+process.on('uncaughtException', failFast);
 
 app.disableHardwareAcceleration();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -59,8 +83,25 @@ function startMock(): any {
 
 // Регистрируем прокси AI — приложение выполняет запросы через него
 
-function registerHandlers(): any {
-  registerCommonCheckIpc({ sandbox: SANDBOX });
+/**
+ * Настройки AI приходят из постоянного хранилища (aiSettings:load), а не из
+ * localStorage: приложение при старте перезаписывает localStorage данными
+ * файла, и настройки, положенные скриптом в браузер, до отправки не доживали.
+ */
+function registerHandlers(aiBaseUrl: string): any {
+  registerCommonCheckIpc({
+    sandbox: SANDBOX,
+    aiSettings: {
+      provider: 'custom',
+      baseUrl: aiBaseUrl,
+      model: 'm',
+      temperature: 0.5,
+      maxTokens: 512,
+      systemPrompt: 's',
+      activePresetId: 'general',
+    },
+    aiKeys: { custom: 'k' },
+  });
 
   ipcMain.handle('fs:getCurrentWorkspace', () => SANDBOX);
   ipcMain.handle('fs:setWorkspaceRoot', () => ({ success: true }));
@@ -102,13 +143,14 @@ function registerHandlers(): any {
 }
 
 app.whenReady().then(async () => {
-  registerHandlers();
+  // Мок-сервер нужен до регистрации обработчиков: его адрес уходит в настройки AI.
+  const mock = await startMock();
+  registerHandlers(mock.baseUrl);
   // AI-запросы идут через главный процесс (обход CORS)
   require('./aiProxy.js').registerAiProxy();
   fs.mkdirSync(SANDBOX, { recursive: true });
   fs.writeFileSync(path.join(SANDBOX, 'code.py'), 'print("start")\n', 'utf-8');
 
-  const mock = await startMock();
   const win = new BrowserWindow({
     width: 1500, height: 940, show: false,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), nodeIntegration: false, contextIsolation: true, sandbox: false },
@@ -119,21 +161,22 @@ app.whenReady().then(async () => {
     await win.loadFile(path.join(ROOT, 'dist', 'index.html'));
     await sleep(2000);
 
-    await js(`
-      localStorage.setItem('workspace_ai_settings', JSON.stringify({
-        provider: 'custom', baseUrl: ${JSON.stringify(mock.baseUrl)}, model: 'm',
-        temperature: 0.5, maxTokens: 512, systemPrompt: 's', activePresetId: 'general' }));
-      localStorage.setItem('workspace_api_keys', JSON.stringify({ custom: 'plain:k' }));
-      return true;
-    `);
+    // Настройки AI отдаёт aiSettings:load (см. registerHandlers): localStorage
+    // приложение при старте перезаписывает данными постоянного хранилища.
     await win.webContents.reload();
     await sleep(2200);
 
     /* Открываем файл, чтобы появился активный документ */
     await js(`
-      const node = [...document.querySelectorAll('div')].find(
-        d => d.textContent?.trim() === 'code.py' && d.className.includes('cursor-pointer'));
-      if (node) node.click();
+      // Строка дерева содержит размер и дату — ищем по title, открываем
+      // двойным щелчком (одиночный даёт вкладку-предпросмотр).
+      const node = [...document.querySelectorAll('[title]')].find(
+        (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'code.py'
+      );
+      if (node) {
+        node.click();
+        node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      }
       return !!node;
     `);
     await sleep(2500);
@@ -221,5 +264,5 @@ app.whenReady().then(async () => {
   mock.server.close();
   fs.writeFileSync(path.join(ROOT, 'insert-check.json'), JSON.stringify(out, null, 2), 'utf-8');
   try { fs.rmSync(SANDBOX, { recursive: true, force: true }); } catch {}
-  app.exit(0);
+  app.exit(out.errors.length > 0 ? 1 : 0);
 });

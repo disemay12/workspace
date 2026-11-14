@@ -148,9 +148,8 @@ export function planSlidesFromMarkdown(markdown: string, fallbackTitle = 'Пре
       if (level === 1) {
         const slide = ensureSlide(text);
         slide.title = text;
-      } else if (current && ((current as SlidePlan).blocks.length > 0 || (current as SlidePlan).table)) {
-        ensureSlide(text);
       } else {
+        // Обе ветки делали одно и то же — развилка была мёртвой.
         ensureSlide(text);
       }
       continue;

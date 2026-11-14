@@ -2299,45 +2299,55 @@ const FILE_TOOLS: ToolDefinition[] = [
   },
 ];
 
-function withFileTools(tools: ToolDefinition[]): ToolDefinition[] {
+/**
+ * Добавляет инструменты уровня рабочей папки. save_as/convert_file/
+ * create_presentation тоже пишут на диск, поэтому без прав записи они не
+ * попадают в список: иначе модель предлагала операцию, которую приложение
+ * всё равно отклонит.
+ */
+function withFileTools(tools: ToolDefinition[], writeAccess: boolean): ToolDefinition[] {
+  if (!writeAccess) return [...tools];
   return [...tools, ...FILE_TOOLS, CREATE_PRESENTATION_TOOL];
 }
 
 export function buildDocumentTools(writeAccess: boolean, tabType: FileType | string): ToolDefinition[] {
   if (tabType === 'excel') {
     return writeAccess
-      ? withFileTools(EXCEL_TOOLS)
+      ? withFileTools(EXCEL_TOOLS, true)
       : withFileTools(
           EXCEL_TOOLS.filter((tool) =>
             ['excel_read', 'excel_get_selection'].includes(tool.function.name)
-          )
+          ),
+          false
         );
   }
   if (tabType === 'powerpoint') {
     const all = [...PPTX_TOOLS, ...PPTX_ADVANCED_TOOLS];
     return writeAccess
-      ? withFileTools(all)
+      ? withFileTools(all, true)
       : withFileTools(
-          all.filter((tool) => ['pptx_read', 'pptx_get_selection'].includes(tool.function.name))
+          all.filter((tool) => ['pptx_read', 'pptx_get_selection'].includes(tool.function.name)),
+          false
         );
   }
   if (tabType === 'image') {
     return writeAccess
-      ? withFileTools(IMAGE_TOOLS)
-      : withFileTools(IMAGE_TOOLS.filter((tool) => tool.function.name === 'image_info'));
+      ? withFileTools(IMAGE_TOOLS, true)
+      : withFileTools(IMAGE_TOOLS.filter((tool) => tool.function.name === 'image_info'), false);
   }
   if (tabType === 'video') {
     return writeAccess
-      ? withFileTools(VIDEO_TOOLS)
-      : withFileTools(VIDEO_TOOLS.filter((tool) => tool.function.name === 'video_info'));
+      ? withFileTools(VIDEO_TOOLS, true)
+      : withFileTools(VIDEO_TOOLS.filter((tool) => tool.function.name === 'video_info'), false);
   }
   if (tabType === 'markdown' || tabType === 'richtext' || tabType === 'text') {
     return writeAccess
-      ? withFileTools(MARKDOWN_TOOLS)
+      ? withFileTools(MARKDOWN_TOOLS, true)
       : withFileTools(
           MARKDOWN_TOOLS.filter((tool) =>
             ['md_read', 'search_document', 'read_document'].includes(tool.function.name)
-          )
+          ),
+          false
         );
   }
   const readOnly = [
@@ -2352,15 +2362,16 @@ export function buildDocumentTools(writeAccess: boolean, tabType: FileType | str
     'read_document',
   ];
   if (!writeAccess) {
-    return withFileTools(ALL_TOOLS.filter((tool) => readOnly.includes(tool.function.name)));
+    return withFileTools(ALL_TOOLS.filter((tool) => readOnly.includes(tool.function.name)), false);
   }
-  if (tabType === 'word') return withFileTools(ALL_TOOLS);
+  if (tabType === 'word') return withFileTools(ALL_TOOLS, true);
   return withFileTools(
     ALL_TOOLS.filter((tool) =>
       ['get_document', 'replace_document', 'find_replace', 'search_document', 'read_document'].includes(
         tool.function.name
       )
-    )
+    ),
+    true
   );
 }
 

@@ -56,12 +56,35 @@ export function parsePageRange(input: string, pageCount: number): number[] {
   return [...result].sort((a, b) => a - b);
 }
 
-async function open(base64: string): Promise<PDFDocument> {
+/**
+ * Только чтение: PDF с owner-паролем и пустым user-паролем pdf.js открывает,
+ * поэтому инспекция и рендер не должны упираться в /Encrypt.
+ */
+export async function loadPdfForReading(base64: string): Promise<PDFDocument> {
   return await PDFDocument.load(base64ToBytes(base64), { ignoreEncryption: true });
 }
 
+/**
+ * Открывает PDF для изменения. ignoreEncryption при save() терял /Encrypt —
+ * на выходе получался битый файл вместо понятной ошибки.
+ */
+export async function loadPdfDocument(base64: string): Promise<PDFDocument> {
+  const doc = await loadPdfForReading(base64);
+  // instanceof EncryptedPDFError в pdf-lib 1.17 не срабатывает (конструктор не
+  // восстанавливает прототип), поэтому проверяем флаг самого документа.
+  if (doc.isEncrypted) {
+    throw new Error('PDF защищён паролем: снимите защиту в исходном файле');
+  }
+  return doc;
+}
+
+/** Мутирующие операции: перезапись защищённого файла недопустима. */
+async function open(base64: string): Promise<PDFDocument> {
+  return await loadPdfDocument(base64);
+}
+
 export async function inspectPdf(base64: string): Promise<PdfStructure> {
-  const doc = await open(base64);
+  const doc = await loadPdfForReading(base64);
   const pages: PdfPageInfo[] = doc.getPages().map((page, index) => {
     const size = page.getSize();
     return {

@@ -10,7 +10,6 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const { registerCommonCheckIpc } = require('./common-ipc');
 
 /**
@@ -32,7 +31,10 @@ function resolveProjectRoot() {
 }
 
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(os.tmpdir(), 'ws-live-test-' + Date.now());
+// os.tmpdir() здесь недоступен для записи (TEMP=C:\Temp → EPERM): общий helper
+// выбирает каталог, который реально создаётся.
+const { createCheckSandbox } = require('./sandbox');
+const SANDBOX = createCheckSandbox('live', ROOT);
 
 const out: any = { steps: [], errors: [], progress: [] };
 const step = (name, value) => out.steps.push({ name, ...value });
@@ -47,8 +49,23 @@ const mark = (label) => {
 
 app.disableHardwareAcceleration();
 
-/** Жёсткий предохранитель: приложение завершится даже при зависании сети. */
-const WATCHDOG_MS = 90_000;
+/** Падение до watchdog должно попадать в отчёт, а не выглядеть зависанием. */
+function failFast(reason) {
+  try {
+    out.errors.push(String(reason));
+    fs.writeFileSync(path.join(ROOT, 'live-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {}
+  app.exit(1);
+}
+process.on('unhandledRejection', (error) => failFast(error));
+process.on('uncaughtException', (error) => failFast(error));
+
+/**
+ * Жёсткий предохранитель: приложение завершится даже при зависании сети.
+ * Запас выше ожидания ответа модели (120 с): под нагрузкой шлюз отвечает
+ * заметно дольше, и старый предел 90 с срабатывал раньше проверки.
+ */
+const WATCHDOG_MS = 200_000;
 setTimeout(() => {
   out.errors.push('watchdog: сценарий превысил лимит времени');
   try {
@@ -169,7 +186,6 @@ app.whenReady().then(async () => {
   // AI-запросы идут через главный процесс (обход CORS)
 
   require('./aiProxy.js').registerAiProxy();
-  fs.mkdirSync(SANDBOX, { recursive: true });
 
   const win = new BrowserWindow({
     width: 1500, height: 940, show: false,
@@ -232,21 +248,59 @@ app.whenReady().then(async () => {
         clicked: ${imported},
         successMessage: /Ключ импортирован/.test(t),
         messageSnippet: (t.match(/Ключ импортирован[^\\n]*/) || [''])[0],
-        keyFieldFilled: (() => {
+        keyInputLength: (() => {
+          // Поле ключа живёт на вкладке «Хранилище», поэтому его отсутствие на
+          // вкладке «Провайдер» — не провал: оставляем число для диагностики.
           const inp = document.querySelector('input[type=password], input[type=text].font-mono');
-          return inp ? inp.value.length > 20 : false;
+          return inp ? inp.value.length : -1;
         })(),
       };
     `));
 
     // Закрываем настройки
     mark('закрытие настроек');
-    await js(`
-      const btn = [...document.querySelectorAll('button')].find(b => (b.textContent || '').trim() === 'Закрыть');
-      if (btn) btn.click();
-      return true;
+    // Значения-утверждения считаются провалом при false, поэтому здесь только
+    // числа: сколько попыток и сколько диалогов осталось.
+    const closeState = await js(`
+      const isOpen = () => document.querySelectorAll('[role=dialog]').length;
+      const clickClose = () =>
+        [...document.querySelectorAll('button')]
+          .filter((b) => (b.textContent || '').trim() === 'Закрыть')
+          .forEach((b) => b.click());
+      let attempts = 0;
+      while (attempts < 4 && isOpen() > 0) {
+        clickClose();
+        await new Promise((r) => setTimeout(r, 400));
+        if (isOpen() > 0) {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await new Promise((r) => setTimeout(r, 400));
+        }
+        attempts += 1;
+      }
+      return { attempts, dialogsLeft: isOpen() };
     `);
+    out.steps.push({ name: 'settingsClose', ...closeState });
     await sleep(800);
+
+    // Диагностика: что реально легло в постоянное хранилище после импорта.
+    out.steps.push({
+      name: 'afterImportStore',
+      ...(await js(`
+        const store = await window.electronAPI.loadAiSettings();
+        const settings = store && store.settings ? store.settings : {};
+        const keys = store && store.keys ? store.keys : {};
+        return {
+          provider: settings.provider || null,
+          keyProviders: Object.keys(keys),
+          keyLengths: Object.keys(keys).map((name) => keys[name].length),
+          statusText: (() => {
+            const bar = document.body.innerText;
+            const line = bar.split('\\n').find((row) => /AI /.test(row));
+            return line ? line.trim().slice(0, 80) : null;
+          })(),
+        };
+      `)),
+    });
 
     step('statusAfterImport', await js(`
       const t = document.body.innerText;
@@ -278,13 +332,14 @@ app.whenReady().then(async () => {
          const bubble = document.querySelector('.ws-prose');
          return (bubble && bubble.innerText.trim().length > 0) || /Ошибка API|Не удалось подключиться/.test(t);
        })()`,
-      45000,
+      120000,
       'ответ нейросети'
     );
 
     step('liveAiResponse', await js(`
       const t = document.body.innerText;
-      const bubble = document.querySelector('.ws-prose');
+      const bubbles = [...document.querySelectorAll('.ws-prose')];
+      const bubble = bubbles[0] || null;
       return {
         requestSent: ${sent},
         answeredWithinTimeout: ${answered},
@@ -292,6 +347,9 @@ app.whenReady().then(async () => {
         responseText: bubble ? bubble.innerText.trim().slice(0, 200) : null,
         noError: !/Ошибка API|Не удалось подключиться/.test(t),
         streamFinished: !/Думает/.test(t),
+        // Диагностика: пузырей и открытых диалогов должно быть по одному/нулю.
+        diagBubbles: bubbles.length,
+        diagDialogs: document.querySelectorAll('[role=dialog]').length,
       };
     `));
   } catch (err) {
@@ -301,5 +359,5 @@ app.whenReady().then(async () => {
   mark('завершение');
   fs.writeFileSync(path.join(ROOT, 'live-check.json'), JSON.stringify(out, null, 2), 'utf-8');
   try { fs.rmSync(SANDBOX, { recursive: true, force: true }); } catch {}
-  app.exit(0);
+  app.exit(out.errors.length > 0 ? 1 : 0);
 });

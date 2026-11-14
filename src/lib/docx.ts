@@ -158,6 +158,9 @@ const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types';
 const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+// Цель ссылки Word хранит не в самом документе, а в rels: <w:hyperlink r:id>
+// без отношения открывается как «битая ссылка».
+const HYPERLINK_REL = `${R_NS}/hyperlink`;
 
 const HIGHLIGHTS: Record<string, string> = {
   yellow: '#fef08a',
@@ -178,6 +181,17 @@ const HIGHLIGHTS: Record<string, string> = {
   white: '#ffffff',
 };
 
+/**
+ * Пакет не разбирается: вызывающий обязан показать ошибку, а не «восстановить»
+ * документ из текста — base64 от ZIP проходил как текст и затирал файл.
+ */
+export class DocxCorruptError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DocxCorruptError';
+  }
+}
+
 /** Читает .docx (base64) и возвращает HTML с сохранёнными шрифтом, кеглем и цветом. */
 export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
   const zip = await JSZip.loadAsync(base64ToBytes(base64));
@@ -194,6 +208,11 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
   ]);
 
   const doc = parseXml(docXml);
+  // Без этой проверки битый XML давал {html:'<p></p>'} и редактор сохранял
+  // поверх файла пустой документ.
+  if (doc.getElementsByTagName('parsererror').length > 0) {
+    throw new DocxCorruptError('word/document.xml повреждён: файл не разбирается как XML');
+  }
   const rels = relsXml ? parseXml(relsXml) : null;
   const numbering = numberingXml ? parseXml(numberingXml) : null;
   const styles = stylesDoc ? parseXml(stylesDoc) : null;
@@ -203,11 +222,13 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
   registerStylesFromXml(styles);
 
   const images = await readImages(zip, rels);
+  const links = readHyperlinks(rels);
   const listKinds = readListKinds(numbering);
   const listLevelKinds = readListLevelKinds(numbering);
 
   const body = firstByLocal(doc, 'body');
-  if (!body) return { html: '<p></p>', warnings: ['Документ пуст'], blocks: [] };
+  // Без body сохранение падало на отсутствии раздела и уходило в тихий fallback.
+  if (!body) throw new DocxCorruptError('В word/document.xml нет w:body');
 
   interface PendingList {
     items: PendingListItem[];
@@ -245,7 +266,7 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
         pendingList.items.push({
           level: info.level,
           kind,
-          inner: await paragraphInner(child, images),
+          inner: await paragraphInner(child, images, links),
           style: listItemStyle(child),
           xml: serializeXml(child),
         });
@@ -253,7 +274,7 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
       }
       flushList();
       rendered.push({
-        html: renderParagraph(child, await paragraphInner(child, images)),
+        html: renderParagraph(child, await paragraphInner(child, images, links)),
         xml: pendingMarkers + serializeXml(child),
       });
       pendingMarkers = '';
@@ -263,7 +284,7 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
     if (name === 'tbl') {
       flushList();
       rendered.push({
-        html: await renderTable(child, images),
+        html: await renderTable(child, images, links),
         xml: pendingMarkers + serializeXml(child),
       });
       pendingMarkers = '';
@@ -357,6 +378,9 @@ const MARKER_ELEMENTS = new Set([
   'commentRangeEnd',
   'proofErr',
 ]);
+
+/** Контейнеры внутри w:hyperlink: раны в них — не прямые дети ссылки. */
+const HYPERLINK_CONTAINERS = new Set(['smartTag', 'ins', 'sdt', 'sdtContent', 'customXml']);
 
 /** Заглушка для объектов, которые сохраняются без редактирования. */
 function readOnlyPlaceholder(name: string): string {
@@ -456,13 +480,9 @@ export async function htmlToDocxBase64(
   container.innerHTML = html && html.trim() ? html : '<p></p>';
 
   if (options?.sourceBase64) {
-    try {
-      return await patchDocxPackage(container, page, options);
-    } catch (err) {
-      // Повреждённый или чужой пакет не должен блокировать сохранение:
-      // собираем документ заново, но сообщаем об этом в консоль.
-      console.warn('docx: сохранение поверх исходного пакета не удалось', err);
-    }
+    // Исходный пакет — единственный источник media, колонтитулов и styles:
+    // пересборка с нуля их теряла, поэтому ошибку отдаём вызывающему.
+    return await patchDocxPackage(container, page, options);
   }
 
   return buildDocxFromScratch(container, page);
@@ -557,11 +577,25 @@ async function buildDocxFromScratch(container: HTMLElement, page?: PageSetup): P
   const images = new Map<string, ImageEntry>();
   let imageCounter = 0;
   const annotations = collectAnnotations(container);
+  // Цель ссылки → r:id: одна цель — одно отношение, без дублей в rels.
+  const links = new Map<string, string>();
+  const hyperlinkId: HyperlinkId = (target) => {
+    const existing = links.get(target);
+    if (existing) return existing;
+    const id = `rIdLink${links.size + 1}`;
+    links.set(target, id);
+    return id;
+  };
 
-  const bodyXml = renderChildren(container, images, () => {
-    imageCounter += 1;
-    return 'rId' + (imageCounter + 1);
-  });
+  const bodyXml = renderChildren(
+    container,
+    images,
+    () => {
+      imageCounter += 1;
+      return 'rId' + (imageCounter + 1);
+    },
+    hyperlinkId
+  );
 
   const zip = new JSZip();
   zip.file(
@@ -582,7 +616,8 @@ async function buildDocxFromScratch(container: HTMLElement, page?: PageSetup): P
     documentRelsXml(
       images,
       annotations.comments.length > 0,
-      annotations.footnotes.length > 0
+      annotations.footnotes.length > 0,
+      links
     )
   );
   if (annotations.comments.length > 0) {
@@ -888,6 +923,8 @@ async function patchDocxPackage(
   const images = new Map<string, ImageEntry>();
   const usedIds = new Set<string>();
   let relsXml = (await zip.file('word/_rels/document.xml.rels')?.async('string')) ?? '';
+  /** Цель ссылки → r:id: старые отношения переиспользуем, чтобы rels не рос. */
+  const linkIds = new Map<string, string>();
   if (relsXml) {
     const rels = parseXml(relsXml);
     for (const rel of elementsByLocal(rels, 'Relationship')) {
@@ -896,6 +933,10 @@ async function patchDocxPackage(
       usedIds.add(id);
       const type = rel.getAttribute('Type') ?? '';
       const target = rel.getAttribute('Target') ?? '';
+      if (type.endsWith('/hyperlink') && target) {
+        linkIds.set(target, id);
+        continue;
+      }
       if (!type.endsWith('/image') || !target) continue;
       const path = target.startsWith('/') ? target.slice(1) : `word/${target.replace(/^\.\.\//, '')}`;
       const file = zip.file(path) ?? zip.file(decodeURIComponent(path));
@@ -920,6 +961,26 @@ async function patchDocxPackage(
     return id;
   };
 
+  const pendingLinks: Array<{ id: string; target: string }> = [];
+  let linkSeq = 1;
+  /**
+   * r:id для внешней ссылки: подходящее отношение переиспользуем, иначе
+   * выдаём новый rId. Сами отношения дописываем в rels один раз — после
+   * обхода полотна, чтобы не править XML пакета на каждом блоке.
+   */
+  const hyperlinkId: HyperlinkId = (target) => {
+    const existing = linkIds.get(target);
+    if (existing) return existing;
+    let id = '';
+    do {
+      id = `rIdLink${linkSeq++}`;
+    } while (usedIds.has(id));
+    usedIds.add(id);
+    linkIds.set(target, id);
+    pendingLinks.push({ id, target });
+    return id;
+  };
+
   const blocks = options.blockXml ?? new Map<string, string>();
   const usedBlocks = new Set<string>();
   const bodyParts: string[] = [];
@@ -932,7 +993,7 @@ async function patchDocxPackage(
       if ((node.textContent ?? '').trim()) {
         unchanged = false;
         strayText = true;
-        bodyParts.push(paragraphXml(runsFromInline(node, {}, images, nextId), {}));
+        bodyParts.push(paragraphXml(runsFromInline(node, {}, images, nextId, hyperlinkId), {}));
       }
       continue;
     }
@@ -951,7 +1012,7 @@ async function patchDocxPackage(
     }
 
     unchanged = false;
-    bodyParts.push(renderBlockElement(element, images, nextId));
+    bodyParts.push(renderBlockElement(element, images, nextId, hyperlinkId));
   }
 
   const orderUnchanged = ids.every((id, index) => id === `d${index + 1}`);
@@ -960,6 +1021,8 @@ async function patchDocxPackage(
     !strayText &&
     orderUnchanged &&
     !pageChanged &&
+    // Правка только колонтитула не меняет тело — иначе она молча терялась.
+    !options.headerFooterEdits?.length &&
     usedBlocks.size === blocks.size &&
     container.children.length === blocks.size
   ) {
@@ -985,12 +1048,24 @@ async function patchDocxPackage(
   let nextDocumentXml =
     docXml.slice(0, innerStart) + bodyParts.join('') + sectPrXml + docXml.slice(closeIndex);
 
+  if (pendingLinks.length > 0) nextDocumentXml = ensureRelationshipsNamespace(nextDocumentXml);
+
   if (options.headerFooterEdits?.length) {
     nextDocumentXml = await editHeaderFooterParts(
       zip,
       nextDocumentXml,
       options.headerFooterEdits
     );
+    // Правка колонтитула пишет rels сама: перечитываем, иначе запись ниже
+    // затрёт новые отношения устаревшей копией.
+    const editedRels = await zip.file('word/_rels/document.xml.rels')?.async('string');
+    if (editedRels) relsXml = editedRels;
+  }
+  // Ссылки появляются только при пересборке блоков, поэтому их отношения
+  // дописываем один раз здесь, уже поверх актуального rels.
+  for (const link of pendingLinks) {
+    relsXml = ensureDocumentRelationship(relsXml, link.id, HYPERLINK_REL, link.target, true);
+    relsDirty = true;
   }
   zip.file('word/document.xml', nextDocumentXml);
 
@@ -1124,11 +1199,12 @@ function serializeXml(element: Element): string {
 function renderBlockElement(
   element: Element,
   images: Map<string, ImageEntry>,
-  nextId: () => string
+  nextId: () => string,
+  hyperlinkId: HyperlinkId
 ): string {
   const wrapper = document.createElement('div');
   wrapper.appendChild(element.cloneNode(true));
-  return renderChildren(wrapper, images, nextId);
+  return renderChildren(wrapper, images, nextId, hyperlinkId);
 }
 
 /* ----------------------------------------------------- оформление страницы */
@@ -1372,7 +1448,9 @@ function ensureDocumentRelationship(
   xml: string,
   preferredId: string,
   type: string,
-  target: string
+  target: string,
+  /** Внешняя цель: без TargetMode Word ищет её внутри пакета. */
+  external = false
 ): string {
   let id = preferredId;
   let index = 1;
@@ -1380,7 +1458,8 @@ function ensureDocumentRelationship(
     id = `${preferredId}${index}`;
     index += 1;
   }
-  const entry = `<Relationship Id="${id}" Type="${type}" Target="${target}"/>`;
+  const targetMode = external ? ' TargetMode="External"' : '';
+  const entry = `<Relationship Id="${id}" Type="${type}" Target="${escapeAttr(target)}"${targetMode}/>`;
   if (!xml) {
     return (
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
@@ -1388,6 +1467,20 @@ function ensureDocumentRelationship(
     );
   }
   return xml.replace('</Relationships>', `${entry}</Relationships>`);
+}
+
+/**
+ * r:id требует объявленного xmlns:r на корне документа: не-Word пакеты
+ * объявляют его только локально, и Word считает такой файл повреждённым.
+ */
+function ensureRelationshipsNamespace(xml: string): string {
+  const root = /<w:document\b[^>]*>/.exec(xml);
+  // Молчаливый no-op оставлял <w:hyperlink r:id> без xmlns:r — Word ругался
+  // на повреждение, файл сохранялся «успешно».
+  if (!root) throw new Error('Не найден корневой w:document: xmlns:r добавить некуда');
+  if (/xmlns:r\s*=/.test(root[0])) return xml;
+  const patched = root[0].replace('<w:document', `<w:document xmlns:r="${R_NS}"`);
+  return xml.slice(0, root.index) + patched + xml.slice(root.index + root[0].length);
 }
 
 async function readImages(zip: JSZip, rels: Document | null): Promise<Map<string, string>> {
@@ -1412,6 +1505,22 @@ async function readImages(zip: JSZip, rels: Document | null): Promise<Map<string
     })
   );
   return images;
+}
+
+/**
+ * Цели гиперссылок по r:id из word/_rels/document.xml.rels. Раньше href
+ * всегда был '#', поэтому при правке блока <a> ссылка исчезала.
+ */
+function readHyperlinks(rels: Document | null): Map<string, string> {
+  const links = new Map<string, string>();
+  if (!rels) return links;
+  for (const rel of elementsByLocal(rels, 'Relationship')) {
+    const id = rel.getAttribute('Id');
+    const target = rel.getAttribute('Target');
+    const type = rel.getAttribute('Type') ?? '';
+    if (id && target && type.endsWith('/hyperlink')) links.set(id, target);
+  }
+  return links;
 }
 
 function readListKinds(numbering: Document | null): Map<string, 'ul' | 'ol'> {
@@ -1614,16 +1723,22 @@ function headingTag(style: string): string {
   return 'p';
 }
 
-async function paragraphInner(p: Element, images: Map<string, string>): Promise<string> {
+async function paragraphInner(
+  p: Element,
+  images: Map<string, string>,
+  links: Map<string, string>
+): Promise<string> {
   let html = '';
   for (const child of childElements(p)) {
     const name = localName(child);
     if (name === 'r') html += renderRun(child, images);
     else if (name === 'hyperlink') {
-      const href = '#';
-      let inner = '';
-      for (const run of elementsByLocal(child, 'r')) inner += renderRun(run, images);
-      html += `<a href="${escapeAttr(href)}">${inner}</a>`;
+      const relId = child.getAttribute('r:id') ?? child.getAttributeNS(R_NS, 'id') ?? '';
+      const anchor = attr(child, 'anchor');
+      // Цель берём из rels: без этого ссылка превращалась в href="#".
+      const href = links.get(relId) || (anchor ? `#${anchor}` : '');
+      const inner = hyperlinkInner(child, images);
+      html += href ? `<a href="${escapeAttr(href)}">${inner}</a>` : inner;
     } else if (name === 'commentRangeStart') {
       const id = Number(attr(child, 'id'));
       const info = currentComments.get(id);
@@ -1650,6 +1765,17 @@ async function paragraphInner(p: Element, images: Map<string, string>): Promise<
           ? `<span data-field="${fieldKind}">${inner || '1'}</span>`
           : inner;
     }
+  }
+  return html;
+}
+
+/** Раны ссылки, в том числе внутри w:smartTag/w:ins/w:sdtContent. */
+function hyperlinkInner(node: Element, images: Map<string, string>): string {
+  let html = '';
+  for (const child of childElements(node)) {
+    const name = localName(child);
+    if (name === 'r') html += renderRun(child, images);
+    else if (HYPERLINK_CONTAINERS.has(name)) html += hyperlinkInner(child, images);
   }
   return html;
 }
@@ -1716,18 +1842,107 @@ function wrapRun(text: string, rPr: Element | null): string {
   return `<span style="${styles.join(';')}">${html}</span>`;
 }
 
-async function renderTable(tbl: Element, images: Map<string, string>): Promise<string> {
-  const rows: string[] = [];
-  for (const tr of elementsByLocal(tbl, 'tr')) {
-    const cells: string[] = [];
-    for (const tc of elementsByLocal(tr, 'tc')) {
-      const paras: string[] = [];
-      for (const p of elementsByLocal(tc, 'p')) paras.push(await paragraphInner(p, images));
-      cells.push(`<td>${paras.join('<br>')}</td>`);
+interface DocxTableCell {
+  html: string;
+  colSpan: number;
+  /** '' — обычная ячейка, 'restart' — начало вертикального объединения, 'continue' — продолжение. */
+  vMerge: string;
+  /** Стартовый столбец: по нему ищем продолжения объединения в следующих строках. */
+  col: number;
+  rowSpan: number;
+  /** Ячейку закрывает rowspan предыдущей строки — не выводим. */
+  covered: boolean;
+}
+
+/** Строки таблицы: прямые w:tr плюс строки внутри w:sdt/w:sdtContent и w:customXml. */
+function collectTableRows(node: Element, out: Element[]): void {
+  for (const child of childElements(node)) {
+    const name = localName(child);
+    if (name === 'tr') out.push(child);
+    else if (name === 'sdt' || name === 'sdtContent' || name === 'customXml') {
+      collectTableRows(child, out);
     }
-    rows.push(`<tr>${cells.join('')}</tr>`);
   }
-  return `<table>${rows.join('')}</table>`;
+}
+
+async function renderTable(
+  tbl: Element,
+  images: Map<string, string>,
+  links: Map<string, string>
+): Promise<string> {
+  const rows: DocxTableCell[][] = [];
+  // Только свои строки: elementsByLocal затягивал строки вложенной таблицы,
+  // а строки внутри w:sdt/w:customXml наоборот исчезали.
+  const rowElements: Element[] = [];
+  collectTableRows(tbl, rowElements);
+  for (const tr of rowElements) {
+    const cells: DocxTableCell[] = [];
+    // gridBefore: строка начинается не с первой колонки, объединения считаются от неё.
+    let col =
+      Math.max(0, Number(attr(childByLocal(childByLocal(tr, 'trPr'), 'gridBefore'), 'val')) || 0);
+    for (const tc of childElements(tr)) {
+      if (localName(tc) !== 'tc') continue;
+      // Только прямой tcPr: у ячейки с вложенной таблицей читался её tcPr.
+      const tcPr = childByLocal(tc, 'tcPr');
+      const colSpan = Math.max(1, Number(attr(firstByLocal(tcPr, 'gridSpan'), 'val')) || 1);
+      const vMergeNode = firstByLocal(tcPr, 'vMerge');
+      // <w:vMerge/> без val — продолжение объединения сверху.
+      const vMerge = vMergeNode ? attr(vMergeNode, 'val') || 'continue' : '';
+      const parts: string[] = [];
+      for (const child of childElements(tc)) {
+        const name = localName(child);
+        if (name === 'p') parts.push(await paragraphInner(child, images, links));
+        else if (name === 'tbl') parts.push(await renderTable(child, images, links));
+        else if (name === 'sdt') {
+          for (const inner of childElements(child)) {
+            if (localName(inner) === 'sdtContent') {
+              for (const node of childElements(inner)) {
+                if (localName(node) === 'p') parts.push(await paragraphInner(node, images, links));
+                else if (localName(node) === 'tbl') parts.push(await renderTable(node, images, links));
+              }
+            }
+          }
+        }
+      }
+      cells.push({
+        html: parts.join('<br>'),
+        colSpan,
+        vMerge,
+        col,
+        rowSpan: 1,
+        covered: false,
+      });
+      col += colSpan;
+    }
+    rows.push(cells);
+  }
+
+  // Высоту объединения считаем по продолжениям ниже в том же столбце.
+  rows.forEach((cells, r) => {
+    for (const cell of cells) {
+      if (cell.vMerge !== 'restart') continue;
+      for (let k = r + 1; k < rows.length; k += 1) {
+        const below = rows[k].find((item) => item.col === cell.col && item.vMerge === 'continue');
+        if (!below) break;
+        below.covered = true;
+        cell.rowSpan += 1;
+      }
+    }
+  });
+
+  const html = rows
+    .map((cells) => {
+      const rendered = cells
+        .filter((cell) => !cell.covered)
+        .map((cell) => {
+          const colspan = cell.colSpan > 1 ? ` colspan="${cell.colSpan}"` : '';
+          const rowspan = cell.rowSpan > 1 ? ` rowspan="${cell.rowSpan}"` : '';
+          return `<td${colspan}${rowspan}>${cell.html}</td>`;
+        });
+      return `<tr>${rendered.join('')}</tr>`;
+    })
+    .join('');
+  return `<table>${html}</table>`;
 }
 
 /* --------------------------------------------------------------- запись */
@@ -1739,23 +1954,21 @@ interface ImageEntry {
   ext: string;
 }
 
+/** Выдаёт r:id отношения для цели ссылки, заводя отношение при первом обращении. */
+type HyperlinkId = (target: string) => string;
+
 function renderChildren(
   parent: Node,
   images: Map<string, ImageEntry>,
-  nextId: () => string
+  nextId: () => string,
+  hyperlinkId: HyperlinkId
 ): string {
   let xml = '';
-  let list: 'ul' | 'ol' | null = null;
-
-  const closeList = () => {
-    list = null;
-  };
 
   for (const node of [...parent.childNodes]) {
     if (node.nodeType === Node.TEXT_NODE) {
       if ((node.textContent ?? '').trim()) {
-        closeList();
-        xml += paragraphXml(runsFromInline(node, {}, images, nextId), {});
+        xml += paragraphXml(runsFromInline(node, {}, images, nextId, hyperlinkId), {});
       }
       continue;
     }
@@ -1763,19 +1976,16 @@ function renderChildren(
     const tag = node.tagName.toLowerCase();
 
     if (tag === 'ul' || tag === 'ol') {
-      closeList();
-      xml += emitListXml(node, 0, tag, images, nextId);
+      xml += emitListXml(node, 0, tag, images, nextId, hyperlinkId);
       continue;
     }
 
     if (tag === 'table') {
-      closeList();
-      xml += tableXml(node, images, nextId);
+      xml += tableXml(node, images, nextId, hyperlinkId);
       continue;
     }
 
     if (tag === 'br') {
-      closeList();
       xml += paragraphXml(
         (node as Element).hasAttribute('data-page-break')
           ? '<w:r><w:br w:type="page"/></w:r>'
@@ -1786,16 +1996,14 @@ function renderChildren(
     }
 
     if (node.getAttribute('data-field') === 'TOC') {
-      closeList();
       xml += tocParagraphXml(node);
       continue;
     }
 
-    closeList();
     const align = readAlign(node);
     const namedStyle = node.getAttribute('data-style') || undefined;
     const style = namedStyle || blockStyle(tag);
-    xml += paragraphXml(runsFromInline(node, {}, images, nextId), {
+    xml += paragraphXml(runsFromInline(node, {}, images, nextId, hyperlinkId), {
       align,
       style,
       namedStyle,
@@ -1813,7 +2021,8 @@ function emitListXml(
   level: number,
   kind: 'ul' | 'ol',
   images: Map<string, ImageEntry>,
-  nextId: () => string
+  nextId: () => string,
+  hyperlinkId: HyperlinkId
 ): string {
   let xml = '';
   for (const item of [...list.children]) {
@@ -1824,7 +2033,7 @@ function emitListXml(
         const tag = child.tagName.toLowerCase();
         if (tag === 'ul' || tag === 'ol') continue;
       }
-      runs += runsFromInline(child, {}, images, nextId);
+      runs += runsFromInline(child, {}, images, nextId, hyperlinkId);
     }
     xml += paragraphXml(runs, {
       list: kind,
@@ -1842,7 +2051,8 @@ function emitListXml(
           Math.min(level + 1, 8),
           tag,
           images,
-          nextId
+          nextId,
+          hyperlinkId
         );
       }
     }
@@ -2082,7 +2292,8 @@ function runsFromInline(
   node: Node,
   style: RunStyle,
   images: Map<string, ImageEntry>,
-  nextId: () => string
+  nextId: () => string,
+  hyperlinkId: HyperlinkId
 ): string {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent ?? '';
@@ -2097,7 +2308,7 @@ function runsFromInline(
   if (node.hasAttribute('data-comment-id') && Number.isFinite(commentId)) {
     let inner = '';
     for (const child of [...node.childNodes]) {
-      inner += runsFromInline(child, style, images, nextId);
+      inner += runsFromInline(child, style, images, nextId, hyperlinkId);
     }
     return (
       `<w:commentRangeStart w:id="${commentId}"/>${inner}` +
@@ -2109,7 +2320,7 @@ function runsFromInline(
   if (node.hasAttribute('data-footnote-id') && Number.isFinite(footnoteId)) {
     let inner = '';
     for (const child of [...node.childNodes]) {
-      inner += runsFromInline(child, style, images, nextId);
+      inner += runsFromInline(child, style, images, nextId, hyperlinkId);
     }
     return (
       `${inner}<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr>` +
@@ -2121,7 +2332,7 @@ function runsFromInline(
     const id = bookmarkId(bookmark);
     let inner = '';
     for (const child of [...node.childNodes]) {
-      inner += runsFromInline(child, style, images, nextId);
+      inner += runsFromInline(child, style, images, nextId, hyperlinkId);
     }
     return `<w:bookmarkStart w:id="${id}" w:name="${escapeXml(bookmark)}"/>${inner}<w:bookmarkEnd w:id="${id}"/>`;
   }
@@ -2151,15 +2362,23 @@ function runsFromInline(
     const href = node.getAttribute('href') ?? '';
     let inner = '';
     for (const child of [...node.childNodes]) {
-      inner += runsFromInline(child, style, images, nextId);
+      inner += runsFromInline(child, style, images, nextId, hyperlinkId);
     }
-    if (!href || !/^(https?:\/\/|mailto:|tel:)/i.test(href)) return inner;
-    return `<w:fldSimple w:instr="HYPERLINK &quot;${escapeXml(href)}&quot;">${inner}</w:fldSimple>`;
+    if (!href) return inner;
+    // Закладка внутри документа: цель живёт в самом w:hyperlink, отношение не нужно.
+    if (href.startsWith('#')) {
+      const anchor = href.slice(1);
+      return anchor ? `<w:hyperlink w:anchor="${escapeXml(anchor)}">${inner}</w:hyperlink>` : inner;
+    }
+    if (!/^(https?:\/\/|mailto:|tel:)/i.test(href)) return inner;
+    // Раньше ссылка уходила в поле HYPERLINK: при правке абзаца Word
+    // пересобирал поле и <w:hyperlink> исходника терялся вместе с r:id.
+    return `<w:hyperlink r:id="${hyperlinkId(href)}">${inner}</w:hyperlink>`;
   }
 
   const next: RunStyle = { ...style, ...styleFromElement(node) };
   let xml = '';
-  for (const child of [...node.childNodes]) xml += runsFromInline(child, next, images, nextId);
+  for (const child of [...node.childNodes]) xml += runsFromInline(child, next, images, nextId, hyperlinkId);
   return xml;
 }
 
@@ -2254,14 +2473,61 @@ function imageRunXml(id: string, widthPx = 576, heightPx = 336, alt = ''): strin
   );
 }
 
-function tableXml(table: Element, images: Map<string, ImageEntry>, nextId: () => string): string {
-  const rows: string[] = [];
-  for (const tr of [...table.querySelectorAll(':scope > tbody > tr, :scope > tr')]) {
-    const cells: string[] = [];
+function tableXml(
+  table: Element,
+  images: Map<string, ImageEntry>,
+  nextId: () => string,
+  hyperlinkId: HyperlinkId
+): string {
+  // thead/tfoot тоже показывают строки: селектор без них терял шапку таблицы.
+  const rowElements = [
+    ...table.querySelectorAll(':scope > :is(thead,tbody,tfoot) > tr, :scope > tr'),
+  ];
+  // В HTML продолжений rowspan нет — позиции колонок восстанавливаем здесь,
+  // иначе Word покажет разорванную сетку вместо вертикального объединения.
+  const continuations: Array<Array<{ col: number; colspan: number }>> = rowElements.map(() => []);
+  const covered: Array<Set<number>> = rowElements.map(() => new Set<number>());
+  const placed = rowElements.map((tr, row) => {
+    const own: Array<{ element: Element; col: number; colspan: number; rowspan: number }> = [];
+    let col = 0;
+    // Только прямые ячейки строки: ячейки вложенной таблицы сюда не попадают.
     for (const tc of [...tr.querySelectorAll(':scope > td, :scope > th')]) {
-      const isHeader = tc.tagName.toLowerCase() === 'th';
-      const runs = runsFromInline(tc, isHeader ? { bold: true } : {}, images, nextId);
+      // Колонки, уже занятые объединением сверху, пропускаем.
+      while (covered[row].has(col)) col += 1;
       const colspan = Math.max(1, Number(tc.getAttribute('colspan') || 1));
+      const rowspan = Math.max(1, Number(tc.getAttribute('rowspan') || 1));
+      own.push({ element: tc, col, colspan, rowspan });
+      for (let k = 1; k < rowspan && row + k < rowElements.length; k += 1) {
+        continuations[row + k].push({ col, colspan });
+        for (let c = col; c < col + colspan; c += 1) covered[row + k].add(c);
+      }
+      col += colspan;
+    }
+    return own;
+  });
+
+  const rows: string[] = [];
+  for (let row = 0; row < rowElements.length; row += 1) {
+    // Продолжения сверху и свои ячейки идут вперемешку — по порядку колонок.
+    const slots: Array<{ col: number; colspan: number; element?: Element; rowspan?: number }> = [
+      ...continuations[row],
+      ...placed[row],
+    ].sort((a, b) => a.col - b.col);
+
+    const cells: string[] = [];
+    for (const { element: tc, colspan, rowspan } of slots) {
+      if (!tc) {
+        // Содержимое принадлежит ячейке сверху: здесь только vMerge. Пустой
+        // w:p оставляем — с пустым w:tc Word переписывает файл при открытии.
+        cells.push(
+          '<w:tc><w:tcPr>' +
+            (colspan > 1 ? `<w:gridSpan w:val="${colspan}"/>` : '') +
+            '<w:vMerge/></w:tcPr><w:p/></w:tc>'
+        );
+        continue;
+      }
+      const isHeader = tc.tagName.toLowerCase() === 'th';
+      const runs = runsFromInline(tc, isHeader ? { bold: true } : {}, images, nextId, hyperlinkId);
       const background = cssColorToHex(cssValue(tc.getAttribute('style') ?? '', 'background-color'));
       const widthPt = cssLengthToPt(cssValue(tc.getAttribute('style') ?? '', 'width'));
       const widthTwips = widthPt ? Math.round(widthPt * 20) : 0;
@@ -2270,6 +2536,8 @@ function tableXml(table: Element, images: Map<string, ImageEntry>, nextId: () =>
       const props =
         `<w:tcPr><w:tcW w:w="${widthTwips}" w:type="${widthTwips ? 'dxa' : 'auto'}"/>` +
         (colspan > 1 ? `<w:gridSpan w:val="${colspan}"/>` : '') +
+        // Начало объединения вниз: строки ниже получат w:vMerge без значения.
+        ((rowspan ?? 1) > 1 ? '<w:vMerge w:val="restart"/>' : '') +
         (background
           ? `<w:shd w:val="clear" w:color="auto" w:fill="${background}"/>`
           : isHeader
@@ -2312,10 +2580,25 @@ function tableXml(table: Element, images: Map<string, ImageEntry>, nextId: () =>
   );
 }
 
+/** src → запись: перебор всех изображений на каждый <img> был O(n²) по base64. */
+const imagesBySrc = new WeakMap<Map<string, ImageEntry>, Map<string, ImageEntry>>();
+
+function imageSrc(image: ImageEntry): string {
+  return `data:${image.contentType};base64,${bytesToBase64(image.bytes)}`;
+}
+
 function takeImage(src: string, images: Map<string, ImageEntry>, nextId: () => string): ImageEntry | null {
   const match = src.match(/^data:([^;]+);base64,(.+)$/);
   if (!match) return null;
-  const existing = [...images.values()].find((image) => image.bytes.length > 0 && `data:${image.contentType};base64,` + bytesToBase64(image.bytes) === src);
+  let cache = imagesBySrc.get(images);
+  if (!cache) {
+    cache = new Map<string, ImageEntry>();
+    for (const image of images.values()) {
+      if (image.bytes.length > 0) cache.set(imageSrc(image), image);
+    }
+    imagesBySrc.set(images, cache);
+  }
+  const existing = cache.get(src);
   if (existing) return existing;
   const contentType = match[1];
   const entry: ImageEntry = {
@@ -2325,6 +2608,7 @@ function takeImage(src: string, images: Map<string, ImageEntry>, nextId: () => s
     ext: extOf(contentType),
   };
   images.set(entry.id, entry);
+  cache.set(src, entry);
   return entry;
 }
 
@@ -2584,7 +2868,8 @@ function rootRelsXml(): string {
 function documentRelsXml(
   images: Map<string, ImageEntry>,
   comments: boolean,
-  footnotes: boolean
+  footnotes: boolean,
+  links: Map<string, string>
 ): string {
   const rels = [...images.values()]
     .map(
@@ -2592,9 +2877,16 @@ function documentRelsXml(
         `<Relationship Id="${image.id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${image.id}.${image.ext}"/>`
     )
     .join('');
+  // Ссылки обязаны жить в rels: без отношения <w:hyperlink r:id> не открывается.
+  const hyperlinks = [...links.entries()]
+    .map(
+      ([target, id]) =>
+        `<Relationship Id="${id}" Type="${HYPERLINK_REL}" Target="${escapeAttr(target)}" TargetMode="External"/>`
+    )
+    .join('');
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-    `<Relationships xmlns="${REL_NS}">${rels}` +
+    `<Relationships xmlns="${REL_NS}">${rels}${hyperlinks}` +
     '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
     '<Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>' +
     (comments
@@ -2640,6 +2932,12 @@ function elementsByLocal(root: ParentNode, name: string): Element[] {
 function firstByLocal(root: ParentNode | null, name: string): Element | null {
   if (!root) return null;
   return elementsByLocal(root, name)[0] ?? null;
+}
+
+/** Поиск только среди прямых детей: firstByLocal цеплял tcPr вложенной ячейки. */
+function childByLocal(node: Element | null, name: string): Element | null {
+  if (!node) return null;
+  return childElements(node).find((child) => localName(child) === name) ?? null;
 }
 
 function attr(el: Element | null, name: string): string {

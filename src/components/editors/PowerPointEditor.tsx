@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
-  Bold,
   ChevronLeft,
   ChevronRight,
   Copy,
@@ -41,7 +40,6 @@ import {
   type PptxDocument,
   type PptxParagraph,
   type PptxShapeModel,
-  type PptxSlideModel,
   type PptxTextBody,
   type PptxTransitionModel,
 } from '../../lib/pptxDoc';

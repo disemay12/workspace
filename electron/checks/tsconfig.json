@@ -1,19 +1,34 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    // ES2024+DOM в lib: наборы компилируют src/lib/*, где уже используются
+    // String.prototype.toWellFormed (ES2024) и DOMParser/document.
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "module": "Node16",
     "moduleResolution": "node16",
     "outDir": "../../dist-electron",
     // Проверочные скрипты импортируют код из src/ (formulaEngine, dateFormat),
     // поэтому корнем компиляции служит каталог проекта, а не electron/checks.
     "rootDir": "../..",
-    "strict": false,
+    "strict": true,
+    // Из strict отключено минимально необходимое. Полный strict даёт 401 ошибку
+    // в 15 наборах: 324 — неявный any в IPC-обработчиках и колбэках, остальное
+    // strictNullChecks на массивах-накопителях (const out = { steps: [], ... })
+    // и null-проверках; три ошибки приходят из src/lib/docx.ts, который вне
+    // этого лимита. Разбор — отдельный проход, флаги включаем там же.
     "noImplicitAny": false,
-    "noImplicitThis": false,
     "strictNullChecks": false,
+    "noImplicitThis": false,
+    // Проверки читают err.message/err.stack в ~50 обработчиках catch.
+    "useUnknownInCatchVariables": false,
+    // Остаток strict (strictFunctionTypes, strictBindCallApply,
+    // strictPropertyInitialization, alwaysStrict) действует.
+    "noFallthroughCasesInSwitch": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "noEmitOnError": false,
+    // Скомпилированный набор с ошибками типов не должен уходить в dist-electron:
+    // иначе провал всплывает только на прогоне.
+    "noEmitOnError": true,
     "types": ["node"],
     "forceConsistentCasingInFileNames": true
   },

@@ -5,11 +5,12 @@
  * а обрезка, снятие звука и сжатие запускают ffmpeg как отдельный процесс.
  * Если ffmpeg не установлен, операции сообщают об этом, а просмотр остаётся.
  */
-import { app, ipcMain, protocol } from 'electron';
+import { ipcMain, protocol } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { Readable } from 'stream';
+import { assertMutablePath, assertReadablePath } from './fsGuard';
 
 export const VIDEO_EXTENSIONS = [
   'mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'wmv', 'flv', 'f4v', 'mpeg', 'mpg',
@@ -41,6 +42,15 @@ const MIME: Record<string, string> = {
   bmp: 'image/bmp',
 };
 
+/**
+ * Расширения, которые разрешено отдавать по media:// (плеер и превью).
+ * SVG исключён намеренно: это скриптуемая разметка, а схема зарегистрирована
+ * с bypassCSP — отдавать её по привилегированному протоколу незачем.
+ */
+const SERVABLE_EXTENSIONS = new Set(
+  Object.keys(MIME).filter((extension) => extension !== 'svg')
+);
+
 export function videoMime(ext: string): string {
   return MIME[ext.toLowerCase().replace(/^\./, '')] || 'application/octet-stream';
 }
@@ -65,16 +75,39 @@ function which(name: string): string | null {
   return null;
 }
 
+/** ffprobe на повреждённом файле может висеть бесконечно — держим предел. */
+const PROCESS_TIMEOUT_MS = 120_000;
+
+function withTimeout(child: import('child_process').ChildProcess, onTimeout: () => void): NodeJS.Timeout {
+  const timer = setTimeout(() => {
+    try {
+      child.kill();
+    } catch {
+      // процесс уже завершён
+    }
+    onTimeout();
+  }, PROCESS_TIMEOUT_MS);
+  return timer;
+}
+
 function run(bin: string, args: string[]): Promise<{ code: number; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(bin, args, { windowsHide: true });
     let stderr = '';
+    let settled = false;
+    const finish = (code: number, text = stderr) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stderr: text });
+    };
+    const timer = withTimeout(child, () => finish(1, stderr + '\nпревышено время ожидания ffprobe'));
     child.stderr.on('data', (chunk) => {
       stderr += String(chunk);
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
-    child.on('error', (err) => resolve({ code: 1, stderr: err.message }));
-    child.on('close', (code) => resolve({ code: code ?? 1, stderr }));
+    child.on('error', (err) => finish(1, err.message));
+    child.on('close', (code) => finish(code ?? 1));
   });
 }
 
@@ -117,9 +150,23 @@ function runWithProgress(
     });
     const finish = (code: number) => {
       running.delete(key);
+      clearTimeout(watchdog);
       resolve({ code, stderr });
     };
-    child.on('error', (err) => finish(1));
+    // Рендер длинного видео идёт минутами, но зависший ffmpeg иначе держит
+    // запись в `running` вечно и блокирует повторный запуск.
+    const watchdog = setTimeout(
+      () => {
+        try {
+          child.kill();
+        } catch {
+          // процесс уже завершился
+        }
+        stderr += ' ffmpeg остановлен по таймауту';
+      },
+      Math.max(60_000, Math.round(durationSec * 1000 * 3))
+    );
+    child.on('error', () => finish(1));
     child.on('close', (code) => finish(code ?? 1));
   });
 }
@@ -160,18 +207,9 @@ async function probe(filePath: string): Promise<{
   const ffprobe = which('ffprobe');
   const empty = { duration: 0, width: 0, height: 0, hasAudio: false, videoCodec: '', audioCodec: '', size: stat.size };
   if (!ffprobe) return empty;
-  const result = await run(ffprobe, [
-    '-v', 'error',
-    '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height',
-    '-of', 'json',
-    filePath,
-  ]);
-  try {
-    const data = JSON.parse(result.stderr && result.stderr.trim().startsWith('{') ? result.stderr : await fs.promises.readFile(filePath, 'utf8').then(() => '{}'));
-    void data;
-  } catch {
-    /* ffprobe пишет JSON в stdout, а run собирает только stderr — ниже отдельный запуск */
-  }
+  // Раньше здесь шёл первый запуск через run() (собирает только stderr, JSON
+  // терялся), а в catch весь файл читался как UTF-8 ради заглушки '{}':
+  // двойной вызов ffprobe и чтение гигабайтного видео в память.
   const json = await capture(ffprobe, [
     '-v', 'error',
     '-show_entries', 'format=duration:stream=codec_type,codec_name,width,height',
@@ -204,10 +242,18 @@ function capture(bin: string, args: string[]): Promise<{ code: number; stdout: s
     const child = spawn(bin, args, { windowsHide: true });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const finish = (code: number, errorText?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr: errorText ? errorText : stderr });
+    };
+    const timer = withTimeout(child, () => finish(1, 'превышено время ожидания ffprobe'));
     child.stdout.on('data', (chunk) => { stdout += String(chunk); });
     child.stderr.on('data', (chunk) => { stderr += String(chunk); });
-    child.on('error', (err) => resolve({ code: 1, stdout, stderr: err.message }));
-    child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    child.on('error', (err) => finish(1, err.message));
+    child.on('close', (code) => finish(code ?? 1));
   });
 }
 
@@ -245,7 +291,7 @@ function atempoChain(speed: number): string {
 }
 
 function speedFilterGraph(
-  req: VideoEditRequest,
+  _req: VideoEditRequest,
   trimStart: number,
   trimEnd: number,
   speed: number,
@@ -352,6 +398,9 @@ async function editVideo(
     req.outputPath && req.outputPath !== req.filePath
       ? req.outputPath
       : path.join(dir, base + suffix + (hasSpeedChange || hasZoom ? '.mp4' : ext === '.webm' ? '.webm' : '.mp4'));
+  // ffmpeg запускается с `-y` и пишет куда угодно: без проверки один вызов
+  // обходил весь контроль записи и мог затереть любой файл пользователя.
+  assertMutablePath(output, 'write');
 
   const args = ['-y'];
   if (start > 0) args.push('-ss', start.toFixed(3));
@@ -418,6 +467,20 @@ export function registerVideo(): void {
       const raw = decodeURIComponent(url.searchParams.get('path') || normalized);
       if (!raw || !fs.existsSync(raw)) {
         return new Response('not found', { status: 404 });
+      }
+
+      // Схема зарегистрирована с bypassCSP и обслуживает любой путь из URL:
+      // без ограничения по расширению страница в этом же сеансе читала бы
+      // произвольные файлы диска. Отдаём только медиа, PDF и картинки.
+      if (!SERVABLE_EXTENSIONS.has(path.extname(raw).toLowerCase().replace('.', ''))) {
+        return new Response('forbidden', { status: 403 });
+      }
+      // Схема отдаёт файл по любому пути из URL: секреты приложения и каталоги
+      // ключей через неё тоже закрыты.
+      try {
+        assertReadablePath(raw);
+      } catch {
+        return new Response('forbidden', { status: 403 });
       }
 
       // Range-запросы обязательны для перемотки видео: без 206 Chromium
@@ -506,6 +569,7 @@ export function registerVideo(): void {
       const ffmpeg = requireFfmpeg();
       const format = req?.format ?? 'mp3';
       const outputPath = req?.outputPath || uniqueOutput(filePath, format === 'mp3' ? '.mp3' : format === 'aac' ? '.m4a' : '.m4a', '-audio');
+      assertMutablePath(outputPath, 'write');
       const args = ['-y', '-hide_banner', '-loglevel', 'error', ...buildExtractAudioArgs(filePath, outputPath, format)];
       const result = await run(ffmpeg, args);
       if (result.code !== 0) return { success: false, error: result.stderr.trim().split('\n').pop() || 'ffmpeg error' };
@@ -527,6 +591,7 @@ export function registerVideo(): void {
               Math.max(0, Math.min(info.duration || 0, ((info.duration || 0) * (index + 0.5)) / count))
             );
       const dir = req?.dir || path.dirname(filePath);
+      assertMutablePath(dir, 'write');
       fs.mkdirSync(dir, { recursive: true });
       const stem = path.basename(filePath, path.extname(filePath));
       const files: string[] = [];
@@ -549,6 +614,7 @@ export function registerVideo(): void {
       const format = req?.format ?? 'mp4';
       const ext = format === 'webm' ? '.webm' : format === 'gif' ? '.gif' : '.mp4';
       const outputPath = req?.outputPath || uniqueOutput(filePath, ext, `-${format}`);
+      assertMutablePath(outputPath, 'write');
       const args = ['-y', '-hide_banner', '-nostats', ...buildConvertArgs(filePath, outputPath, format, req?.quality)];
       const result = await run(ffmpeg, args);
       if (result.code !== 0) return { success: false, error: result.stderr.trim().split('\n').pop() || 'ffmpeg error' };
@@ -563,6 +629,7 @@ export function registerVideo(): void {
     try {
       const ffmpeg = requireFfmpeg();
       const outputPath = req?.outputPath || uniqueOutput(filePath, '.gif', '-clip');
+      assertMutablePath(outputPath, 'write');
       const start = Math.max(0, Number(req?.start) || 0);
       const duration = Math.max(0.2, Number(req?.duration) || 3);
       const args = ['-y', '-hide_banner', '-loglevel', 'error', ...buildGifArgs(filePath, outputPath, start, duration, req?.fps, req?.width)];

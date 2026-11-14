@@ -124,18 +124,40 @@ function open(stored: string): string {
 }
 
 export function registerAiSettings(): void {
+  /** Ключ одного провайдера: полный список рендереру не нужен. */
+  const keyFor = (data: StoredSettings, provider: string): { key: string; unreadable: boolean } => {
+    const stored = data.keys?.[provider];
+    if (!stored) return { key: '', unreadable: false };
+    const value = open(stored);
+    return { key: value, unreadable: !value };
+  };
+
   ipcMain.handle('aiSettings:load', () => {
     const data = read();
+    const active = String(data.provider ?? '');
     const keys: Record<string, string> = {};
     /** Ключи, которые не удалось расшифровать (профиль/компьютер сменились). */
     const keyErrors: string[] = [];
-    for (const [provider, stored] of Object.entries(data.keys ?? {})) {
-      const value = open(stored);
-      if (value) keys[provider] = value;
-      else keyErrors.push(provider);
+    for (const provider of Object.keys(data.keys ?? {})) {
+      const result = keyFor(data, provider);
+      if (result.unreadable) keyErrors.push(provider);
+      // Отдаём ключ только активного провайдера: остальные — по запросу.
+      else if (provider === active && result.key) keys[provider] = result.key;
     }
     const { keys: _omit, ...settings } = data;
-    return { settings, keys, keyErrors };
+    // Без шифрования ОС ключ лёг бы в файл кодированным base64 — об этом
+    // предупреждаем в интерфейсе, а не молчим.
+    return {
+      settings,
+      keys,
+      keyErrors,
+      encryptionUnavailable: !safeStorage.isEncryptionAvailable(),
+    };
+  });
+
+  ipcMain.handle('aiSettings:key', (_event, provider: string) => {
+    if (!provider || typeof provider !== 'string') return { key: '', unreadable: false };
+    return keyFor(read(), provider);
   });
 
   ipcMain.handle(

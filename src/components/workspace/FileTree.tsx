@@ -46,13 +46,63 @@ import { fileSystemService, imageDataUrl } from '../../services/fileSystemServic
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
 import { SHARE_SERVICES } from '../../services/shareService';
 
+/**
+ * Кеш миниатюр ограничен суммарным объёмом, а не числом записей: 60 превью
+ * по 8 МБ — это сотни мегабайт в heap.
+ */
+const THUMB_CACHE_BYTES_LIMIT = 32 * 1024 * 1024;
 const THUMB_CACHE = new Map<string, string>();
+let thumbCacheBytes = 0;
+
+/** data-URL в heap занимает два байта на символ (UTF-16). */
+const thumbUrlBytes = (url: string): number => url.length * 2;
+
+/** Ключ включает mtime и размер: после пересохранения файла превью неверно. */
+function thumbKey(item: FileItem): string {
+  return `${item.path}|${item.mtime ?? ''}|${item.size}`;
+}
+
+/** Чтение с обновлением порядка: Map хранит вставку, старые вытесняем первыми. */
+function readThumb(key: string): string {
+  const hit = THUMB_CACHE.get(key);
+  if (!hit) return '';
+  THUMB_CACHE.delete(key);
+  THUMB_CACHE.set(key, hit);
+  return hit;
+}
+
+function writeThumb(key: string, url: string): void {
+  const bytes = thumbUrlBytes(url);
+  // Одно превью больше лимита не кешируем: иначе вытеснение снесло бы весь кеш.
+  if (bytes > THUMB_CACHE_BYTES_LIMIT) return;
+  const previous = THUMB_CACHE.get(key);
+  if (previous) thumbCacheBytes -= thumbUrlBytes(previous);
+  THUMB_CACHE.delete(key);
+  THUMB_CACHE.set(key, url);
+  thumbCacheBytes += bytes;
+  while (thumbCacheBytes > THUMB_CACHE_BYTES_LIMIT && THUMB_CACHE.size > 1) {
+    const oldest = THUMB_CACHE.keys().next().value;
+    if (oldest === undefined) break;
+    const removed = THUMB_CACHE.get(oldest);
+    THUMB_CACHE.delete(oldest);
+    if (removed) thumbCacheBytes -= thumbUrlBytes(removed);
+  }
+}
 
 /** Миниатюра изображения: файл читается один раз и кешируется как data-URL. */
 const FileThumb: React.FC<{ item: FileItem }> = ({ item }) => {
-  const [src, setSrc] = useState(() => THUMB_CACHE.get(item.path) ?? '');
+  const key = thumbKey(item);
+  const [thumb, setThumb] = useState(() => ({ key, src: readThumb(key) }));
+  // Превью от другой версии файла не показываем, пока не загрузили новое.
+  const src = thumb.key === key ? thumb.src : '';
+
   useEffect(() => {
     if (src || item.size > 8 * 1024 * 1024) return;
+    const cached = readThumb(key);
+    if (cached) {
+      setThumb({ key, src: cached });
+      return;
+    }
     let alive = true;
     void (async () => {
       try {
@@ -62,8 +112,8 @@ const FileThumb: React.FC<{ item: FileItem }> = ({ item }) => {
           binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
         }
         const url = imageDataUrl(btoa(binary), item.extension);
-        THUMB_CACHE.set(item.path, url);
-        if (alive) setSrc(url);
+        writeThumb(key, url);
+        if (alive) setThumb({ key, src: url });
       } catch {
         // превью не критично: останется значок типа
       }
@@ -71,7 +121,8 @@ const FileThumb: React.FC<{ item: FileItem }> = ({ item }) => {
     return () => {
       alive = false;
     };
-  }, [item.path, item.extension, item.size, src]);
+  }, [key, item.path, item.extension, item.size, src]);
+
   return src ? (
     <img src={src} alt="" loading="lazy" className="h-4 w-4 shrink-0 rounded-sm object-cover" />
   ) : (
@@ -112,7 +163,7 @@ interface Props {
 }
 
 /** Иконка и цвет по типу файла — визуальная навигация в дереве. */
-function fileIcon(type: FileType | undefined, name: string) {
+function fileIcon(type: FileType | undefined, _name: string) {
   switch (type) {
     case 'excel':
       return <FileSpreadsheet size={14} className="shrink-0 text-emerald-500" />;
@@ -228,8 +279,6 @@ export const FileTree: React.FC<Props> = ({
     setExplorerPrefs(next);
     writePreferences({ ...readPreferences(), explorer: next });
   };
-
-  const rootItems = useMemo(() => tree[rootPath] || [], [tree, rootPath]);
 
   /** Плоский список видимых строк: выделение диапазона, фокус, виртуализация. */
   const visibleFlat = useMemo(
@@ -774,6 +823,7 @@ export const FileTree: React.FC<Props> = ({
       {/* Дерево */}
       <div
         tabIndex={0}
+        data-file-tree=""
         onKeyDown={handleTreeKeys}
         onDragOver={(event) => {
           if (!event.dataTransfer.types.includes('application/x-workspace-paths')) return;

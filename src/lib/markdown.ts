@@ -28,13 +28,20 @@ import 'prismjs/components/prism-yaml';
 import 'prismjs/components/prism-css';
 import 'prismjs/components/prism-diff';
 
-export function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
+export {
+  escapeHtml,
+  escapeRawHtml,
+  isSafeImageSrc,
+  isSafeLinkHref,
+  sanitizeFenceLanguage,
+} from './sanitizeMarkdownHtml';
+import {
+  escapeHtml,
+  escapeRawHtml,
+  isSafeImageSrc,
+  isSafeLinkHref,
+  sanitizeFenceLanguage,
+} from './sanitizeMarkdownHtml';
 
 // Инициализируем mermaid один раз
 let mermaidInitialized = false;
@@ -43,7 +50,9 @@ export function initMermaid(isDark = true): void {
     mermaid.initialize({
       startOnLoad: false,
       theme: isDark ? 'dark' : 'default',
-      securityLevel: 'loose',
+      // 'loose' разрешал HTML в подписях и click-обработчики: диаграмма из
+      // документа исполняла скрипт в окне с мостом electronAPI.
+      securityLevel: 'strict',
       fontFamily: 'Segoe UI, system-ui, sans-serif',
     });
     mermaidInitialized = true;
@@ -98,8 +107,29 @@ const markedInstance = new Marked({
 
 markedInstance.use({
   renderer: {
+    /** Единственная точка, где в вывод попадает пользовательский HTML. */
+    html({ text }) {
+      return escapeRawHtml(text);
+    },
+    /**
+     * Ссылка тоже приходит из документа, а переход по `javascript:` исполняет
+     * код в окне с мостом electronAPI. Разрешены только явные схемы.
+     */
+    link({ href, title, tokens }) {
+      const text = this.parser.parseInline(tokens);
+      if (!isSafeLinkHref(href)) return text;
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+      return `<a href="${escapeHtml(href)}"${titleAttr} class="ws-link text-ws-accent underline decoration-dotted">${text}</a>`;
+    },
+    image({ href, title, text }) {
+      if (!isSafeImageSrc(href)) return escapeHtml(text || '');
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+      return `<img src="${escapeHtml(href)}" alt="${escapeHtml(text || '')}"${titleAttr} class="max-w-full rounded my-1" />`;
+    },
     code({ text, lang }) {
-      const language = (lang || '').toLowerCase().trim();
+      // info-string фенса приходит из документа: вставлять его в разметку
+      // без экранирования — тот же XSS, что и сырой HTML.
+      const language = sanitizeFenceLanguage(lang || '');
 
       // Mermaid диаграмма
       if (language === 'mermaid') {
@@ -177,6 +207,36 @@ export function renderRichMarkdown(markdown: string): string {
 }
 
 /**
+ * Активное содержимое в готовом SVG. Проверка идёт по разобранному дереву, а
+ * не регуляркой: шаблон `\son[a-z]+\s*=` срабатывал на обычный текст подписи
+ * (`onset=1`, `online=true`) и превращал валидную диаграмму в ошибку.
+ */
+function svgHasActiveContent(svg: string): boolean {
+  let doc: Document | null = null;
+  try {
+    doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  } catch {
+    doc = null;
+  }
+  if (!doc || doc.getElementsByTagName('parsererror').length > 0) {
+    // Разобрать не удалось — пропускаем только заведомо безопасный текст.
+    return true;
+  }
+  for (const element of Array.from(doc.getElementsByTagName('*'))) {
+    const tag = element.tagName.toLowerCase().replace(/^svg:/, '');
+    if (tag === 'script' || tag === 'foreignobject' || tag === 'iframe' || tag === 'embed') return true;
+    for (const attribute of Array.from(element.attributes)) {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith('on')) return true;
+      if ((name === 'href' || name === 'xlink:href' || name === 'src') && !isSafeLinkHref(attribute.value)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Рендерит все Mermaid блоки внутри переданного DOM-контейнера
  */
 export async function renderMermaidBlocks(container: HTMLElement | null): Promise<void> {
@@ -196,9 +256,16 @@ export async function renderMermaidBlocks(container: HTMLElement | null): Promis
 
     try {
       const { svg } = await mermaid.render(id, code);
+      // Даже при securityLevel:'strict' проверяем результат: SVG вставляется
+      // в живой DOM, а не в изолированный контейнер.
+      if (svgHasActiveContent(svg)) {
+        throw new Error('в SVG найдены активные элементы');
+      }
       el.innerHTML = svg;
     } catch (err) {
-      el.innerHTML = `<div class="text-ws-danger text-xs text-left p-2 font-mono">Ошибка диаграммы: ${(err as Error).message}</div><pre class="text-left font-mono text-[11px] text-ws-faint p-2">${escapeHtml(code)}</pre>`;
+      el.innerHTML = `<div class="text-ws-danger text-xs text-left p-2 font-mono">Ошибка диаграммы: ${escapeHtml(
+        (err as Error).message
+      )}</div><pre class="text-left font-mono text-[11px] text-ws-faint p-2">${escapeHtml(code)}</pre>`;
     }
   }
 }

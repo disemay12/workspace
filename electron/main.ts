@@ -16,6 +16,14 @@ import { setWatchRoot } from './watcher';
 import { registerTerminal } from './terminal';
 import { registerContextMenuIpc } from './contextMenu';
 import { registerUpdater, UPDATE_EXIT_CODE } from './updater';
+import { openExternalSafe } from './safeOpen';
+import {
+  assertMutablePath,
+  assertReadablePath,
+  getWorkspaceRoot,
+  setProtectedDirectories,
+  setWorkspaceRoot,
+} from './fsGuard';
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -95,8 +103,73 @@ let closeRequestPending = false;
  */
 let updateExitCode: number | null = null;
 
-/** Текущая корневая папка рабочего пространства (выбирается пользователем). */
-let workspaceRoot: string = '';
+/** Текущая корневая папка рабочего пространства хранится в fsGuard. */
+
+/* ============================================================
+   Границы доверия: навигация окна и запись в системные каталоги
+   ============================================================ */
+
+/** Корень собранного фронтенда: единственный file://, куда можно уйти. */
+function appFileOrigin(): string {
+  const dist = path.join(__dirname, '..', 'dist').replace(/\\/g, '/');
+  return 'file:///' + dist.replace(/^\/+/, '');
+}
+
+/** Допустим ли переход: только сам dev-сервер или собственная сборка. */
+function isInternalUrl(value: string): boolean {
+  if (!value) return false;
+  const normalized = value.replace(/\\/g, '/');
+  if (isDev) {
+    // Без границы префикса `http://localhost:5173` пропускал `:51730`.
+    return normalized.startsWith(`${devServerUrl}/`) || normalized === devServerUrl;
+  }
+  const origin = `${appFileOrigin().toLowerCase()}/`;
+  const lowered = normalized.toLowerCase();
+  if (!lowered.startsWith(origin)) return false;
+  // `dist-evil/...` и `dist/../electron/...` — не внутренние адреса.
+  return !lowered.slice(origin.length).split('/').includes('..');
+}
+
+/**
+ * Единые правила для всех окон приложения.
+ *
+ * Клик по ссылке в Markdown, ответе модели или документе иначе уводит окно на
+ * сторонний адрес, а preload остаётся привязан к окну: страница получает
+ * electronAPI (файлы, терминал, установку обновлений). Поэтому внутренние
+ * переходы разрешены, внешние уходят в системный браузер, окна не открываются.
+ */
+function hardenWebContents(win: BrowserWindow): void {
+  const contents = win.webContents;
+
+  contents.on('will-navigate', (event, url) => {
+    if (isInternalUrl(url)) return;
+    event.preventDefault();
+    openExternalSafe(url);
+  });
+
+  contents.setWindowOpenHandler(({ url }) => {
+    openExternalSafe(url);
+    return { action: 'deny' };
+  });
+
+  // Тег <webview> в этом приложении не используется и не должен появиться
+  // из стороннего HTML.
+  contents.on('will-attach-webview', (event) => event.preventDefault());
+  // Навигация внутри фрейма тоже не должна уводить документ на сторонний сайт.
+  contents.on('will-frame-navigate', (event) => {
+    const url = event.url || '';
+    if (isInternalUrl(url)) return;
+    event.preventDefault();
+    openExternalSafe(url);
+  });
+}
+
+/** Системные каталоги, которых не должно быть в записи рендерера. */
+function configureFsGuard(): void {
+  // В разработке каталог приложения — это каталог проекта: его файлы
+  // редактируют, поэтому запрет действует только в собранной версии.
+  setProtectedDirectories(app.isPackaged ? [app.getAppPath()] : []);
+}
 
 /**
  * Процесс с низким integrity level (Windows выдаёт его при запуске из
@@ -197,10 +270,14 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      // preload импортирует только electron, поэтому песочница рендерера
+      // совместима с мостом и снимает целый класс побегов при XSS.
+      sandbox: true,
       spellcheck: false,
     },
   });
+
+  hardenWebContents(mainWindow);
 
   // Показываем окно только после готовности отрисовки — убирает белую вспышку
   mainWindow.once('ready-to-show', () => mainWindow?.show());
@@ -264,6 +341,16 @@ function createWindow() {
     if (closeRequestPending) return; // диалог уже показан
     closeRequestPending = true;
 
+    // Рендерер мог зависнуть или перезагрузиться: без второго шанса окно
+    // перестаёт закрываться и крестиком, и через IPC.
+    setTimeout(() => {
+      closeRequestPending = false;
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (!mainWindow.webContents.isCrashed() && mainWindow.webContents.isLoading()) return;
+      allowClose = true;
+      mainWindow.close();
+    }, 5000).unref();
+
     mainWindow.webContents.send('window:closeRequested');
   });
 
@@ -273,6 +360,8 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // Системные каталоги для проверок записи зависят от app.getAppPath().
+  configureFsGuard();
   registerContextMenuIpc();
   registerVideo();
   registerTerminal(() => mainWindow);
@@ -343,9 +432,10 @@ ipcMain.handle('window:new', async () => {
         preload: path.join(__dirname, 'preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false,
+        sandbox: true,
       },
     });
+    hardenWebContents(win);
     win.once('ready-to-show', () => win.show());
     const devUrl = process.env.VITE_DEV_SERVER_URL;
     if (devUrl) await win.loadURL(devUrl);
@@ -408,6 +498,16 @@ function runPowerShell(script: string): Promise<{ ok: boolean; output?: string; 
 ipcMain.handle('excel:openFile', async (_event, filePath: string) => {
   if (!filePath) return { success: false, error: 'Не указан путь к файлу' };
   if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+  try {
+    assertReadablePath(filePath);
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+  // `shell.openPath` по ассоциации запускает и .exe: проверка та же, что в
+  // system:openPath, иначе диалог подтверждения легко обходится этим каналом.
+  if (needsExecutableConfirmation(filePath) && !(await confirmExecutableOpen(filePath))) {
+    return { success: false, error: 'Открытие отменено' };
+  }
   const error = await shell.openPath(filePath);
   return error ? { success: false, error } : { success: true };
 });
@@ -418,6 +518,11 @@ ipcMain.handle('excel:runMacro', async (_event, filePath: string, macroName: str
     return { success: false, error: 'Укажите файл и имя макроса' };
   }
   if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+  try {
+    assertMutablePath(filePath, 'write');
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
 
   const safePath = filePath.replace(/'/g, "''");
   const safeMacro = macroName.trim().replace(/'/g, "''");
@@ -460,6 +565,11 @@ ipcMain.handle('excel:exportCharts', async (_event, filePath: string, charts: Ex
     return { success: false, error: 'Нет диаграмм для экспорта' };
   }
   if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+  try {
+    assertMutablePath(filePath, 'write');
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
 
   const payload = Buffer.from(JSON.stringify(charts), 'utf8').toString('base64');
   const safePath = filePath.replace(/'/g, "''");
@@ -516,6 +626,11 @@ ipcMain.handle('excel:createPivot', async (_event, filePath: string, spec: Excel
     return { success: false, error: 'Не указан источник сводной' };
   }
   if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+  try {
+    assertMutablePath(filePath, 'write');
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
 
   const payload = Buffer.from(JSON.stringify(spec), 'utf8').toString('base64');
   const safePath = filePath.replace(/'/g, "''");
@@ -589,7 +704,8 @@ ipcMain.handle('secrets:describe', () => {
   const info = secretsImporter.read(false);
   return {
     found: info.found,
-    filePath: info.filePath,
+    // Полный путь рендереру не нужен: зная его, XSS читает файл первым делом.
+    fileName: info.filePath ? path.basename(info.filePath) : '',
     baseUrl: info.baseUrl,
     textModel: info.textModel,
     imageModel: info.imageModel,
@@ -599,17 +715,37 @@ ipcMain.handle('secrets:describe', () => {
   };
 });
 
-/** Импорт ключа — вызывается только по действию пользователя. */
-ipcMain.handle('secrets:importKey', () => {
-  const info = secretsImporter.read(true);
+/** Импорт ключа — вызывает пользователь, поэтому подтверждение спрашиваем сами. */
+ipcMain.handle('secrets:importKey', async () => {
+  const info = secretsImporter.read(false);
   if (!info.found || !info.apiKey) {
     return { success: false, error: info.error || 'API-ключ не найден в secrets.local.ps1' };
   }
+  const options = {
+    type: 'question' as const,
+    title: 'Импорт ключа',
+    message: 'Импортировать API-ключ из secrets.local.ps1?',
+    detail:
+      'Интерфейс запросил ключ из локального файла секретов. Ключ будет сохранён в профиле ' +
+      'приложения в зашифрованном виде.',
+    buttons: ['Отмена', 'Импортировать'],
+    defaultId: 1,
+    cancelId: 0,
+  };
+  const answer = mainWindow
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  if (answer.response !== 1) return { success: false, error: 'Импорт отменён' };
+
+  const withKey = secretsImporter.read(true);
+  if (!withKey.found || !withKey.apiKey) {
+    return { success: false, error: withKey.error || 'API-ключ не найден в secrets.local.ps1' };
+  }
   return {
     success: true,
-    apiKey: info.apiKey,
-    baseUrl: info.baseUrl,
-    model: info.textModel,
+    apiKey: withKey.apiKey,
+    baseUrl: withKey.baseUrl,
+    model: withKey.textModel,
   };
 });
 
@@ -658,21 +794,31 @@ ipcMain.handle('session:patch', (_event, patch: Partial<WorkspaceSession>) => {
   return next;
 });
 ipcMain.handle('fs:getCurrentWorkspace', () => {
-  if (!workspaceRoot) {
+  if (!getWorkspaceRoot()) {
     const saved = readSession().lastPath;
-    workspaceRoot = saved && fs.existsSync(saved) ? saved : app.getPath('documents');
+    setWorkspaceRoot(saved && fs.existsSync(saved) ? saved : app.getPath('documents'));
   }
-  if (workspaceRoot) setWatchRoot(workspaceRoot, () => mainWindow);
-  return workspaceRoot;
+  const root = getWorkspaceRoot();
+  if (root) setWatchRoot(root, () => mainWindow);
+  return root;
 });
 
 ipcMain.handle('fs:setWorkspaceRoot', (_event, dirPath: string) => {
-  workspaceRoot = dirPath;
-  if (dirPath) {
-    writeSession({ lastPath: dirPath });
-    setWatchRoot(dirPath, () => mainWindow);
+  if (!dirPath || typeof dirPath !== 'string') return { success: false, error: 'Не указан путь' };
+  try {
+    // Корень диска и системные каталоги рабочей папкой не бывают, а рекурсивное
+    // наблюдение за `C:\` вешает главный процесс.
+    assertMutablePath(dirPath, 'write');
+    if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) {
+      return { success: false, error: 'Каталог не найден' };
+    }
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
   }
-  return { success: true };
+  setWorkspaceRoot(dirPath);
+  writeSession({ lastPath: dirPath });
+  setWatchRoot(getWorkspaceRoot(), () => mainWindow);
+  return { success: true, path: getWorkspaceRoot() };
 });
 
 ipcMain.handle('fs:getFavorites', () => {
@@ -696,8 +842,8 @@ ipcMain.handle('fs:openFolderDialog', async () => {
     title: 'Выберите рабочую папку WorkSpace',
   });
   if (result.canceled || result.filePaths.length === 0) return null;
-  workspaceRoot = result.filePaths[0];
-  return workspaceRoot;
+  setWorkspaceRoot(result.filePaths[0]);
+  return getWorkspaceRoot();
 });
 
 ipcMain.handle(
@@ -841,6 +987,7 @@ ipcMain.handle(
   'doc:extractText',
   async (_event, payload: { path?: string; base64?: string } = {}) => {
     try {
+      if (payload.path) assertReadablePath(payload.path);
       const buffer = payload.base64
         ? Buffer.from(payload.base64, 'base64')
         : await fs.promises.readFile(payload.path ?? '');
@@ -851,7 +998,11 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8') => {  try {
+ipcMain.handle('fs:readFile', async (_event, filePath: string, encoding = 'utf-8') => {
+  try {
+    // Ключи и настройки приложения рендереру недоступны: путь к ним он знает
+    // из диагностики, а чтение открывает канал утечки.
+    assertReadablePath(filePath);
     const buffer = await fs.promises.readFile(filePath);
     if (encoding === 'base64') {
       return { success: true, content: buffer.toString('base64'), isBinary: true };
@@ -886,6 +1037,7 @@ ipcMain.handle(
   'fs:readPreview',
   async (_event, filePath: string, maxBytes = 65536) => {
     try {
+      assertReadablePath(filePath);
       const stat = await fs.promises.stat(filePath);
       const size = Math.min(Math.max(1024, maxBytes), stat.size);
       const handle = await fs.promises.open(filePath, 'r');
@@ -906,10 +1058,65 @@ ipcMain.handle(
   }
 );
 
+/** Расширения, запуск которых — исполнение кода, а не просмотр файла. */
+const EXECUTABLE_EXTENSIONS = new Set([
+  'exe', 'com', 'scr', 'bat', 'cmd', 'ps1', 'psm1', 'vbs', 'vbe', 'js', 'jse',
+  'wsf', 'wsh', 'msi', 'msp', 'cpl', 'lnk', 'url', 'reg', 'hta', 'jar', 'pif',
+]);
+
+/**
+ * Запуск исполняемого файла подтверждается диалогом: раньше любой скрипт в
+ * документе/ответе модели мог попросить main открыть свой файл — это тихое
+ * исполнение кода без ведома пользователя.
+ */
+function needsExecutableConfirmation(target: string): boolean {
+  const extension = path.extname(target).toLowerCase().replace('.', '');
+  if (extension) return EXECUTABLE_EXTENSIONS.has(extension);
+  // Без расширения Windows тоже запускает файл, если это PE («MZ»).
+  try {
+    const handle = fs.openSync(target, 'r');
+    try {
+      const magic = Buffer.alloc(2);
+      fs.readSync(handle, magic, 0, 2, 0);
+      return magic[0] === 0x4d && magic[1] === 0x5a;
+    } finally {
+      fs.closeSync(handle);
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Подтверждение запуска исполняемого файла. Один диалог на все каналы:
+ * `system:openPath` и `excel:openFile` открывают файл одинаково, и второй не
+ * должен становиться обходом подтверждения.
+ */
+async function confirmExecutableOpen(target: string): Promise<boolean> {
+  const options = {
+    type: 'warning' as const,
+    title: 'Запуск исполняемого файла',
+    message: 'Открыть этот файл в системе?',
+    detail: target + '\n\nWindows запустит его как программу.',
+    buttons: ['Отмена', 'Открыть'],
+    defaultId: 0,
+    cancelId: 0,
+  };
+  const answer = mainWindow
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  return answer.response === 1;
+}
+
 /** Открывает любой файл средствами Windows (EXE запускается, PDF открывается в просмотрщике). */
 ipcMain.handle('system:openPath', async (_event, filePath: string) => {
   if (!filePath) return { success: false, error: 'Не указан путь к файлу' };
   if (!fs.existsSync(filePath)) return { success: false, error: 'Файл не найден' };
+
+  if (needsExecutableConfirmation(filePath) && !(await confirmExecutableOpen(filePath))) {
+    return { success: false, error: 'Открытие отменено' };
+  }
+
   const error = await shell.openPath(filePath);
   return error ? { success: false, error } : { success: true };
 });
@@ -966,22 +1173,29 @@ async function writeFileAtomic(
     throw err;
   }
 
+  const removeTemp = () => fs.promises.unlink(tmpPath).catch(() => undefined);
   try {
-    await fs.promises.rename(tmpPath, filePath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY' && code !== 'EACCES') throw err;
     try {
-      await fs.promises.copyFile(tmpPath, filePath);
-    } catch (copyErr) {
-      const copyCode = (copyErr as NodeJS.ErrnoException).code;
-      if (copyCode !== 'EPERM' && copyCode !== 'EBUSY' && copyCode !== 'EACCES') {
-        throw copyErr;
+      await fs.promises.rename(tmpPath, filePath);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EBUSY' && code !== 'EACCES') throw err;
+      try {
+        await fs.promises.copyFile(tmpPath, filePath);
+      } catch (copyErr) {
+        const copyCode = (copyErr as NodeJS.ErrnoException).code;
+        if (copyCode !== 'EPERM' && copyCode !== 'EBUSY' && copyCode !== 'EACCES') {
+          throw copyErr;
+        }
+        if (binaryFile) throw lockedError(copyCode);
+        await writeWithRetry(filePath);
       }
-      if (binaryFile) throw lockedError(copyCode);
-      await writeWithRetry(filePath);
     }
-    await fs.promises.unlink(tmpPath).catch(() => undefined);
+  } finally {
+    // Раньше при провале copyFile временный файл оставался рядом с документом:
+    // мусорные *.ws-tmp накапливались после каждого занятого файла.
+    await removeTemp();
   }
 }
 
@@ -997,6 +1211,8 @@ ipcMain.handle(
             : encoding && encoding.toLowerCase() !== 'utf-8' && iconv.encodingExists(encoding)
               ? iconv.encode(content, encoding)
               : content;
+
+      assertMutablePath(filePath, 'write');
 
       // Бинарные офисные файлы нельзя писать поверх открытого файла:
       // Excel/Word видят недописанный ZIP и сообщают «недопустимый формат».
@@ -1051,6 +1267,7 @@ ipcMain.handle('fs:statFile', async (_event, filePath: string) => {
  */
 ipcMain.handle('fs:readBinary', async (_event, filePath: string) => {
   try {
+    assertReadablePath(filePath);
     const stat = await fs.promises.stat(filePath);
     if (stat.size > MAX_BINARY_BYTES) {
       return {
@@ -1075,6 +1292,7 @@ ipcMain.handle(
   'fs:readBinarySlice',
   async (_event, filePath: string, offset = 0, length = 0) => {
     try {
+      assertReadablePath(filePath);
       const stat = await fs.promises.stat(filePath);
       const start = Math.max(0, Math.min(Number(offset) || 0, stat.size));
       const size = Math.max(0, Math.min(Number(length) || 0, stat.size - start));
@@ -1103,6 +1321,7 @@ ipcMain.handle(
 /** Запись байтов с той же атомарностью, что и текстовая запись. */
 ipcMain.handle('fs:writeBinary', async (_event, filePath: string, data: unknown) => {
   try {
+    assertMutablePath(filePath, 'write');
     const buffer = toBuffer(data);
     await writeFileAtomic(filePath, buffer, true);
     return { success: true, size: buffer.byteLength };
@@ -1117,6 +1336,7 @@ ipcMain.handle('fs:writeBinary', async (_event, filePath: string, data: unknown)
  */
 ipcMain.handle('fs:guessEncoding', async (_event, filePath: string) => {
   try {
+    assertReadablePath(filePath);
     const handle = await fs.promises.open(filePath, 'r');
     let sample: Buffer;
     try {
@@ -1173,6 +1393,30 @@ ipcMain.handle('fs:guessEncoding', async (_event, filePath: string) => {
   }
 });
 
+/**
+ * Ждёт готовности разметки к снимку: шрифты и два кадра отрисовки вместо
+ * фиксированных 120 мс, из-за которых картинка иногда снималась до вёрстки.
+ */
+async function waitForPaint(win: BrowserWindow, timeoutMs = 3000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  try {
+    await Promise.race([
+      win.webContents
+        .executeJavaScript(
+          'document.fonts ? document.fonts.ready.then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))) : new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))'
+        )
+        .catch(() => undefined),
+      timeout,
+    ]);
+  } finally {
+    // Иначе на каждый экспорт остаётся живой таймер на 3 секунды.
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** PNG по слайдам: каждая страница htmlPages рендерится в окно размера слайда. */
 ipcMain.handle(
   'ppt:exportImages',
@@ -1186,15 +1430,19 @@ ipcMain.handle(
     let win: BrowserWindow | null = null;
     const files: string[] = [];
     try {
+      assertMutablePath(dir, 'write');
       fs.mkdirSync(dir, { recursive: true });
       win = new BrowserWindow({
         show: false,
         width: Math.max(320, Math.min(3840, Math.round(width))),
         height: Math.max(240, Math.min(2160, Math.round(height))),
+        // Окно отрисовки не должно получить ни node, ни мостов.
+        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
       });
+      hardenWebContents(win);
       for (let index = 0; index < htmlPages.length; index += 1) {
         await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(htmlPages[index])}`);
-        await new Promise((resolve) => setTimeout(resolve, 120));
+        await waitForPaint(win);
         const image = await win.webContents.capturePage();
         const file = path.join(dir, `slide-${String(index + 1).padStart(2, '0')}.png`);
         fs.writeFileSync(file, image.toPNG());
@@ -1220,8 +1468,13 @@ ipcMain.handle(
   ) => {
     let win: BrowserWindow | null = null;
     try {
-      win = new BrowserWindow({ show: false });
+      win = new BrowserWindow({
+        show: false,
+        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+      });
+      hardenWebContents(win);
       await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+      await waitForPaint(win);
       // Размер страницы в микронах: презентация печатается своим форматом,
       // иначе слайд 16:9 попадёт на A4 с полями.
       const hasCustomSize = Boolean(pageSize && pageSize.width > 0 && pageSize.height > 0);
@@ -1245,6 +1498,7 @@ ipcMain.handle(
         if (result.canceled || !result.filePath) return { success: false, canceled: true };
         output = result.filePath;
       }
+      assertMutablePath(output, 'write');
       await fs.promises.writeFile(output, pdf);
       return { success: true, path: output };
     } catch (err) {
@@ -1259,6 +1513,8 @@ ipcMain.handle(
   'fs:createFile',
   async (_event, filePath: string, initialContent = '', encoding?: string) => {
     try {
+      assertMutablePath(filePath, 'write');
+
       const isBase64 =
         encoding === 'base64' ||
         (typeof initialContent === 'string' &&
@@ -1299,6 +1555,7 @@ ipcMain.handle(
 
 ipcMain.handle('fs:createDirectory', async (_event, dirPath: string) => {
   try {
+    assertMutablePath(dirPath, 'write');
     await fs.promises.mkdir(dirPath, { recursive: true });
     return { success: true };
   } catch (err) {
@@ -1308,6 +1565,7 @@ ipcMain.handle('fs:createDirectory', async (_event, dirPath: string) => {
 
 ipcMain.handle('fs:deletePath', async (_event, targetPath: string) => {
   try {
+    assertMutablePath(targetPath, 'delete');
     const stat = await fs.promises.stat(targetPath);
     if (stat.isDirectory()) {
       await fs.promises.rm(targetPath, { recursive: true, force: true });
@@ -1322,6 +1580,7 @@ ipcMain.handle('fs:deletePath', async (_event, targetPath: string) => {
 
 ipcMain.handle('fs:trashPath', async (_event, targetPath: string) => {
   try {
+    assertMutablePath(targetPath, 'delete');
     await shell.trashItem(targetPath);
     return { success: true };
   } catch (err) {
@@ -1343,6 +1602,8 @@ ipcMain.handle('fs:pickDirectory', async (_event, defaultDir?: string) => {
 
 ipcMain.handle('fs:renamePath', async (_event, oldPath: string, newPath: string) => {
   try {
+    assertMutablePath(oldPath, 'delete');
+    assertMutablePath(newPath, 'write');
     if (fs.existsSync(newPath)) {
       return { success: false, error: 'Объект с таким именем уже существует' };
     }
@@ -1453,6 +1714,39 @@ ipcMain.handle('autosave:list', async () => {
   }
 });
 
+/**
+ * Только метаданные снимков. Каждая запись снимка и уборка каталога
+ * проверяют владельца имени и срок, и на полном содержимом (до 8 МБ на файл)
+ * они гоняли десятки мегабайт через IPC каждые две секунды.
+ */
+ipcMain.handle('autosave:listMeta', async () => {
+  try {
+    fs.mkdirSync(autosaveDir(), { recursive: true });
+    const files = await fs.promises.readdir(autosaveDir());
+    const items: Record<string, unknown>[] = [];
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const raw = await fs.promises.readFile(path.join(autosaveDir(), file), 'utf8');
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        items.push({
+          id: parsed.id,
+          path: parsed.path,
+          name: parsed.name,
+          type: parsed.type,
+          savedAt: parsed.savedAt,
+          size: typeof parsed.content === 'string' ? parsed.content.length : 0,
+        });
+      } catch {
+        // битый снимок пропускаем
+      }
+    }
+    return { success: true, items };
+  } catch (err) {
+    return { success: false, items: [], error: (err as Error).message };
+  }
+});
+
 ipcMain.handle('autosave:read', async (_event, name: string) => {
   try {
     const raw = await fs.promises.readFile(autosaveFile(name), 'utf8');
@@ -1472,6 +1766,7 @@ ipcMain.handle('autosave:remove', async (_event, name: string) => {
 });
 ipcMain.handle('fs:copyPath', async (_event, source: string, target: string) => {
   try {
+    assertMutablePath(target, 'write');
     if (fs.existsSync(target)) {
       return { success: false, error: 'Объект с таким именем уже существует' };
     }
@@ -1515,6 +1810,8 @@ const TEXT_EXTENSIONS = new Set([
 
 const MAX_CONTENT_SEARCH_BYTES = 4 * 1024 * 1024;
 const MAX_RESULTS = 300;
+/** Слишком длинный шаблон почти всегда означает катастрофический бэктрекинг. */
+const MAX_REGEX_LENGTH = 200;
 
 interface RawSearchResult {
   path: string;
@@ -1542,7 +1839,11 @@ function matchesGlob(fileName: string, filePath: string, glob: string): boolean 
       .replace(/[.+^${}()|[\]\\]/g, '\\$&')
       .replace(/\*/g, '.*')
       .replace(/\?/g, '.');
-    return new RegExp(`^${escaped}$`, 'i').test(target) || new RegExp(escaped, 'i').test(target);
+    // Шаблон должен описывать имя целиком: незаякоренная вторая проверка
+    // делала `*.ts` совпадающим с `a.ts.bak`. Для шаблонов с каталогом
+    // совпадение ищется в конце абсолютного пути.
+    const anchored = pattern.includes('/') || pattern.includes('\\') ? `^.*${escaped}$` : `^${escaped}$`;
+    return new RegExp(anchored, 'i').test(target);
   });
 }
 
@@ -1642,6 +1943,20 @@ ipcMain.handle(
 
       let regex: RegExp;
       try {
+        if (useRegex) {
+          // Простые защиты от катастрофического бэктрекинга: шаблон вида
+          // `(a+)+$` иначе вешает главный процесс на файле в 4 МБ.
+          if (query.length > MAX_REGEX_LENGTH) {
+            return { success: false, error: 'Слишком длинное регулярное выражение', results: [] };
+          }
+          if (/(\([^)]*[+*]\)|[+*]\))[+*]/.test(query)) {
+            return {
+              success: false,
+              error: 'Вложенные квантификаторы не поддерживаются: уточните выражение',
+              results: [],
+            };
+          }
+        }
         regex = useRegex
           ? new RegExp(query, caseSensitive ? '' : 'i')
           : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseSensitive ? '' : 'i');

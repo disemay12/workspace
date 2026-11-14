@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { OpenTab, PageSetup } from '../../types';
-import { bindDocxBlockSources, docxBase64ToHtml, docxPackageInfo, htmlToDocxBase64 } from '../../lib/docx';
+import { bindDocxBlockSources, DocxCorruptError, docxBase64ToHtml, docxPackageInfo, htmlToDocxBase64 } from '../../lib/docx';
 import type { DocxBlockSource, HeaderFooterEdit } from '../../lib/docx';
 import { offsetWithinBlock, applyDocumentTool, sanitizeSelectionHtml, selectionRangeHtml } from '../../lib/documentModel';
 import { DocumentHistory } from '../../lib/documentHistory';
@@ -47,7 +47,13 @@ import { registerDocumentController } from '../../services/docBridge';
 interface Props {
   tab: OpenTab;
   onChange: (newContent: string) => void;
-  onSave: () => void;
+  /** contentOverride — живое содержимое: tab.content к моменту вызова отстаёт. */
+  onSave: (contentOverride?: string) => void | Promise<unknown>;
+  /** Регистрирует сериализатор вкладки: Ctrl+S из App должен идти через редактор. */
+  onRegisterSave?: (
+    tabId: string,
+    saver: (() => void | Promise<unknown>) | null
+  ) => void;
   onAskAI?: (prompt: string, contextText: string) => void;
 }
 
@@ -72,6 +78,16 @@ const FONT_FAMILIES = [
   { label: 'Garamond', value: 'Garamond, "Times New Roman", serif' },
   { label: 'Palatino Linotype', value: '"Palatino Linotype", Palatino, serif' },
 ];
+
+/**
+ * Пакет не разобрался: сохранение затёрло бы исходный файл, поэтому правки не
+ * пишем и показываем это же сообщение на любую попытку сохранить.
+ */
+const CORRUPT_DOCUMENT_MESSAGE =
+  'Документ повреждён: правки не сохраняются, чтобы не затереть файл. Откройте копию.';
+
+/** docx/doc — бинарные пакеты: их содержимое нельзя «восстановить» как текст. */
+const BINARY_DOC_EXTENSIONS = new Set(['docx', 'doc']);
 
 /** Кегли в пунктах — те же, что в выпадающем списке Word. */
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
@@ -191,7 +207,13 @@ function rangeForBlockOffsets(block: Element, start: number, end: number): Range
   return range;
 }
 
-export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) => {
+export const WordEditor: React.FC<Props> = ({
+  tab,
+  onChange,
+  onSave,
+  onRegisterSave,
+  onAskAI,
+}) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [showColors, setShowColors] = useState<'highlight' | 'text' | null>(null);
@@ -232,6 +254,8 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
   const selectionRef = useRef<{ data: DocumentSelection; range: Range } | null>(null);
   /** Исходный пакет вкладки: источник истины для сохранения. */
   const sourceBase64Ref = useRef('');
+  /** Пакет повреждён: держим это в ref, чтобы debounce-сериализация его не писала. */
+  const corruptRef = useRef(false);
   /** Исходные XML-блоки документа (в порядке HTML-блоков). */
   const blockSourcesRef = useRef<DocxBlockSource[]>([]);
   /** Карта data-docx-id → исходный XML для патча при сохранении. */
@@ -375,6 +399,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
         setLoading(true);
         setError('');
         sourceBase64Ref.current = '';
+        corruptRef.current = false;
         blockSourcesRef.current = [];
         blockXmlRef.current = new Map();
         headerFooterEditsRef.current = new Map();
@@ -406,6 +431,16 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
         setLoading(false);
       } catch (err) {
         if (cancelled) return;
+        const binary = BINARY_DOC_EXTENSIONS.has(tab.extension.toLowerCase());
+        // Восстановление из текста — только для текстовых вкладок: base64 от ZIP
+        // проходил вторую ветку tryDecodeText и заменял документ мусором.
+        if (err instanceof DocxCorruptError || binary) {
+          corruptRef.current = true;
+          setError(CORRUPT_DOCUMENT_MESSAGE);
+          setLoading(false);
+          return;
+        }
+
         // Резервное восстановление: файл мог быть создан как Markdown/текст вместо бинарного ZIP
         const recoveredText = tryDecodeText(tab.content);
         if (recoveredText && recoveredText.trim()) {
@@ -490,6 +525,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
     // Debounce упаковки пакета .docx (устраняет фризы при быстром наборе текста)
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     debounceTimer.current = setTimeout(() => {
+      if (corruptRef.current) return;
       const seq = ++serializeSeq.current;
       void serializeDocx(html, pageSetupRef.current)
         .then((base64) => {
@@ -693,23 +729,41 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
     setVersionsTick((value) => value + 1);
   }, [tab.id]);
 
-  const flushSave = useCallback(async () => {
+  const flushSave = useCallback(async (): Promise<boolean> => {
     if (debounceTimer.current) {
       clearTimeout(debounceTimer.current);
       debounceTimer.current = null;
     }
+    // Сериализации нет — писать на диск нечего, файл был бы затёрт.
+    if (corruptRef.current) {
+      setError(CORRUPT_DOCUMENT_MESSAGE);
+      return false;
+    }
+    let base64: string | undefined;
     if (editorRef.current) {
       try {
-        const html = editorRef.current.innerHTML;
-        const base64 = await serializeDocx(html, pageSetupRef.current);
+        base64 = await serializeDocx(editorRef.current.innerHTML, pageSetupRef.current);
+        setError('');
         onChange(base64);
-      } catch {
-        // ignore
+      } catch (err) {
+        // Без сериализации писать нечего: на диск ушла бы предыдущая версия.
+        setError(`Не удалось подготовить документ к сохранению: ${(err as Error).message}`);
+        return false;
       }
     }
-    onSave();
+    const saved = await onSave(base64);
     captureVersion('Сохранено');
+    // Вызывающему (Ctrl+S, «Сохранить и закрыть») нужен исход записи.
+    return saved !== false;
   }, [onChange, onSave, serializeDocx, captureVersion]);
+
+  // Ctrl+S в App вызывает сохранение вкладки без содержимого — отдаём ему
+  // этот же сериализатор, иначе на диск уходит предыдущий base64.
+  useEffect(() => {
+    if (!onRegisterSave) return;
+    onRegisterSave(tab.id, flushSave);
+    return () => onRegisterSave(tab.id, null);
+  }, [onRegisterSave, tab.id, flushSave]);
 
   /** Закрывает открытую транзакцию и пишет её в историю. */
   const finalizeTransaction = useCallback(() => {
@@ -830,7 +884,8 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
       readHtml: () => editorRef.current?.innerHTML ?? '',
       serialize: async () => {
         const root = editorRef.current;
-        if (!root) return tab.content;
+        // Повреждённый пакет не пересобираем с нуля: отдаём исходное содержимое.
+        if (!root || corruptRef.current) return tab.content;
         return await serializeDocx(root.innerHTML, pageSetupRef.current);
       },
       writeHtml: (html, transactionId) => {
@@ -953,6 +1008,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
       setHeaderFooter: async (edit) => {
         const root = editorRef.current;
         if (!root) return { ok: false, message: 'Редактор документа недоступен' };
+        if (corruptRef.current) return { ok: false, message: CORRUPT_DOCUMENT_MESSAGE };
 
         const key = `${edit.kind}:${edit.referenceType ?? 'default'}`;
         if (edit.remove) headerFooterEditsRef.current.delete(key);
@@ -982,7 +1038,7 @@ export const WordEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI }) 
         setPageSetup(merged);
 
         const root = editorRef.current;
-        if (!root) return;
+        if (!root || corruptRef.current) return;
         // Поля и базовый шрифт живут в sectPr/styles.xml: без пересборки
         // пакета они не попадут в сохраняемый .docx.
         const seq = ++serializeSeq.current;
@@ -2334,6 +2390,12 @@ function countWords(text: string): number {
   return trimmed.split(/\s+/).length;
 }
 
+/** Только base64-символы и длина кратна 4: это пакет, а не текстовый документ. */
+function looksLikeBase64(raw: string): boolean {
+  const text = raw.replace(/\s+/g, '');
+  return text.length > 0 && text.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(text);
+}
+
 /**
  * Пытается декодировать текст из base64 или сырой строки.
  */
@@ -2351,7 +2413,12 @@ function tryDecodeText(raw: string): string | null {
     // не base64
   }
 
-  if (typeof raw === 'string' && /[\w\u0400-\u04FF\s#*<>]/.test(raw.slice(0, 200))) {
+  // base64 от бинарного файла проходит как текст и превращался в мусорный документ.
+  if (
+    typeof raw === 'string' &&
+    !looksLikeBase64(raw) &&
+    /[\w\u0400-\u04FF\s#*<>]/.test(raw.slice(0, 200))
+  ) {
     return raw;
   }
 

@@ -2,9 +2,15 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "CommonJS",
+    // moduleResolution намеренно не задан: в TS 7 явные node10/classic удалены,
+    // а nodenext требует расширений в import (electron/youtube.ts: './gdrive').
+    // Для CommonJS действует стандартное разрешение Node.
     "outDir": "dist-electron",
     "rootDir": "electron",
     "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true

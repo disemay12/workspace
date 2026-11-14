@@ -15,7 +15,6 @@ import JSZip from 'jszip';
 import {
   normalizeHexColor,
   presetById,
-  fontPresetById,
   type ThemeColorSet,
   type ThemeFontPair,
 } from './pptxThemes';

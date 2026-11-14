@@ -51,7 +51,8 @@ function fontXml(style: CellStyle): string {
   }
   const color = argb(style.color);
   if (color) parts.push(`<color rgb="${color}"/>`);
-  parts.push('<name val="Calibri"/>');
+  // <name> не пишем: жёсткий Calibri перебивал шрифт листа у стилизованной
+  // ячейки. Шрифт задаётся только если он есть в самом стиле.
   parts.push('</font>');
   return parts.join('');
 }
@@ -265,7 +266,8 @@ class StyleRegistry {
   }
 }
 
-interface SheetEntry {
+/** Лист книги: имя с уже раскодированными сущностями и путь части. */
+export interface SheetEntry {
   name: string;
   path: string;
 }
@@ -279,7 +281,8 @@ function decodeEntities(value: string): string {
     .replace(/&apos;/g, "'");
 }
 
-async function readSheetMap(zip: JSZip): Promise<SheetEntry[]> {
+/** Единый разбор карты листов: xlsxCharts использует его же, чтобы лист с «&» в имени находился. */
+export async function readSheetMap(zip: JSZip): Promise<SheetEntry[]> {
   const workbookFile = zip.file('xl/workbook.xml');
   const relsFile = zip.file('xl/_rels/workbook.xml.rels');
   if (!workbookFile || !relsFile) return [];

@@ -10,7 +10,6 @@ const A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
 const P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main';
 const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
-const CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types';
 const SLIDE_TYPE = `${R_NS}/slide`;
 const LAYOUT_TYPE = `${R_NS}/slideLayout`;
 const NOTES_TYPE = `${R_NS}/notesSlide`;
@@ -176,16 +175,19 @@ export async function deletePptxSlide(base64: string, index: number): Promise<st
   let relsXml =
     (await zip.file('ppt/_rels/presentation.xml.rels')?.async('string')) ?? '';
 
-  const sldIds = [...presentationXml.matchAll(/<p:sldId\b[^>]*\/>/g)].map((match) => match[0]);
-  const target = sldIds[index] ?? '';
-  const relId = /r:id="([^"]+)"/.exec(target)?.[1] ?? '';
+  // Адресуем слайд по r:id, а не по индексу в p:sldIdLst: если часть связи
+  // не разрешилась, позиции в списке и в редакторе расходятся и удалялся
+  // соседний слайд.
+  const relId = slideRelId(relsXml, part);
+  // Без r:id часть уже удалена, а ссылка осталась — получался битый пакет.
+  if (!relId) return base64;
+  const target = findSlideIdEntry(presentationXml, relId) ?? '';
   if (target) presentationXml = presentationXml.replace(target, '');
-  if (relId) {
-    relsXml = relsXml.replace(
-      new RegExp(`<Relationship\\b[^>]*Id="${escapeRegExp(relId)}"[^>]*/>`),
-      ''
-    );
-  }
+  // Парный </Relationship> тоже возможен — шаблон не должен зависеть от '/>'.
+  relsXml = relsXml.replace(
+    new RegExp(`<Relationship\\b[^>]*Id="${escapeRegExp(relId)}"[^>]*?(?:/>|>[\\s\\S]*?</Relationship>)`),
+    ''
+  );
 
   zip.remove(part);
   zip.remove(part.replace('slides/', 'slides/_rels/') + '.rels');
@@ -204,20 +206,41 @@ export async function movePptxSlide(
   to: number
 ): Promise<string> {
   const zip = await loadZip(base64);
+  const presentation = await readPresentation(zip);
+  const fromPart = presentation.slideParts[from];
+  if (!fromPart) return base64;
   const file = zip.file('ppt/presentation.xml');
   if (!file) return base64;
   let xml = await file.async('string');
-  const ids = [...xml.matchAll(/<p:sldId\b[^>]*\/>/g)].map((match) => match[0]);
-  if (from < 0 || from >= ids.length) return base64;
-
-  const without = ids.filter((_, index) => index !== from);
-  const target = Math.max(0, Math.min(to, without.length));
-  without.splice(target, 0, ids[from]);
-
-  const listMatch = /<p:sldIdLst\b[^>]*>[\s\S]*?<\/p:sldIdLst>/.exec(xml);
+  const listMatch = /<p:sldIdLst\b[^>]*>([\s\S]*?)<\/p:sldIdLst>/.exec(xml);
   if (!listMatch) return base64;
-  const list = `<p:sldIdLst>${without.join('')}</p:sldIdLst>`;
-  xml = xml.replace(listMatch[0], list);
+
+  const relsXml =
+    (await zip.file('ppt/_rels/presentation.xml.rels')?.async('string')) ?? '';
+  const targets = relationshipTargets(relsXml);
+  const entries = slideIdEntries(listMatch[1]);
+  // Переставляем только разрешённые слайды: элементы без валидной связи
+  // остаются на своих местах, поэтому from/to считаются как в редакторе.
+  const visibleRaw: number[] = [];
+  entries.forEach((entry, index) => {
+    const relId = /r:id="([^"]+)"/.exec(entry)?.[1] ?? '';
+    const part = relId ? targets.get(relId) : undefined;
+    if (part && zip.file(normalizeSlideTarget(part))) visibleRaw.push(index);
+  });
+  const fromRaw = visibleRaw[from];
+  if (fromRaw === undefined) return base64;
+
+  // Порядок строим по индексам entries: сравнение строк выбрасывало оба
+  // слайда с одинаковым p:sldId.
+  const order = visibleRaw.filter((raw) => raw !== fromRaw);
+  const targetIndex = Math.max(0, Math.min(to, order.length));
+  order.splice(targetIndex, 0, fromRaw);
+
+  let next = 0;
+  const rebuilt = entries.map((entry, index) =>
+    visibleRaw.includes(index) ? entries[order[next++]] : entry
+  );
+  xml = xml.replace(listMatch[0], `<p:sldIdLst>${rebuilt.join('')}</p:sldIdLst>`);
   zip.file('ppt/presentation.xml', xml);
   return zip.generateAsync({ type: 'base64', compression: 'DEFLATE' });
 }
@@ -674,7 +697,8 @@ async function readPresentation(zip: JSZip): Promise<PresentationInfo> {
   const targets = relationshipTargets(relsXml);
   const slideParts: string[] = [];
 
-  for (const match of xml.matchAll(/<p:sldId\b[^>]*r:id="([^"]+)"[^>]*\/>/g)) {
+  // Тег может быть и парным (<p:sldId ...></p:sldId>) — шаблон с «/>» пропускал его.
+  for (const match of xml.matchAll(/<p:sldId\b[^>]*r:id="([^"]+)"[^>]*>/g)) {
     const target = targets.get(match[1]);
     if (target) slideParts.push(normalizeSlideTarget(target));
   }
@@ -771,29 +795,136 @@ function findShape(doc: Document, shapeId: string): Element | null {
   );
 }
 
+/** Копия узла свойств: один pPr/rPr вставляется в несколько абзацев. */
+function cloneProps(node: Element | null): Element | null {
+  return node ? (node.cloneNode(true) as Element) : null;
+}
+
+/** Свойства рана в виде a:endParaRPr (общий тип CT_TextCharacterProperties). */
+function cloneEndParaRPr(doc: Document, runPr: Element | null): Element | null {
+  if (!runPr) return null;
+  const end = doc.createElementNS(A_NS, 'a:endParaRPr');
+  for (const attribute of Array.from(runPr.attributes)) {
+    end.setAttributeNode(attribute.cloneNode(true) as Attr);
+  }
+  for (const child of Array.from(runPr.childNodes)) end.appendChild(child.cloneNode(true));
+  return end;
+}
+
+/** Ран с текстом. Экранирование делает textContent + XMLSerializer, как и раньше. */
+function appendRun(doc: Document, paragraph: Element, runPr: Element | null, text: string): void {
+  const run = doc.createElementNS(A_NS, 'a:r');
+  if (runPr) run.appendChild(runPr.cloneNode(true));
+  const node = doc.createElementNS(A_NS, 'a:t');
+  node.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
+  node.textContent = text;
+  run.appendChild(node);
+  paragraph.appendChild(run);
+}
+
+/**
+ * Замена текста тела с сохранением форматирования.
+ *
+ * Правка приходит плоскими строками, а размер/цвет/жирный живут в ранах:
+ * новый текст раскладывается по существующим ранам, а не склеивается в один,
+ * иначе инлайн-форматирование внутри абзаца терялось.
+ */
 function replaceTextBody(doc: Document, txBody: Element, paragraphs: string[]): void {
-  const firstRunPr = firstByLocal(txBody, 'rPr')?.cloneNode(true) as Element | null;
-  const pPr = firstByLocal(txBody, 'pPr')?.cloneNode(true) as Element | null;
+  // Снимок исходного тела: pPr и раны адресуем по индексу абзаца, чтобы
+  // пережили правку и lvl маркеров списка, и разбивка на раны.
+  const sources = [...txBody.children]
+    .filter((child) => child.localName === 'p')
+    .map((paragraph) => ({
+      pPr: cloneProps(firstByLocal(paragraph, 'pPr')),
+      endPr: cloneProps(firstByLocal(paragraph, 'endParaRPr')),
+      runs: [...paragraph.children]
+        .filter((child) => child.localName === 'r')
+        .map((run) => ({
+          rPr: cloneProps(firstByLocal(run, 'rPr')),
+          // Длины в кодпоинтах: разрез не должен рвать суррогатную пару.
+          text: Array.from(firstByLocal(run, 't')?.textContent ?? ''),
+        })),
+    }));
+
+  const fallbackRunPr =
+    sources.flatMap((source) => source.runs).find((run) => run.rPr)?.rPr ?? null;
 
   for (const child of [...txBody.children]) {
     if (child.localName === 'p') txBody.removeChild(child);
   }
 
-  for (const paragraph of paragraphs) {
+  // Перевод строки внутри абзаца — отдельный <a:p>: в <a:t> \n не отображается.
+  const lines = paragraphs.flatMap((paragraph, index) =>
+    String(paragraph ?? '')
+      .split('\n')
+      .map((text) => ({ text, index }))
+  );
+
+  let previousPPr: Element | null = null;
+  let previousRunPr: Element | null = fallbackRunPr;
+  let previousEndPr: Element | null = null;
+
+  for (const { text, index } of lines) {
+    const source = sources[index];
+    // Лишний (новый) абзац наследует оформление предыдущего.
+    const pPr: Element | null = source ? source.pPr : previousPPr;
     const p = doc.createElementNS(A_NS, 'a:p');
     if (pPr) p.appendChild(pPr.cloneNode(true));
-    if (paragraph) {
-      const run = doc.createElementNS(A_NS, 'a:r');
-      if (firstRunPr) run.appendChild(firstRunPr.cloneNode(true));
-      const text = doc.createElementNS(A_NS, 'a:t');
-      text.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
-      text.textContent = paragraph;
-      run.appendChild(text);
-      p.appendChild(run);
+    const glyphs = Array.from(text);
+
+    if (glyphs.length === 0) {
+      const ownRunPr = source?.runs.find((run) => run.rPr)?.rPr ?? previousRunPr;
+      const endPr = source?.endPr ?? cloneEndParaRPr(doc, ownRunPr) ?? previousEndPr;
+      p.appendChild(endPr ? endPr.cloneNode(true) : doc.createElementNS(A_NS, 'a:endParaRPr'));
     } else {
-      p.appendChild(doc.createElementNS(A_NS, 'a:endParaRPr'));
+      const template = source?.runs ?? [];
+      const original = template.flatMap((run) => run.text);
+      // Неизменённые начало и конец абзаца оставляют границы ранов на месте:
+      // правка в середине не перекрашивает соседние раны.
+      const shared = Math.min(original.length, glyphs.length);
+      let prefix = 0;
+      while (prefix < shared && original[prefix] === glyphs[prefix]) prefix += 1;
+      let suffix = 0;
+      while (
+        suffix < shared - prefix &&
+        original[original.length - 1 - suffix] === glyphs[glyphs.length - 1 - suffix]
+      ) {
+        suffix += 1;
+      }
+      // Куски: неизменённые края сдвигаются, изменённая середина масштабируется
+      // пропорционально — границы остаются монотонными, текст не теряется.
+      const position = (at: number): number => {
+        // Строго: дописанный в конец текст должен достаться последнему рану.
+        if (at < prefix) return at;
+        if (at >= original.length - suffix) return at + glyphs.length - original.length;
+        return (
+          prefix +
+          Math.round(
+            ((at - prefix) * (glyphs.length - prefix - suffix)) /
+              (original.length - prefix - suffix)
+          )
+        );
+      };
+
+      let boundary = 0;
+      let written = false;
+      template.forEach((run) => {
+        const from = position(boundary);
+        boundary += run.text.length;
+        const slice = glyphs.slice(from, position(boundary)).join('');
+        if (!slice) return; // опустевший ран удаляем, а не держим пустым
+        const runPr = run.rPr ?? previousRunPr;
+        appendRun(doc, p, runPr, slice);
+        written = true;
+        if (runPr) previousRunPr = runPr;
+      });
+      // Ран не нашлось (пустой шаблон) — текст пишем свойствами предыдущего.
+      if (!written) appendRun(doc, p, template.find((run) => run.rPr)?.rPr ?? previousRunPr, text);
     }
+
     txBody.appendChild(p);
+    previousPPr = pPr ?? previousPPr;
+    previousEndPr = source?.endPr ?? previousEndPr;
   }
 }
 
@@ -838,7 +969,7 @@ function insertIntoSlideList(xml: string, entry: string, index: number): string 
       (open) => `${open}<p:sldIdLst>${entry}</p:sldIdLst>`
     );
   }
-  const ids = [...list[1].matchAll(/<p:sldId\b[^>]*\/>/g)].map((match) => match[0]);
+  const ids = slideIdEntries(list[1]);
   const target = Math.max(0, Math.min(index, ids.length));
   ids.splice(target, 0, entry);
   return xml.replace(list[0], `<p:sldIdLst>${ids.join('')}</p:sldIdLst>`);
@@ -916,6 +1047,34 @@ function normalizeSlideTarget(target: string): string {
   return target.startsWith('/')
     ? target.slice(1)
     : `ppt/${target.replace(/^\.\.\//, '')}`;
+}
+
+/** Элементы p:sldId в порядке списка: самозакрытый или парный тег. */
+function slideIdEntries(listXml: string): string[] {
+  return [...listXml.matchAll(/<p:sldId\b[^>]*?(?:\/>|>[\s\S]*?<\/p:sldId>)/g)].map(
+    (match) => match[0]
+  );
+}
+
+/** r:id связи, указывающей на часть слайда: адресуем слайд по ней, не по индексу. */
+function slideRelId(relsXml: string, part: string): string {
+  for (const rel of relsXml.matchAll(/<Relationship\b[^>]*>/g)) {
+    const tag = rel[0];
+    if (!/Type="[^"]*\/slide"/.test(tag)) continue;
+    const id = /Id="([^"]+)"/.exec(tag)?.[1];
+    const target = /Target="([^"]+)"/.exec(tag)?.[1];
+    if (!id || !target) continue;
+    if (normalizeSlideTarget(target) === part) return id;
+  }
+  return '';
+}
+
+/** Элемент p:sldId с нужным r:id (самозакрытый или парный). */
+function findSlideIdEntry(presentationXml: string, relId: string): string | null {
+  const pattern = new RegExp(
+    `<p:sldId\\b[^>]*r:id="${escapeRegExp(relId)}"[^>]*?(?:/>|>[\\s\\S]*?</p:sldId>)`
+  );
+  return pattern.exec(presentationXml)?.[0] ?? null;
 }
 
 function localeNumber(value: string): number {

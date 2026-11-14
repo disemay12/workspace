@@ -203,7 +203,8 @@ function run(): void {
   }
 
   fs.writeFileSync(path.join(ROOT, 'v11-check.json'), JSON.stringify(out, null, 2), 'utf-8');
-  app.exit(0);
+  // out.errors заполняется только в catch (в успехе — пустой массив).
+  app.exit(Array.isArray(out.errors) && out.errors.length > 0 ? 1 : 0);
 }
 
 run();

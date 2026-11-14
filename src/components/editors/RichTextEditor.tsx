@@ -350,9 +350,13 @@ export const RichTextEditor: React.FC<Props> = ({
 
   /* ---------------- Рендеринг диаграмм Mermaid ---------------- */
   useEffect(() => {
-    if (viewMode === 'visual' || viewMode === 'split') {
+    if (viewMode !== 'visual' && viewMode !== 'split') return;
+    // Mermaid перерисовывает схему целиком: на каждый набранный символ это
+    // дорого, поэтому ждём паузу в наборе.
+    const timer = window.setTimeout(() => {
       void renderMermaidBlocks(previewRef.current);
-    }
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [tab.content, viewMode]);
 
   /* ---------------- Вставка текста из чата AI ---------------- */

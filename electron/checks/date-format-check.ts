@@ -2,12 +2,31 @@
  * Проверка форматирования дат: коды форматов из реальных русских файлов
  * Excel, включая те, на которых встроенный SSF выбрасывает исключение.
  */
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   formatSerialDate,
   isDateFormat,
   formatCellValue,
   parseDateInput,
 } from '../../src/lib/dateFormat';
+
+/**
+ * Корень проекта — поиск package.json вверх: набор запускают и из
+ * dist-electron/, и из dist-electron/electron/checks/, а жёсткий подъём на три
+ * уровня во втором случае уходил бы за пределы проекта.
+ */
+function resolveProjectRoot(): string {
+  let dir = __dirname;
+  for (let i = 0; i < 4; i++) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.join(__dirname, '..', '..', '..');
+}
+const ROOT = resolveProjectRoot();
 
 const failures: string[] = [];
 let passed = 0;
@@ -100,4 +119,26 @@ if (failures.length > 0) {
 }
 console.log('='.repeat(72));
 console.log(failures.length === 0 ? '  ИТОГ: ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ' : '  ИТОГ: ЕСТЬ ПРОВАЛЫ');
+
+// Набор запускается и как отдельный скрипт, и как suite из run-all-checks.js,
+// который сводит результат по JSON рядом с остальными *-check.json.
+fs.writeFileSync(
+  path.join(ROOT, 'date-format-check.json'),
+  JSON.stringify(
+    {
+      steps: [
+        {
+          name: 'dateFormat',
+          ok: failures.length === 0,
+          passed,
+          failures,
+        },
+      ],
+    },
+    null,
+    2
+  ),
+  'utf-8'
+);
+
 process.exit(failures.length === 0 ? 0 : 1);

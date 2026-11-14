@@ -397,5 +397,5 @@ app.whenReady().then(async () => {
     JSON.stringify(out, null, 2),
     'utf-8'
   );
-  app.exit(0);
+  app.exit(out.fatal || out.errors.length > 0 ? 1 : 0);
 });

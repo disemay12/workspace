@@ -1,11 +1,53 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import crypto from 'crypto';
 import path from 'path';
+
+/**
+ * CSP без 'unsafe-inline' для собранной страницы.
+ *
+ * В index.html есть два намеренных инлайн-скрипта (тема до первой отрисовки и
+ * перехват ошибок загрузки), поэтому 'unsafe-inline' в dev остаётся: HMR и
+ * React-refresh вставляют свои инлайн-скрипты. В сборке каждый инлайн-скрипт
+ * заменяется своим sha256, и 'unsafe-inline' из script-src убирается — тогда
+ * `javascript:`-ссылки и инъекция скрипта в документ не исполняются вовсе.
+ */
+function cspInlineHashes(): Plugin {
+  return {
+    name: 'workspace-csp-inline-hashes',
+    apply: 'build',
+    enforce: 'post',
+    transformIndexHtml(html) {
+      const hashes: string[] = [];
+      const inline = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
+      for (const match of html.matchAll(inline)) {
+        // Парсер HTML нормализует переводы строк до разбора, поэтому хеш
+        // считается по тексту с LF: с CRLF (Windows-исходник) он не совпадал
+        // и Chromium блокировал скрипт темы.
+        const body = match[1].replace(/\r\n?/g, '\n');
+        if (!body.trim()) continue;
+        hashes.push(`'sha256-${crypto.createHash('sha256').update(body, 'utf8').digest('base64')}'`);
+      }
+      if (hashes.length === 0) return html;
+
+      const replaced = html.replace(
+        /(script-src[^;"]*)'unsafe-inline'/,
+        (_all, prefix: string) => `${prefix}${hashes.join(' ')}`
+      );
+      if (replaced === html) {
+        // CSP изменился — значит directive не найден; тихо оставлять
+        // 'unsafe-inline' нельзя, иначе защита исчезает незаметно.
+        throw new Error('CSP: не удалось заменить unsafe-inline в script-src');
+      }
+      return replaced;
+    },
+  };
+}
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), cspInlineHashes()],
   resolve: {
     alias: {
       '@': path.resolve(import.meta.dirname, './src'),

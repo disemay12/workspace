@@ -12,7 +12,6 @@ import { BrowserWindow } from 'electron';
 
 let currentWatcher: fs.FSWatcher | null = null;
 let debounceTimer: NodeJS.Timeout | null = null;
-let currentWatchedDir = '';
 
 const IGNORED_PATTERNS = [
   /[\\/]\.git([\\/]|$)/i,
@@ -26,20 +25,11 @@ const IGNORED_PATTERNS = [
 ];
 
 export function setWatchRoot(dirPath: string, windowGetter: () => BrowserWindow | null): void {
-  if (currentWatcher) {
-    try {
-      currentWatcher.close();
-    } catch {
-      // Игнорируем ошибку закрытия предыдущего watcher
-    }
-    currentWatcher = null;
-    currentWatchedDir = '';
-  }
+  stopWatch();
 
   if (!dirPath || !fs.existsSync(dirPath)) return;
 
   try {
-    currentWatchedDir = dirPath;
     currentWatcher = fs.watch(dirPath, { recursive: true }, (eventType, filename) => {
       if (!filename) return;
 
@@ -71,6 +61,11 @@ export function stopWatch(): void {
       // ignore
     }
     currentWatcher = null;
-    currentWatchedDir = '';
+  }
+  // Без сброса таймера после остановки наблюдения приходило одно лишнее
+  // событие в рендерер.
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
   }
 }

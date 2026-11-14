@@ -28,10 +28,14 @@ BuildersWorkspace/
 *.tsbuildinfo
 
 # ---------- Тестовые артефакты проверок ----------
-test-workspace/
-test-workspace-doc-agent/
+# Все песочницы наборов: test-workspace, test-workspace-docx, test-workspace-model,
+# test-workspace-doc-agent (список конкретных имён пропускал новые).
+test-workspace*/
 *-check.json
 final-report.txt
+# Прогон проверок: блокировка и копии результатов по каждому запуску
+.checks.lock
+.checks-runs/
 smoke-out.txt
 smoke-result.json
 smoke-screenshot.png

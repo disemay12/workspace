@@ -335,12 +335,15 @@ async function main() {
   });
 
   const js = (body) => win.webContents.executeJavaScript(`(async () => { ${body} })()`);
+  // Строка дерева содержит ещё размер и дату, поэтому ищем по title, а открываем
+  // двойным щелчком: одиночный даёт вкладку-предпросмотр без привязки блоков.
   const clickFile = () => js(`
-    const nodes = [...document.querySelectorAll('div')]
-      .filter((d) => d.textContent?.trim() === ${JSON.stringify(DOC_NAME)});
-    if (!nodes.length) return false;
-    const clickable = nodes.find((d) => d.className.includes('cursor-pointer')) || nodes[0];
-    clickable.click();
+    const node = [...document.querySelectorAll('[title]')].find(
+      (d) => (d.getAttribute('title') || '').split(' — ')[0] === ${JSON.stringify(DOC_NAME)}
+    );
+    if (!node) return false;
+    node.click();
+    node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
     return true;
   `);
 
@@ -468,6 +471,7 @@ async function main() {
     let paragraphXml = '';
     let tocXml = '';
     let linkXml = '';
+    let linkRelsXml = '';
     let sectionXml = '';
     let tabsXml = '';
     let nestedXml = '';
@@ -493,6 +497,7 @@ async function main() {
       tocXml = (await tocZip.file('word/document.xml')?.async('string')) ?? '';
       const linkZip = await JSZip.loadAsync(Buffer.from(writerDocs.link, 'base64'));
       linkXml = (await linkZip.file('word/document.xml')?.async('string')) ?? '';
+    linkRelsXml = (await linkZip.file('word/_rels/document.xml.rels')?.async('string')) ?? '';
       const sectionZip = await JSZip.loadAsync(Buffer.from(writerDocs.section, 'base64'));
       sectionXml = (await sectionZip.file('word/document.xml')?.async('string')) ?? '';
       const tabsZip = await JSZip.loadAsync(Buffer.from(writerDocs.tabs, 'base64'));
@@ -535,6 +540,11 @@ async function main() {
         (await tocRefreshedZip.file('word/document.xml')?.async('string')) ?? '';
       runIdsHtml = String(writerDocs.runIdsHtml ?? '');
     }
+    // Диагностика записи ссылки: видно, что реально попало в пакет.
+    results.linkDebug = {
+      doc: linkXml.slice(0, 600),
+      rels: linkRelsXml.slice(0, 600),
+    };
     step('paragraphWriter', {
       available: Boolean(writerDocs),
       line: paragraphXml.includes('w:line="360"'),
@@ -550,10 +560,17 @@ async function main() {
         paragraphXml.includes('w:sz="16"') &&
         paragraphXml.includes('w:color="000000"'),
       tocField: /TOC \\o "1-3"/.test(tocXml) && tocXml.includes('w:fldChar'),
+      // Ссылка пишется каноническим <w:hyperlink r:id>, а адрес — в
+      // word/_rels/document.xml.rels с TargetMode="External"; старое поле
+      // w:fldSimple HYPERLINK тоже принимаем для обратной совместимости.
       hyperlink:
-        linkXml.includes('HYPERLINK') &&
-        linkXml.includes('https://example.com') &&
-        linkXml.includes('<w:fldSimple'),
+        (linkXml.includes('<w:hyperlink') &&
+          /r:id="rId[A-Za-z]*\d+"/.test(linkXml) &&
+          linkRelsXml.includes('https://example.com') &&
+          linkRelsXml.includes('TargetMode="External"')) ||
+        (linkXml.includes('HYPERLINK') &&
+          linkXml.includes('https://example.com') &&
+          linkXml.includes('<w:fldSimple')),
       sectionBreak: /<w:pPr>[^]*?<w:sectPr>/.test(sectionXml),
       tabs:
         tabsXml.includes('<w:tabs>') &&
@@ -846,6 +863,57 @@ async function main() {
       contentControlVisible: reopened.text.includes('только просмотр'),
       bodyKept: reopened.text.includes('Последний абзац.'),
       imagesKept: reopened.images >= 2,
+    });
+
+    /* ---------- Round-trip ссылки и вертикального слияния ----------
+     * Единственный путь, который не покрывали прежние шаги: прочитать
+     * документ с w:hyperlink/vMerge, отредактировать и сохранить поверх
+     * исходного пакета (htmlToDocxBase64 + sourceBase64 — тот же вызов, что
+     * делает WordEditor). Раньше ссылки и rowspan терялись именно здесь. */
+    const roundTrip = await win.webContents.executeJavaScript(`
+      (async () => {
+        const mod = window.__docx;
+        const source = await mod.htmlToDocxBase64(
+          '<p><a href="https://example.com/rt">Ссылка</a> и текст</p>' +
+          '<table><tbody><tr><td rowspan="2">Объединено</td><td>1</td></tr>' +
+          '<tr><td>2</td></tr></tbody></table>'
+        );
+        const read = await mod.docxBase64ToHtml(source);
+        const edited = String(read.html).replace('и текст', 'и текст с правкой');
+        const saved = await mod.htmlToDocxBase64(edited, undefined, { sourceBase64: source });
+        const readAgain = await mod.docxBase64ToHtml(saved);
+        return {
+          saved,
+          readHtml: String(read.html),
+          readAgainHtml: String(readAgain.html),
+        };
+      })()
+    `);
+
+    // Кладём результат рядом с набором: его же открывает ручная проверка в Word.
+    fs.writeFileSync(
+      path.join(SANDBOX, 'link-roundtrip.docx'),
+      Buffer.from(roundTrip.saved, 'base64')
+    );
+
+    const savedZip = await JSZip.loadAsync(Buffer.from(roundTrip.saved, 'base64'));
+    const savedDocXml = (await savedZip.file('word/document.xml')?.async('string')) ?? '';
+    const savedRelsXml =
+      (await savedZip.file('word/_rels/document.xml.rels')?.async('string')) ?? '';
+
+    step('roundTripLinks', {
+      // Чтение: w:hyperlink превращается в <a href>.
+      readHasLink: roundTrip.readHtml.includes('https://example.com/rt'),
+      readHasRowspan: /rowspan="2"/i.test(roundTrip.readHtml),
+      // Запись: правка абзаца сохраняет канонический <w:hyperlink r:id> и отношение.
+      savedHasHyperlink: /<w:hyperlink\b/.test(savedDocXml),
+      savedRelsHaveLink:
+        savedRelsXml.includes('https://example.com/rt') &&
+        savedRelsXml.includes('TargetMode="External"'),
+      // Перечитывание: ссылка и слияние на месте, правка применилась.
+      reopenedLink: roundTrip.readAgainHtml.includes('https://example.com/rt'),
+      reopenedRowspan: /rowspan="2"/i.test(roundTrip.readAgainHtml),
+      editApplied: roundTrip.readAgainHtml.includes('и текст с правкой'),
     });
 
     results.passed = results.steps.every((entry) =>

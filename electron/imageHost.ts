@@ -10,7 +10,9 @@
  * берётся со страницы, а большие наборы режутся на последовательные пачки,
  * каждая — в своём окне. Приложение возвращает ссылки на полученные альбомы.
  */
-import { BrowserWindow, ipcMain, shell } from 'electron';
+import { BrowserWindow, ipcMain } from 'electron';
+import { openExternalSafe } from './safeOpen';
+import { assertReadablePath } from './fsGuard';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -198,11 +200,24 @@ function waitForResult(win: BrowserWindow, patternRegExp: RegExp, timeoutMs: num
     let poll: NodeJS.Timeout | undefined;
     let timer: NodeJS.Timeout | undefined;
 
+    const onNavigate = (_event: unknown, url: string) => check(url);
+    const onLoad = () => {
+      void win.webContents
+        .executeJavaScript('window.location.href')
+        .then((url) => check(String(url)))
+        .catch(() => undefined);
+    };
+
     const finish = (url: string) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       if (poll) clearInterval(poll);
+      // Без снятия обработчиков на каждый альбом остаются слушатели окна,
+      // которое уже никто не закрывает.
+      win.webContents.removeListener('did-navigate', onNavigate);
+      win.webContents.removeListener('did-navigate-in-page', onNavigate);
+      win.webContents.removeListener('did-finish-load', onLoad);
       resolve(url);
     };
 
@@ -210,14 +225,9 @@ function waitForResult(win: BrowserWindow, patternRegExp: RegExp, timeoutMs: num
       if (patternRegExp.test(url)) finish(url);
     };
 
-    win.webContents.on('did-navigate', (_event, url) => check(url));
-    win.webContents.on('did-navigate-in-page', (_event, url) => check(url));
-    win.webContents.on('did-finish-load', () => {
-      void win.webContents
-        .executeJavaScript('window.location.href')
-        .then((url) => check(String(url)))
-        .catch(() => undefined);
-    });
+    win.webContents.on('did-navigate', onNavigate);
+    win.webContents.on('did-navigate-in-page', onNavigate);
+    win.webContents.on('did-finish-load', onLoad);
 
     poll = setInterval(() => {
       void win.webContents
@@ -228,15 +238,30 @@ function waitForResult(win: BrowserWindow, patternRegExp: RegExp, timeoutMs: num
 
     timer = setTimeout(() => finish(''), timeoutMs);
 
-    win.on('closed', () => finish(''));
+    win.once('closed', () => finish(''));
   });
 }
+
+const MAX_BATCH_BASE64_CHARS = 100 * 1024 * 1024;
 
 async function openBatch(
   host: ImageHostConfig,
   files: string[],
   options: { captureAlbum: boolean; authorized: boolean }
 ): Promise<{ album?: string; count: number }> {
+  let totalBytes = 0;
+  for (const file of files) {
+    try {
+      totalBytes += fs.statSync(file).size;
+    } catch {
+      // файл исчез между выбором и загрузкой — его поймает readFileSync
+    }
+  }
+  // Все файлы сразу попадают в base64 в памяти главного процесса.
+  if (totalBytes * 1.4 > MAX_BATCH_BASE64_CHARS) {
+    throw new Error('Пачка изображений больше 100 МБ — уменьшите число файлов за раз');
+  }
+
   const payload: UploadPayload[] = files.map((file) => ({
     name: path.basename(file),
     type: MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
@@ -250,13 +275,23 @@ async function openBatch(
     autoHideMenuBar: true,
     webPreferences: { sandbox: true, contextIsolation: true },
   });
+  // Ссылку присылает сторонняя страница: file: и зарегистрированные
+  // протоколы запустили бы обработчик в системе.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    openExternalSafe(url);
     return { action: 'deny' };
   });
 
   const script = buildInjectScript(payload, host.selectors, Boolean(host.supportsPaste));
+  const expectedHost = new URL(host.url).host;
   const attach = () => {
+    // Скрипт вставляет base64 в поля страницы: на чужом домене (редирект,
+    // всплывающее окно сайта) этого делать нельзя.
+    try {
+      if (new URL(win.webContents.getURL()).host !== expectedHost) return;
+    } catch {
+      return;
+    }
     void win.webContents.executeJavaScript(script).catch(() => undefined);
   };
   win.webContents.on('did-finish-load', attach);
@@ -265,9 +300,15 @@ async function openBatch(
   const pattern = new RegExp(host.resultPattern ?? '^$');
   const albumPromise = options.captureAlbum ? waitForResult(win, pattern, 120_000) : Promise.resolve('');
 
-  await win.loadURL(host.url);
-  const album = await albumPromise;
-  return { album: album || undefined, count: files.length };
+  try {
+    await win.loadURL(host.url);
+    const album = await albumPromise;
+    return { album: album || undefined, count: files.length };
+  } finally {
+    // Окно с чужой страницей больше не нужно: без destroy на каждую пачку
+    // оставалось живое окно с загруженным сайтом.
+    if (!win.isDestroyed()) win.destroy();
+  }
 }
 
 export function registerImageHosts(): void {
@@ -285,6 +326,14 @@ export function registerImageHosts(): void {
 
       const accepted: string[] = [];
       for (const file of existing) {
+        // Файлы уходят в base64 на сторонний сайт: секреты приложения и
+        // каталоги ключей здесь закрыты так же, как на чтении.
+        try {
+          assertReadablePath(file);
+        } catch (err) {
+          result.skipped!.push({ path: file, reason: (err as Error).message });
+          continue;
+        }
         const problem = hostFileProblem(file, host);
         if (problem) result.skipped!.push({ path: file, reason: problem });
         else accepted.push(file);

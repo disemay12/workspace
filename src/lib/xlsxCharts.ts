@@ -7,6 +7,7 @@
  */
 import JSZip from 'jszip';
 import { ChartSpec, parseRange, toColumnName } from './sheetFormatting';
+import { readSheetMap } from './xlsxStyles';
 
 const EMU_PER_PIXEL = 9525;
 const DEFAULT_COL_PX = 104;
@@ -53,18 +54,25 @@ function seriesXml(
   sheet: string,
   range: ReturnType<typeof parseRange>,
   seriesIndex: number,
-  col: number
+  col: number,
+  withCategories: boolean,
+  hasHeader: boolean
 ): string {
   if (!range) return '';
-  const dataStart = range.startRow + 1;
-  const name = cellRef(sheet, range.startRow, col);
-  const categories = rangeRef(sheet, dataStart, range.startCol, range.endRow, range.startCol);
-  const values = rangeRef(sheet, dataStart, col, range.endRow, col);
+  // Заголовок серии — первая строка диапазона, данные начинаются со следующей.
+  const firstData = hasHeader ? range.startRow + 1 : range.startRow;
+  const name = hasHeader ? cellRef(sheet, range.startRow, col) : '';
+  const categories = withCategories
+    ? `<c:cat><c:strRef><c:f>${escapeXml(
+        rangeRef(sheet, firstData, range.startCol, range.endRow, range.startCol)
+      )}</c:f></c:strRef></c:cat>`
+    : '';
+  const values = rangeRef(sheet, firstData, col, range.endRow, col);
   return [
     '<c:ser>',
     `<c:idx val="${seriesIndex}"/><c:order val="${seriesIndex}"/>`,
-    `<c:tx><c:strRef><c:f>${escapeXml(name)}</c:f></c:strRef></c:tx>`,
-    `<c:cat><c:strRef><c:f>${escapeXml(categories)}</c:f></c:strRef></c:cat>`,
+    name ? `<c:tx><c:strRef><c:f>${escapeXml(name)}</c:f></c:strRef></c:tx>` : '',
+    categories,
     `<c:val><c:numRef><c:f>${escapeXml(values)}</c:f></c:numRef></c:val>`,
     '</c:ser>',
   ].join('');
@@ -74,13 +82,19 @@ function buildChartXml(sheet: string, chart: ChartSpec): string {
   const range = parseRange(chart.range);
   if (!range) return '';
   const series: string[] = [];
-  const lastCol = range.endCol;
-  const firstSeriesCol = range.startCol + 1;
+  // Если в диапазоне один столбец, категорий нет: данные — он сам. Раньше
+  // серия не создавалась вовсе (startCol + 1 > endCol) и Excel считал
+  // диаграмму повреждённой.
+  const withCategories = range.endCol > range.startCol;
+  const firstSeriesCol = withCategories ? range.startCol + 1 : range.startCol;
+  // Заголовок не может быть единственной строкой: ссылка A2:A1 ломает файл.
+  // Без явного признака считаем заголовком первую строку — как раньше.
+  const hasHeader = range.endRow > range.startRow && (chart.hasHeader ?? true);
   if (chart.type === 'pie') {
-    series.push(seriesXml(sheet, range, 0, firstSeriesCol));
+    series.push(seriesXml(sheet, range, 0, firstSeriesCol, withCategories, hasHeader));
   } else {
-    for (let col = firstSeriesCol; col <= lastCol; col++) {
-      series.push(seriesXml(sheet, range, col - firstSeriesCol, col));
+    for (let col = firstSeriesCol; col <= range.endCol; col++) {
+      series.push(seriesXml(sheet, range, col - firstSeriesCol, col, withCategories, hasHeader));
     }
   }
 
@@ -184,51 +198,6 @@ function buildDrawingXml(sheet: string, charts: ChartSpec[], chartFileIndex: num
   return { xml, rels: relsXml, chartFiles };
 }
 
-interface SheetEntry {
-  name: string;
-  path: string;
-}
-
-async function readSheetMap(zip: JSZip): Promise<SheetEntry[]> {
-  const workbookFile = zip.file('xl/workbook.xml');
-  const relsFile = zip.file('xl/_rels/workbook.xml.rels');
-  if (!workbookFile || !relsFile) return [];
-  const workbookXml = await workbookFile.async('string');
-  const relsXml = await relsFile.async('string');
-
-  const targets = new Map<string, string>();
-  for (const match of relsXml.matchAll(/<Relationship\b[^>]*\/?>/g)) {
-    const tag = match[0];
-    const id = /\bId="([^"]+)"/.exec(tag)?.[1];
-    const target = /\bTarget="([^"]+)"/.exec(tag)?.[1];
-    if (id && target) targets.set(id, target);
-  }
-
-  const result: SheetEntry[] = [];
-  for (const match of workbookXml.matchAll(/<sheet\b[^>]*\/?>/g)) {
-    const tag = match[0];
-    const name = /\bname="([^"]+)"/.exec(tag)?.[1];
-    const rid = /\br:id="([^"]+)"/.exec(tag)?.[1];
-    if (!name || !rid) continue;
-    const target = targets.get(rid);
-    if (!target) continue;
-    const normalized = target.startsWith('/')
-      ? target.slice(1)
-      : `xl/${target.replace(/^\.\//, '')}`;
-    result.push({ name, path: normalized.replace(/\/\.\//g, '/') });
-  }
-  return result;
-}
-
-function decodeEntities(value: string): string {
-  return value
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
-}
-
 export interface ChartExportEntry {
   sheet: string;
   charts: ChartSpec[];
@@ -251,9 +220,8 @@ export async function injectChartsIntoXlsx(
   let drawingCursor = 1;
 
   for (const entry of relevant) {
-    const sheetEntry = sheetMap.find(
-      (item) => decodeEntities(item.name) === entry.sheet
-    );
+    // Имя в карте уже декодировано.
+    const sheetEntry = sheetMap.find((item) => item.name === entry.sheet);
     if (!sheetEntry) continue;
     const sheetFile = zip.file(sheetEntry.path);
     if (!sheetFile) continue;

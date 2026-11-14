@@ -187,12 +187,17 @@ npm start
 npm run typecheck
 ```
 
-Полный прогон проверок (типы, сборка, IPC, рендеринг, AI). Часть сценариев
-требует настроенный API-ключ; `integration-check` может зависать в среде без сети:
+Полный прогон проверок (типы, сборка, IPC, рендеринг, AI). Наборы с реальным
+API подключаются только по явному флагу:
 
 ```bash
-npm run checks
+npm run checks        # без сети и без ключа
+npm run checks:live   # + обход CORS и сквозной ответ модели (нужен secrets.local.ps1)
 ```
+
+Каждый прогон пишет отчёт в `final-report.txt` и копию в `.checks-runs/<время>/`
+(там же профили Electron по наборам). Одновременные прогоны блокируются
+`.checks.lock` — общий `dist/` у них один.
 
 > **Примечание для ручного запуска.** Если в системе задана переменная
 > `ELECTRON_RUN_AS_NODE`, Electron запустится как обычный Node и упадёт.
@@ -206,7 +211,7 @@ npm run checks
 
 ```bash
 npm run build:portable   # WorkSpace\WorkSpace.exe + app.asar
-npm run pack:release     # dist\WorkSpace-<version>-win-x64.zip
+npm run pack:release     # release\WorkSpace-<version>-win-x64.zip
 ```
 
 Рекомендуемая папка запуска — `C:\WorkSpace` (не из временных и не из

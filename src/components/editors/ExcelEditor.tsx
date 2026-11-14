@@ -33,7 +33,6 @@ import {
   Replace,
   Palette,
   BarChart3,
-  MessageSquare,
   ListChecks,
   SlidersHorizontal,
   Table2,
@@ -43,7 +42,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { registerSheetController } from '../../services/sheetBridge';
-import type { SheetEditResult, SheetReadResult } from '../../services/sheetBridge';
+import type { SheetReadResult } from '../../services/sheetBridge';
 import { ClipboardPaste, Undo2, Redo2 } from 'lucide-react';
 import { parseClipboardTable } from '../../lib/clipboardTable';
 import * as SheetFmt from '../../lib/sheetFormatting';
@@ -83,7 +82,13 @@ import {
 interface Props {
   tab: OpenTab;
   onChange: (newContent: string) => void;
-  onSave: () => void | Promise<unknown>;
+  /** contentOverride — живое содержимое: tab.content к моменту вызова отстаёт. */
+  onSave: (contentOverride?: string) => void | Promise<unknown>;
+  /** Регистрирует сериализатор вкладки: Ctrl+S из App должен идти через редактор. */
+  onRegisterSave?: (
+    tabId: string,
+    saver: (() => void | Promise<unknown>) | null
+  ) => void;
   onAskAI?: (prompt: string, contextText: string) => void;
   /** Применяет действие AI к таблице (вставка формулы, заполнение и т.п.). */
   onAIApply?: (action: AIAction, result: string) => void;
@@ -108,13 +113,20 @@ const MIN_COLS = 16;
 /** Сколько строк подгружается за один заход в режиме больших файлов. */
 const WINDOW_ROWS = 4000;
 
+/** Самая длинная строка: спред Math.max(...rows) падал на ~150 k аргументов. */
+function maxRowLength(rows: readonly { length: number }[]): number {
+  let max = 0;
+  for (const row of rows) if (row.length > max) max = row.length;
+  return max;
+}
+
 /** Плотная сетка из окна строк воркера: та же форма, что и у полного разбора. */
 function buildWindowGrid(
   raw: (string | number | boolean | null)[][],
   minRows = MIN_ROWS,
   minCols = MIN_COLS
 ): (string | number | boolean | null)[][] {
-  const cols = Math.max(minCols, ...raw.map((row) => row.length), 1);
+  const cols = Math.max(minCols, maxRowLength(raw), 1);
   const count = Math.max(raw.length, minRows);
   const grid: (string | number | boolean | null)[][] = [];
   for (let row = 0; row < count; row++) {
@@ -240,7 +252,14 @@ const FUNCTION_HINTS: Record<string, string> = {
   MIN: 'МИН(число1; …) — минимум',
 };
 
-export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, onAIApply }) => {
+export const ExcelEditor: React.FC<Props> = ({
+  tab,
+  onChange,
+  onSave,
+  onRegisterSave,
+  onAskAI,
+  onAIApply,
+}) => {
   const [sheets, setSheets] = useState<Workbook>({});
   const [meta, setMeta] = useState<SheetFmt.WorkbookMeta>({});
   const [sheetNames, setSheetNames] = useState<string[]>([]);
@@ -403,6 +422,15 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     totals: Record<string, number>;
     loaded: Record<string, number>;
   } | null>(null);
+  /** Ширина листов в оконном режиме: обход всего грида на каждое окно — O(n²). */
+  const windowedColsRef = useRef<Record<string, number>>({});
+
+  /** Ширина листа для дописываемых строк: кэш плюс длина пришедшего окна. */
+  const windowCols = useCallback((sheet: string, rows: readonly { length: number }[]): number => {
+    const cols = Math.max(MIN_COLS, windowedColsRef.current[sheet] ?? 0, maxRowLength(rows));
+    windowedColsRef.current[sheet] = cols;
+    return cols;
+  }, []);
 
   /* ---------------- Разбор книги ---------------- */
 
@@ -425,7 +453,12 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         windowedRef.current?.close();
         windowedRef.current = opened.source;
         const totals: Record<string, number> = {};
-        for (const sheetMeta of opened.meta) totals[sheetMeta.name] = sheetMeta.rows;
+        const colsBySheet: Record<string, number> = {};
+        for (const sheetMeta of opened.meta) {
+          totals[sheetMeta.name] = sheetMeta.rows;
+          colsBySheet[sheetMeta.name] = Math.max(MIN_COLS, sheetMeta.cols);
+        }
+        windowedColsRef.current = colsBySheet;
         const first = opened.meta[0]?.name ?? 'Лист 1';
         const rows = await opened.source.getWindow(first, 0, WINDOW_ROWS);
         if (cancelled) return true;
@@ -459,6 +492,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         windowedRef.current.close();
         windowedRef.current = null;
         windowedStateRef.current = null;
+        windowedColsRef.current = {};
         setWindowed(null);
       }
       try {
@@ -504,7 +538,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         }
 
         const rows = Math.max(raw.length, MIN_ROWS);
-        const cols = Math.max(MIN_COLS, ...raw.map((r) => r.length), 1);
+        const cols = Math.max(MIN_COLS, maxRowLength(raw), 1);
 
         const sheetGrid: Grid = [];
         for (let r = 0; r < rows; r++) {
@@ -583,6 +617,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       windowedRef.current?.close();
       windowedRef.current = null;
       windowedStateRef.current = null;
+      windowedColsRef.current = {};
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id, tab.reloadKey, reloadToken]);
@@ -674,14 +709,9 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       if (rows.length === 0) return;
       state.loaded[sheet] = loaded + rows.length;
       windowedStateRef.current = state;
+      const cols = windowCols(sheet, rows);
       setSheets((prev) => {
         const grid = prev[sheet] ? [...prev[sheet]] : [];
-        const cols = Math.max(
-          MIN_COLS,
-          ...grid.map((row) => row.length),
-          ...rows.map((row) => row.length),
-          1
-        );
         rows.forEach((row, index) => {
           const values: (string | number | boolean | null)[] = [];
           for (let col = 0; col < cols; col++) values.push(row[col] ?? '');
@@ -693,7 +723,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     } catch (err) {
       setError(`Не удалось загрузить строки: ${(err as Error).message}`);
     }
-  }, []);
+  }, [windowCols]);
 
   // Прокрутка близко к краю — просим следующее окно.
   useEffect(() => {
@@ -792,7 +822,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           if (sheetMeta) {
             const rowIndexes = Object.keys(sheetMeta.rowHeights).map(Number);
             if (rowIndexes.length > 0) {
-              const maxRow = Math.max(...rowIndexes);
+              // Тот же спред: у книги с высотами всех строк Math.max падал до записи файла.
+              const maxRow = rowIndexes.reduce((a, b) => Math.max(a, b), 0);
               sheet['!rows'] = Array.from({ length: maxRow + 1 }, (_, index) => ({
                 hpx: sheetMeta.rowHeights[index] ?? SheetFmt.DEFAULT_ROW_HEIGHT,
               }));
@@ -856,21 +887,25 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
         if (seq === syncSeqRef.current) onChange(content);
         return content;
       } catch (err) {
-        console.error('Ошибка синхронизации книги', err);
+        // Молча вернуть null нельзя: правки остались бы только в памяти,
+        // а сохранение записало бы старую книгу и отрапортовало успех.
+        const message = `Не удалось собрать книгу для сохранения: ${(err as Error).message}`;
+        showNotice(message);
+        console.error(message, err);
         return null;
       }
     },
-    [activeSheet, isCsv, onChange, tab.extension]
+    [activeSheet, isCsv, onChange, showNotice, tab.extension]
   );
 
   /**
    * Сохранение оконного режима: сначала догружаем остаток строк,
    * затем собираем книгу обычным путём (сериализация нужна один раз).
    */
-  const flushWindowed = useCallback(async () => {
+  const flushWindowed = useCallback(async (): Promise<string | null> => {
     const source = windowedRef.current;
     const state = windowedStateRef.current;
-    if (!source || !state) return;
+    if (!source || !state) return null;
     setLoading(true);
     try {
       for (const sheet of sheetNamesRef.current) {
@@ -880,12 +915,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
           const rows = await source.getWindow(sheet, loaded, WINDOW_ROWS * 4);
           if (rows.length === 0) break;
           const grid = sheetsRef.current[sheet] ? [...sheetsRef.current[sheet]] : [];
-          const cols = Math.max(
-            MIN_COLS,
-            ...grid.map((row) => row.length),
-            ...rows.map((row) => row.length),
-            1
-          );
+          const cols = windowCols(sheet, rows);
           rows.forEach((row, index) => {
             const values: (string | number | boolean | null)[] = [];
             for (let col = 0; col < cols; col++) values.push(row[col] ?? '');
@@ -904,21 +934,43 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       windowedRef.current = null;
       try {
         const content = await syncWorkbook(sheetsRef.current, sheetNamesRef.current);
-        if (content) onChange(content);
+        // Пустая сериализация — это тоже содержимое, ошибка приходит как null.
+        if (content !== null) onChange(content);
+        return content;
       } finally {
         windowedRef.current = guard;
       }
     } catch (err) {
-      setError(`Не удалось подготовить книгу к сохранению: ${(err as Error).message}`);
+      // setError здесь рисует экран «не удалось открыть таблицу» поверх живой
+      // книги — при сбое догрузки достаточно заметки, но вернуть null обязательно.
+      showNotice(`Не удалось подготовить книгу к сохранению: ${(err as Error).message}`);
+      return null;
     } finally {
       setLoading(false);
     }
-  }, [onChange, syncWorkbook]);
+  }, [onChange, showNotice, syncWorkbook, windowCols]);
 
-  const saveWithWindowed = useCallback(async () => {
-    if (windowedRef.current) await flushWindowed();
-    await onSave();
-  }, [flushWindowed, onSave]);
+  /**
+   * Сохранение: сначала сериализация (в оконном режиме — с догрузкой остатка),
+   * затем запись именно этого base64. Если сериализация не удалась — не пишем.
+   */
+  const saveWithWindowed = useCallback(async (): Promise<boolean> => {
+    const content = windowedRef.current
+      ? await flushWindowed()
+      : await syncWorkbook(sheetsRef.current, sheetNamesRef.current);
+    if (content === null) return false;
+    const saved = await onSave(content);
+    // Вызывающему (Ctrl+S, «Сохранить и закрыть») нужен исход записи.
+    return saved !== false;
+  }, [flushWindowed, onSave, syncWorkbook]);
+
+  // Ctrl+S в App сохраняет вкладку без содержимого — отдаём ему эту функцию,
+  // иначе догруженные окна и последние правки не попадут на диск.
+  useEffect(() => {
+    if (!onRegisterSave) return;
+    onRegisterSave(tab.id, saveWithWindowed);
+    return () => onRegisterSave(tab.id, null);
+  }, [onRegisterSave, tab.id, saveWithWindowed]);
 
   /* ---------------- Вычисление формул ---------------- */
 
@@ -1376,7 +1428,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     if (!window.electronAPI?.openInExcel) return;
     setExcelBusy(true);
     try {
-      await onSave();
+      // В настоящий Excel отдаём только то, что точно легло на диск.
+      if (!(await saveWithWindowed())) return;
       const res = await window.electronAPI.openInExcel(tab.path);
       showNotice(res.success ? 'Открыто в настоящем Excel' : `Excel: ${res.error || 'ошибка'}`);
     } finally {
@@ -1393,7 +1446,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     if (!macroName?.trim()) return;
     setExcelBusy(true);
     try {
-      await onSave();
+      // В настоящий Excel отдаём только то, что точно легло на диск.
+      if (!(await saveWithWindowed())) return;
       const res = await window.electronAPI.runExcelMacro(tab.path, macroName.trim());
       if (res.success) {
         await reloadFromDisk();
@@ -1406,12 +1460,19 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     }
   };
 
+  /**
+   * Мост в настоящий Excel работает только с книгой на диске: COM открывает файл,
+   * поэтому без пути и для CSV-вкладок кнопки экспорта неактивны.
+   */
+  const excelBridgeReady = Boolean(window.electronAPI && tab.path && !isCsv);
+
   /** Экспорт диаграмм WorkSpace в книгу как нативных объектов Excel. */
   const exportChartsToExcel = async () => {
     if (!window.electronAPI?.excelExportCharts || activeMeta.charts.length === 0) return;
     setExcelBusy(true);
     try {
-      await onSave();
+      // В настоящий Excel отдаём только то, что точно легло на диск.
+      if (!(await saveWithWindowed())) return;
       const res = await window.electronAPI.excelExportCharts(
         tab.path,
         activeMeta.charts.map((chart) => ({
@@ -1450,7 +1511,8 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     while (sheetNamesRef.current.includes(`Сводная Excel ${index}`)) index++;
     setExcelBusy(true);
     try {
-      await onSave();
+      // В настоящий Excel отдаём только то, что точно легло на диск.
+      if (!(await saveWithWindowed())) return;
       const res = await window.electronAPI.excelCreatePivot(tab.path, {
         sourceSheet: activeSheet,
         range: SheetFmt.rangeToAddress(range),
@@ -1462,7 +1524,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       if (res.success) {
         await reloadFromDisk();
         setPivotOpen(false);
-        showNotice(`Сводная Excel создана: Сводная Excel ${index}`);
+        showNotice(`Сводная таблица создана: Сводная Excel ${index}`);
       } else {
         showNotice(`Сводная Excel: ${res.error || 'ошибка Excel'}`);
       }
@@ -1662,13 +1724,20 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
     return Number.isFinite(num) ? num : null;
   };
 
+  /** Один и тот же признак заголовка для превью и для спеки диаграммы. */
+  const rangeHasHeader = useCallback(
+    (range: SheetFmt.GridRange): boolean => {
+      const firstValue = displayCell(range.startRow, range.startCol + 1);
+      return firstValue.trim() !== '' && numericFromText(firstValue) === null;
+    },
+    [displayCell]
+  );
+
   const buildChartData = useCallback(
     (rangeText: string): { labels: string[]; series: ChartSeries[] } => {
       const range = SheetFmt.parseRange(rangeText);
       if (!range) return { labels: [], series: [] };
-      const firstValue = displayCell(range.startRow, range.startCol + 1);
-      const hasHeader =
-        firstValue.trim() !== '' && numericFromText(firstValue) === null;
+      const hasHeader = rangeHasHeader(range);
       const dataStart = hasHeader ? range.startRow + 1 : range.startRow;
       const labels: string[] = [];
       for (let row = dataStart; row <= range.endRow; row++) {
@@ -1687,7 +1756,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       }
       return { labels, series };
     },
-    [displayCell]
+    [displayCell, rangeHasHeader]
   );
 
   const createChart = () => {
@@ -1701,6 +1770,7 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
       type: chartType,
       range: SheetFmt.rangeToAddress(range),
       title: chartTitle.trim() || 'Диаграмма',
+      hasHeader: rangeHasHeader(range),
       x: 48 + activeMeta.charts.length * 24,
       y: 48 + activeMeta.charts.length * 24,
       width: 460,
@@ -3316,6 +3386,17 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
             Диаграммы сохраняются в xlsx
           </span>
         )}
+        {activeMeta.charts.length > 0 && (
+          <button
+            onClick={() => void exportChartsToExcel()}
+            disabled={!excelBridgeReady || excelBusy}
+            title="Перенести диаграммы листа в книгу как нативные объекты Excel"
+            className="flex items-center gap-1 rounded border border-ws px-1.5 py-0.5 hover:bg-ws-hover disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <Download size={12} />
+            Диаграммы в Excel
+          </button>
+        )}
         <button
           onClick={() => setValidationPanelOpen((value) => !value)}
           title="Проверка данных: выпадающий список"
@@ -4144,6 +4225,15 @@ export const ExcelEditor: React.FC<Props> = ({ tab, onChange, onSave, onAskAI, o
               </div>
               <div className="flex justify-end gap-2 border-t border-ws px-4 py-3">
                 <Button variant="secondary" onClick={() => setPivotOpen(false)}>Отмена</Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => void createExcelPivot()}
+                  disabled={!excelBridgeReady || excelBusy}
+                  title="Создать настоящую обновляемую сводную таблицу Excel по выбранным полям"
+                >
+                  <Table2 size={12} />
+                  Сводная в Excel
+                </Button>
                 <Button variant="primary" onClick={createPivot}>Создать лист</Button>
               </div>
             </div>

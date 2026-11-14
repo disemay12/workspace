@@ -7,7 +7,7 @@
  */
 import { fileSystemService } from '../../services/fileSystemService';
 import { readPreferences, shouldUseWindowedSheet } from '../../state/preferences';
-import type { CellEdit, SheetMeta, WorkerRequest, WorkerResponse } from './sheetWorker';
+import type { SheetMeta, WorkerRequest, WorkerResponse } from './sheetWorker';
 
 export type { CellEdit, SheetMeta } from './sheetWorker';
 
@@ -18,10 +18,6 @@ export interface SheetSource {
   meta(): Promise<SheetMeta[]>;
   /** Окно строк указанного листа. */
   getWindow(sheet: string, start: number, count: number): Promise<SheetRow[]>;
-  /** Правки ячеек: копятся в воркере. */
-  setCells(sheet: string, edits: CellEdit[]): Promise<void>;
-  /** Сериализация книги в байты (null — файл только для чтения). */
-  save(): Promise<ArrayBuffer | null>;
   /** Прогресс чтения файла, проценты 0..100. */
   onProgress(handler: (percent: number) => void): () => void;
   close(): void;
@@ -172,13 +168,12 @@ export class WorkerSheetSource implements SheetSource {
     >);
   }
 
-  async setCells(sheet: string, edits: CellEdit[]): Promise<void> {
-    await this.send<void>({ kind: 'setCells', sheet, edits } as Omit<WorkerRequest, 'id'>);
-  }
-
-  async save(): Promise<ArrayBuffer | null> {
-    return this.send<ArrayBuffer>({ kind: 'save' } as Omit<WorkerRequest, 'id'>);
-  }
+  /*
+   * setCells/save удалены намеренно: редактор сохраняет книгу через
+   * syncWorkbook + injectStylesIntoXlsx/injectChartsIntoXlsx, а путь
+   * XLSX.write в CE не переносит оформление, диаграммы и часть styles.xml.
+   * Методы были недостижимы и создавали вид работающего сохранения.
+   */
 
   close(): void {
     if (this.closed) return;

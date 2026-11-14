@@ -49,6 +49,9 @@ export interface AlbumResponse {
 
 const USER_AGENT = 'WorkSpace/1.0';
 
+/** ~100 МБ в base64: больше не имеет смысла гнать через IPC в память. */
+const MAX_UPLOAD_BASE64_CHARS = 140 * 1024 * 1024;
+
 function blobFrom(base64: string, mime: string): Blob {
   const buffer = Buffer.from(base64, 'base64');
   return new Blob([buffer], { type: mime || 'application/octet-stream' });
@@ -214,13 +217,28 @@ async function uploadImgurAlbum(
     links,
   };
 }
+/** JSON-запрос с таймаутом: без него зависший ответ вешает всю галерею. */
+async function postJson(url: string, payload: unknown): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    return await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Telegraph хранит файлы по отдельности. Страница /createPage собирает их в одну галерею. */
 async function uploadTelegraphAlbum(images: AlbumImage[], title: string): Promise<AlbumResponse> {
   if (!images.length) throw new Error('Нет изображений для страницы');
-  const accountRes = await fetch('https://api.telegra.ph/createAccount', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ short_name: 'WorkSpace', author_name: 'WorkSpace' }),
+  const accountRes = await postJson('https://api.telegra.ph/createAccount', {
+    short_name: 'WorkSpace',
+    author_name: 'WorkSpace',
   });
   const account = (await accountRes.json()) as { ok?: boolean; result?: { access_token?: string } };
   const token = account.result && account.result.access_token;
@@ -247,15 +265,11 @@ async function uploadTelegraphAlbum(images: AlbumImage[], title: string): Promis
   }
   if (!links.length) throw new Error(failed.join('; ') || 'Telegraph не принял изображения');
 
-  const pageRes = await fetch('https://api.telegra.ph/createPage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      access_token: token,
-      title: (title || 'WorkSpace').slice(0, 256),
-      content,
-      return_content: false,
-    }),
+  const pageRes = await postJson('https://api.telegra.ph/createPage', {
+    access_token: token,
+    title: (title || 'WorkSpace').slice(0, 256),
+    content,
+    return_content: false,
   });
   const page = (await pageRes.json()) as { ok?: boolean; result?: { url?: string } };
   if (!page.ok || !page.result?.url) throw new Error('Telegraph не собрал страницу');
@@ -270,8 +284,15 @@ export function registerShare(): void {
       req: { service: string; title?: string; clientId?: string; images: AlbumImage[] }
     ): Promise<AlbumResponse> => {
       try {
-        if (req?.service === 'telegraph') return await uploadTelegraphAlbum(req.images || [], req.title || 'WorkSpace');
-        if (req?.service === 'imgur') return await uploadImgurAlbum(req.images || [], req.title || 'WorkSpace', req.clientId || '');
+        // Массив base64 декодируется в память главного процесса целиком:
+        // без общего предела десяток крупных фото уносит окно.
+        const images = req?.images || [];
+        const total = images.reduce((sum, image) => sum + (image?.base64?.length || 0), 0);
+        if (total > MAX_UPLOAD_BASE64_CHARS) {
+          throw new Error('Суммарный размер изображений больше 100 МБ — загрузите их частями');
+        }
+        if (req?.service === 'telegraph') return await uploadTelegraphAlbum(images, req.title || 'WorkSpace');
+        if (req?.service === 'imgur') return await uploadImgurAlbum(images, req.title || 'WorkSpace', req.clientId || '');
         throw new Error('Этот сервис не собирает несколько фото на одну страницу');
       } catch (err) {
         return {
@@ -288,6 +309,11 @@ export function registerShare(): void {
   ipcMain.handle('net:upload', async (_event, req: ShareRequest): Promise<ShareResponse> => {
     try {
       if (!req || !req.base64) throw new Error('Нет данных для загрузки');
+      // base64 приходит целиком и декодируется в память главного процесса:
+      // без предела один большой файл уносит окно вместе с несохранённой работой.
+      if (req.base64.length > MAX_UPLOAD_BASE64_CHARS) {
+        throw new Error('Файл слишком большой для загрузки на хостинг (максимум 100 МБ)');
+      }
       const url = await upload(req, blobFrom(req.base64, req.mime));
       return { success: true, url };
     } catch (err) {

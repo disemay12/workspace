@@ -115,8 +115,6 @@ export function formatSerialDate(
   const locale = options.locale ?? 'ru';
   const parts = serialToParts(serial);
 
-  const months = locale === 'ru' ? MONTHS_GENITIVE : MONTHS_EN;
-  const monthsNom = locale === 'ru' ? MONTHS_NOMINATIVE : MONTHS_EN;
   const weekdaysRu = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
   const weekdaysShortRu = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
   const weekdaysEn = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -221,8 +219,6 @@ export function formatSerialDate(
     }
 
     const t = token.text;
-    const lower = t.toLowerCase();
-    const upper = t.toUpperCase();
     const n = t.length;
 
     // Накопленные часы [ч] / [h]

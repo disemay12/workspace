@@ -513,6 +513,37 @@ export function parseFormula(formula: string): Node {
    Приведение типов
    ============================================================ */
 
+/**
+ * Приводит «1 234,5», «1.234,5», «1,234,567» к машинной записи: десятичным
+ * считается последний разделитель, остальные вырезаются. Раньше
+ * replace(',', '.') менял только первую запятую и «1,234,567» давал null.
+ */
+function normalizeNumericText(input: string): string {
+  // Знак снимается до разбора тысяч: группа «-1» не проходила проверку, и
+  // «-1,234,567» превращалось в -1234.567 вместо -1234567.
+  const sign = input.startsWith('-') || input.startsWith('+') ? input.slice(0, 1) : '';
+  const body = sign ? input.slice(1) : input;
+  const lastDot = body.lastIndexOf('.');
+  const lastComma = body.lastIndexOf(',');
+  if (lastDot < 0 && lastComma < 0) return input;
+  const decimal = lastDot > lastComma ? '.' : ',';
+  const thousands = decimal === '.' ? ',' : '.';
+  // «1,234,567» и «1.234.567» — это разделители тысяч, а не десятичный знак:
+  // после последнего разделителя ровно три цифры и групп больше двух.
+  // Без этой проверки «1,234,567» превращалось в 1234.567 (в 1000 раз меньше).
+  if (!body.includes(thousands)) {
+    const groups = body.split(decimal);
+    const grouped = groups.slice(1).every((group) => /^\d{3}$/.test(group));
+    if (groups.length > 2 && grouped && /^\d{1,3}$/.test(groups[0])) {
+      return sign + groups.join('');
+    }
+  }
+  const withoutThousands = body.split(thousands).join('');
+  if (decimal === '.') return sign + withoutThousands;
+  const at = withoutThousands.lastIndexOf(',');
+  return sign + `${withoutThousands.slice(0, at).replace(/,/g, '')}.${withoutThousands.slice(at + 1)}`;
+}
+
 /** Текст -> число. Пустая строка -> 0. Нечисловой текст -> null. */
 function toNumber(v: unknown): number | null {
   if (v === null || v === undefined) return 0;
@@ -522,7 +553,7 @@ function toNumber(v: unknown): number | null {
   const s = String(v).trim();
   if (s === '') return 0;
   // Поддержка запятой как десятичного разделителя и процентов
-  const cleaned = s.replace(/\s/g, '').replace(',', '.');
+  const cleaned = normalizeNumericText(s.replace(/\s/g, ''));
   if (/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(cleaned)) {
     return parseFloat(cleaned);
   }
@@ -686,14 +717,22 @@ function flattenValues(node: Node, ctx: EvalContext): (CellPrimitive | FormulaEr
   return evalArrayNode(node, ctx);
 }
 
-/** Числовые значения для агрегатов — текст игнорируется (как в Excel). */
-function numericArgs(nodes: Node[], ctx: EvalContext, skipText = true): number[] {
+/**
+ * Числовые значения для агрегатов — текст игнорируется (как в Excel).
+ * Ошибка в аргументе не пропускается: Excel пробрасывает её в результат.
+ */
+function numericArgs(
+  nodes: Node[],
+  ctx: EvalContext,
+  skipText = true
+): number[] | FormulaError {
   const out: number[] = [];
   for (const node of nodes) {
     const values = flattenValues(node, ctx);
     const isRange = node.kind === 'range';
+    const bad = firstError(values);
+    if (bad) return bad;
     for (const v of values) {
-      if (isError(v)) continue;
       if (typeof v === 'number') {
         out.push(v);
       } else if (!skipText || !isRange) {
@@ -751,8 +790,13 @@ function argValues(args: Node[], i: number, ctx: EvalContext): (CellPrimitive | 
   return flattenValues(args[i], ctx);
 }
 
-/** Числовые значения аргументов. */
-function argNums(args: Node[], i: number, ctx: EvalContext, skipText = true): number[] {
+/** Числовые значения аргументов (или первая ошибка среди них). */
+function argNums(
+  args: Node[],
+  i: number,
+  ctx: EvalContext,
+  skipText = true
+): number[] | FormulaError {
   const list: Node[] = args.slice(i);
   return numericArgs(list, ctx, skipText);
 }
@@ -870,6 +914,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
   /* ---------- Математические ---------- */
   SUM: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     return nums.reduce((s, v) => s + v, 0);
   },
 
@@ -973,6 +1018,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   PRODUCT: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     if (nums.length === 0) return 0;
     return nums.reduce((s, v) => s * v, 1);
   },
@@ -988,7 +1034,9 @@ const FUNCTIONS: Record<string, FnImpl> = {
     const d = argNum(args, 1, ctx, 0);
     if (isError(d)) return d;
     const f = Math.pow(10, d);
-    return Math.round((n + Number.EPSILON * Math.sign(n)) * f) / f;
+    // Math.round(-2.5) = -2, а Excel округляет половину от нуля: ROUND(-2.5;0) = -3.
+    const rounded = Math.round(Math.abs(n) * f + 1e-9) / f;
+    return n < 0 ? -rounded : rounded;
   },
 
   ROUNDUP: (args, ctx) => {
@@ -1120,12 +1168,14 @@ const FUNCTIONS: Record<string, FnImpl> = {
   /* ---------- Статистические ---------- */
   AVERAGE: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     if (nums.length === 0) return err(ERRORS.DIV0);
     return nums.reduce((s, v) => s + v, 0) / nums.length;
   },
 
   AVERAGEA: (args, ctx) => {
     const nums = argNums(args, 0, ctx, false);
+    if (isError(nums)) return nums;
     if (nums.length === 0) return err(ERRORS.DIV0);
     return nums.reduce((s, v) => s + v, 0) / nums.length;
   },
@@ -1214,16 +1264,24 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   MIN: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
-    return nums.length === 0 ? 0 : Math.min(...nums);
+    if (isError(nums)) return nums;
+    if (nums.length === 0) return 0;
+    // Спред Math.min(...nums) на диапазоне в миллион ячеек падал с RangeError.
+    return nums.reduce((min, v) => (v < min ? v : min), Infinity);
   },
 
   MAX: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
-    return nums.length === 0 ? 0 : Math.max(...nums);
+    if (isError(nums)) return nums;
+    if (nums.length === 0) return 0;
+    // Спред Math.max(...nums) на диапазоне в миллион ячеек падал с RangeError.
+    return nums.reduce((max, v) => (v > max ? v : max), -Infinity);
   },
 
   MEDIAN: (args, ctx) => {
-    const nums = argNums(args, 0, ctx).slice().sort((a, b) => a - b);
+    const raw = argNums(args, 0, ctx);
+    if (isError(raw)) return raw;
+    const nums = raw.slice().sort((a, b) => a - b);
     if (nums.length === 0) return err(ERRORS.NUM);
     const mid = Math.floor(nums.length / 2);
     return nums.length % 2 ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
@@ -1231,6 +1289,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   MODE: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     const counts = new Map<number, number>();
     for (const n of nums) counts.set(n, (counts.get(n) ?? 0) + 1);
     let best: number | null = null;
@@ -1246,6 +1305,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   STDEV: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     if (nums.length < 2) return err(ERRORS.DIV0);
     const mean = nums.reduce((s, v) => s + v, 0) / nums.length;
     return Math.sqrt(nums.reduce((s, v) => s + (v - mean) ** 2, 0) / (nums.length - 1));
@@ -1253,6 +1313,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   STDEVP: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     if (nums.length < 1) return err(ERRORS.DIV0);
     const mean = nums.reduce((s, v) => s + v, 0) / nums.length;
     return Math.sqrt(nums.reduce((s, v) => s + (v - mean) ** 2, 0) / nums.length);
@@ -1260,6 +1321,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   VAR: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     if (nums.length < 2) return err(ERRORS.DIV0);
     const mean = nums.reduce((s, v) => s + v, 0) / nums.length;
     return nums.reduce((s, v) => s + (v - mean) ** 2, 0) / (nums.length - 1);
@@ -1267,6 +1329,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   VARP: (args, ctx) => {
     const nums = argNums(args, 0, ctx);
+    if (isError(nums)) return nums;
     if (nums.length < 1) return err(ERRORS.DIV0);
     const mean = nums.reduce((s, v) => s + v, 0) / nums.length;
     return nums.reduce((s, v) => s + (v - mean) ** 2, 0) / nums.length;
@@ -1274,7 +1337,9 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   LARGE: (args, ctx) => {
     // Только первый аргумент — данные; второй — номер позиции.
-    const nums = numericArgs(args.slice(0, 1), ctx, false).sort((a, b) => b - a);
+    const raw = numericArgs(args.slice(0, 1), ctx, false);
+    if (isError(raw)) return raw;
+    const nums = raw.sort((a, b) => b - a);
     const k = argNum(args, 1, ctx, 1);
     if (isError(k)) return k;
     if (k < 1 || k > nums.length) return err(ERRORS.NUM);
@@ -1282,7 +1347,9 @@ const FUNCTIONS: Record<string, FnImpl> = {
   },
 
   SMALL: (args, ctx) => {
-    const nums = numericArgs(args.slice(0, 1), ctx, false).sort((a, b) => a - b);
+    const raw = numericArgs(args.slice(0, 1), ctx, false);
+    if (isError(raw)) return raw;
+    const nums = raw.sort((a, b) => a - b);
     const k = argNum(args, 1, ctx, 1);
     if (isError(k)) return k;
     if (k < 1 || k > nums.length) return err(ERRORS.NUM);
@@ -1293,6 +1360,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
     const value = argNum(args, 0, ctx, 0);
     if (isError(value)) return value;
     const nums = argNums(args.slice(1, 2), 0, ctx);
+    if (isError(nums)) return nums;
     const order = args.length > 2 ? argNum(args, 2, ctx, 0) : 0;
     if (isError(order)) return order;
     const sorted = nums.slice().sort((a, b) => (order ? a - b : b - a));
@@ -1302,7 +1370,9 @@ const FUNCTIONS: Record<string, FnImpl> = {
 
   PERCENTILE: (args, ctx) => {
     // Только первый аргумент — данные; второй — доля.
-    const nums = numericArgs(args.slice(0, 1), ctx, false).sort((a, b) => a - b);
+    const raw = numericArgs(args.slice(0, 1), ctx, false);
+    if (isError(raw)) return raw;
+    const nums = raw.sort((a, b) => a - b);
     const p = argNum(args, 1, ctx, 0);
     if (isError(p)) return p;
     if (nums.length === 0 || p < 0 || p > 1) return err(ERRORS.NUM);
@@ -1801,7 +1871,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
     return evalNode(args[idx], ctx);
   },
 
-  ROW: (args, ctx) => {
+  ROW: (args, _ctx) => {
     if (args.length === 0) return err(ERRORS.VALUE);
     const target = args[0];
     if (target.kind === 'ref') return target.addr.row + 1;
@@ -1809,7 +1879,7 @@ const FUNCTIONS: Record<string, FnImpl> = {
     return err(ERRORS.VALUE);
   },
 
-  COLUMN: (args, ctx) => {
+  COLUMN: (args, _ctx) => {
     if (args.length === 0) return err(ERRORS.VALUE);
     const target = args[0];
     if (target.kind === 'ref') return target.addr.col + 1;
@@ -1817,14 +1887,14 @@ const FUNCTIONS: Record<string, FnImpl> = {
     return err(ERRORS.VALUE);
   },
 
-  ROWS: (args, ctx) => {
+  ROWS: (args, _ctx) => {
     if (args.length === 0) return err(ERRORS.VALUE);
     const target = args[0];
     if (target.kind === 'range') return Math.abs(target.end.row - target.start.row) + 1;
     return 1;
   },
 
-  COLUMNS: (args, ctx) => {
+  COLUMNS: (args, _ctx) => {
     if (args.length === 0) return err(ERRORS.VALUE);
     const target = args[0];
     if (target.kind === 'range') return Math.abs(target.end.col - target.start.col) + 1;
@@ -1847,9 +1917,11 @@ const FUNCTIONS: Record<string, FnImpl> = {
     if (isError(m)) return m;
     const d = argNum(args, 2, ctx, 1);
     if (isError(d)) return d;
-    const date = new Date(Date.UTC(y, m - 1, d));
-    date.setUTCFullYear(date.getUTCFullYear() + (y < 100 ? 1900 : 0));
-    return excelSerialFromDate(date);
+    // Date.UTC трактует годы 0..99 как 19xx, поэтому двузначный год
+    // приводим к 19xx до построения даты: раньше правило применялось дважды
+    // и DATE(50;1;1) давал 3850-01-01.
+    const year = y >= 0 && y < 100 ? y + 1900 : y;
+    return excelSerialFromDate(new Date(Date.UTC(year, m - 1, d)));
   },
 
   YEAR: (args, ctx) => {
@@ -2052,19 +2124,34 @@ function collectRange(
 
 const EXCEL_EPOCH = Date.UTC(1899, 11, 30);
 
-function excelSerialFromDate(d: Date): number {
-  const utc = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
-  return Math.round((utc - EXCEL_EPOCH) / 86400000);
+/**
+ * Excel считает 1900 год високосным: serial 60 — несуществующее 29.02.1900.
+ * Поэтому до 01.03.1900 календарь Excel опережает реальный на день, и без
+ * сдвига serial(01.01.1900) равнялся 2 вместо 1.
+ */
+function adjust1900(days: number): number {
+  return days < 61 ? days - 1 : days;
 }
 
-function dateFromSerial(serial: number): Date {
-  return new Date(EXCEL_EPOCH + Math.floor(serial) * 86400000);
+function excelSerialFromDate(d: Date): number {
+  const utc = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  return adjust1900(Math.round((utc - EXCEL_EPOCH) / 86400000));
+}
+
+/** Серийное число -> дата: обратный сдвиг того же правила 1900 года. */
+export function dateFromSerial(serial: number): Date {
+  const days = Math.floor(serial);
+  // Обратный сдвиг; для serial = 60 точной даты в JS нет — 29.02.1900
+  // нормализуется в 01.03.1900.
+  return new Date(EXCEL_EPOCH + (days < 61 ? days + 1 : days) * 86400000);
 }
 
 /** Серийное число из календарной даты (UTC-полночь). */
 function serialFromDate(d: Date): number {
-  return Math.round(
-    (Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - EXCEL_EPOCH) / 86400000
+  return adjust1900(
+    Math.round(
+      (Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - EXCEL_EPOCH) / 86400000
+    )
   );
 }
 

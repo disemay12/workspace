@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import {
   Check,
   FolderOpen,
-  Info,
   Loader2,
   Monitor,
   Plus,
@@ -10,7 +9,6 @@ import {
   ShieldCheck,
   Trash2,
   FileCode2,
-  ExternalLink,
   Pin,
   Download,
 } from 'lucide-react';
@@ -126,12 +124,10 @@ export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) =>
     setUpdateError('');
     setUpdateProgress({ phase: 'download', received: 0, total: updateInfo.size ?? 0, percent: 0 });
     try {
+      // Главный процесс сам знает адрес и хеш из проверки обновлений:
+      // поля assetUrl/assetName/digest из интерфейса не принимаются.
       const downloaded = await window.electronAPI?.downloadUpdate?.({
         version: updateInfo.latestVersion,
-        assetUrl: updateInfo.assetUrl,
-        assetName: updateInfo.assetName,
-        size: updateInfo.size,
-        digest: updateInfo.assetDigest,
       });
       if (!downloaded?.success || !downloaded.zipPath || !downloaded.extractDir) {
         throw new Error(downloaded?.error || 'Не удалось скачать обновление');

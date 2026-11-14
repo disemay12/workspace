@@ -153,15 +153,18 @@ app.whenReady().then(async () => {
     `);
 
     // Клик по кнопке темы (ищем по стабильному признаку — иконке sun/moon внутри titlebar)
-    out.themeButtonFound = await win.webContents.executeJavaScript(`
+    const themeButton = await win.webContents.executeJavaScript(`
       (() => {
         const btns = [...document.querySelectorAll('.titlebar-no-drag button')];
         // Кнопка темы предпоследняя перед настройками; ищем по title
         const themeBtn = btns.find(b => /тема/i.test(b.title || ''));
-        if (themeBtn) { themeBtn.click(); return themeBtn.title; }
-        return null;
+        if (themeBtn) themeBtn.click();
+        return { found: Boolean(themeBtn), title: themeBtn ? (themeBtn.title || '') : '' };
       })()
     `);
+    // Утверждение — found; заголовок кнопки остаётся диагностикой.
+    out.themeButtonFound = Boolean(themeButton.found);
+    out.themeButtonTitle = themeButton.title;
     await sleep(900);
 
     out.themeAfter = await win.webContents.executeJavaScript(`
@@ -239,7 +242,11 @@ app.whenReady().then(async () => {
     out.searchExecution = await win.webContents.executeJavaScript(`
       (async () => {
         const input = document.querySelector('input[placeholder*="Искать текст"]');
-        if (!input) return { error: 'no input' };
+        // Нет поля ввода — это провал именованного утверждения inputFound,
+        // а не строка 'no input', которую раннер принимал за успех.
+        if (!input) {
+          return { inputFound: false, hasResult: false, hasLineBadge: false, hasSnippet: false, resultsFooter: false };
+        }
         // React слушает onChange — эмулируем ввод через native setter
         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
         setter.call(input, 'ERROR');
@@ -251,6 +258,7 @@ app.whenReady().then(async () => {
         await new Promise(r => setTimeout(r, 2000));
         const t = document.body.innerText;
         return {
+          inputFound: true,
           hasResult: t.includes('server.log'),
           hasLineBadge: /стр\\.\\s*\\d+/.test(t) || t.includes('Стр.'),
           hasSnippet: t.includes('ERROR'),
@@ -287,7 +295,11 @@ app.whenReady().then(async () => {
         // в заголовке окна: в .titlebar-no-drag её нет.
         const btn = [...document.querySelectorAll('button')]
           .find(b => /Настройки/i.test(b.title || ''));
-        if (!btn) return { error: 'settings button not found' };
+        // Нет кнопки — именованный провал buttonFound, а не строка-«ошибка»,
+        // которую раннер принимал за успех.
+        if (!btn) {
+          return { buttonFound: false, opened: false, hasTabs: false, hasKeyField: false, hasTestButton: false, hasProviders: false };
+        }
         btn.click();
         await new Promise(r => setTimeout(r, 900));
         const t = document.body.innerText;
@@ -297,6 +309,7 @@ app.whenReady().then(async () => {
         // Признак открытия — заголовок окна вместе с его содержимым.
         const hasHeading = t.includes('Настройки');
         return {
+          buttonFound: true,
           opened: hasHeading && t.includes('Проверить подключение'),
           hasTabs: t.includes('Провайдер') && t.includes('Модель') && t.includes('Промт') && t.includes('Хранилище'),
           hasKeyField: !!document.querySelector('input[type=password]'),
@@ -313,5 +326,5 @@ app.whenReady().then(async () => {
   }
 
   fs.writeFileSync(path.join(ROOT, 'feature-check.json'), JSON.stringify(out, null, 2), 'utf-8');
-  app.exit(0);
+  app.exit(out.fatal || out.errors.length > 0 ? 1 : 0);
 });

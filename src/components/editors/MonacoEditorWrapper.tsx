@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
 import { getMonacoLanguage, SUPPORTED_ENCODINGS, fileSystemService } from '../../services/fileSystemService';
 import { OpenTab } from '../../types';
@@ -42,6 +42,11 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
 }) => {
   const editorRef = useRef<any>(null);
   const monacoRef = useRef<any>(null);
+  /** Команды Monaco регистрируются один раз и захватывают колбэки первого
+   *  рендера: актуальные пропсы берём из ref, иначе Ctrl+K считает позиции по
+   *  устаревшему тексту. */
+  const propsRef = useRef({ onSave, onRequestInlineEdit });
+  propsRef.current = { onSave, onRequestInlineEdit };
   const [wordWrap, setWordWrap] = useState<'on' | 'off'>('on');
   const [minimap, setMinimap] = useState<boolean>(false);
   const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
@@ -98,8 +103,17 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
           const lineCount = model.getLineCount();
           position = { lineNumber: lineCount, column: model.getLineMaxColumn(lineCount) } as any;
         }
+        // Вставка не должна склеиваться с соседними строками: иначе
+        // `return 1` и следующая строка буфера дают `return 1print(...)`.
+        const value = model.getValue();
+        const offset = model.getOffsetAt(position);
+        let text = edit.text;
+        const before = offset > 0 ? value[offset - 1] : '';
+        const after = offset < value.length ? value[offset] : '';
+        if (before && before !== '\n') text = '\n' + text;
+        if (after && after !== '\n' && !text.endsWith('\n')) text = text + '\n';
         editor.executeEdits('ai-insert', [
-          { range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column), text: edit.text },
+          { range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column), text },
         ]);
       } else {
         const fullRange = model.getFullModelRange();
@@ -148,7 +162,7 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
     });
 
     // Ctrl+S — сохранить
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => onSave());
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => propsRef.current.onSave());
 
     // Ctrl+F — поиск
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, () => {
@@ -157,7 +171,7 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
 
     // Ctrl+K — инлайн-копилот
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => {
-      onRequestInlineEdit?.();
+      propsRef.current.onRequestInlineEdit?.();
     });
 
     editor.focus();
@@ -207,8 +221,25 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
     model.setValue(tab.content);
   }, [tab.content]);
 
-  const lineCount = tab.content.split('\n').length;
   const charCount = tab.content.length;
+  // Число строк считаем только при смене содержимого: курсор и переключатели
+  // перерисовывают компонент, а полный проход по файлу на каждый рендер дорог.
+  const lineCount = useMemo(() => {
+    const content = tab.content;
+    let lines = 1;
+    for (let index = 0; index < content.length; index += 1) {
+      if (content.charCodeAt(index) === 10) lines += 1;
+    }
+    return lines;
+  }, [tab.content]);
+
+  // Размер — это полная UTF-8-кодировка файла; чтобы не кодировать документ на
+  // каждый набранный символ, обновляем значение с задержкой.
+  const [byteSize, setByteSize] = useState(() => new Blob([tab.content]).size);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setByteSize(new Blob([tab.content]).size), 300);
+    return () => window.clearTimeout(timer);
+  }, [tab.content]);
 
   return (
     <div className="flex h-full w-full flex-col bg-ws-editor text-ws">
@@ -386,7 +417,7 @@ export const MonacoEditorWrapper: React.FC<Props> = ({
         <div className="flex items-center gap-3">
           <span>Символов: {charCount.toLocaleString('ru-RU')}</span>
           <span>Строк: {lineCount.toLocaleString('ru-RU')}</span>
-          <span>Размер: {(new Blob([tab.content]).size / 1024).toFixed(1)} КБ</span>
+          <span>Размер: {(byteSize / 1024).toFixed(1)} КБ</span>
         </div>
         <div className="flex items-center gap-3">
           {tab.isDirty && <span className="font-medium text-ws-warning">● Не сохранено</span>}

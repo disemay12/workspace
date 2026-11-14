@@ -49,7 +49,8 @@ type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system' 
 
 interface SecretsInfo {
   found: boolean;
-  filePath: string;
+  /** Только имя файла: полный путь из интерфейса не раскрывается. */
+  fileName: string;
   baseUrl?: string;
   textModel?: string;
   imageModel?: string;
@@ -321,8 +322,8 @@ export const SettingsModal: React.FC<Props> = ({
                     <FileKey size={13} className="text-ws-accent" />
                     Найден файл с ключами
                   </div>
-                  <p className="mt-1 truncate font-mono text-[10px] text-ws-faint" title={secrets.filePath}>
-                    {secrets.filePath}
+                  <p className="mt-1 truncate font-mono text-[10px] text-ws-faint">
+                    {secrets.fileName}
                   </p>
                   {(secrets.baseUrl || secrets.textModel) && (
                     <p className="mt-1 text-[10px] text-ws-muted">

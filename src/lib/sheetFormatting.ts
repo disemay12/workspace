@@ -5,6 +5,8 @@
  * не ломают совместимость с Excel.
  */
 
+import { dateFromSerial } from './formulaEngine';
+
 export type NumberFormat = 'general' | 'number' | 'currency' | 'percent' | 'date' | 'text';
 export type HAlign = 'left' | 'center' | 'right';
 export type VAlign = 'top' | 'middle' | 'bottom';
@@ -86,6 +88,8 @@ export interface ChartSpec {
   type: ChartType;
   range: string;
   title: string;
+  /** Первая строка диапазона — заголовок. Без признака решает эвристика. */
+  hasHeader?: boolean;
   x: number;
   y: number;
   width: number;
@@ -338,6 +342,7 @@ export function normalizeWorkbookMeta(raw: unknown): WorkbookMeta {
           type: raw.type,
           range: raw.range,
           title: typeof raw.title === 'string' ? raw.title : 'Диаграмма',
+          ...(typeof raw.hasHeader === 'boolean' ? { hasHeader: raw.hasHeader } : {}),
           x: typeof raw.x === 'number' ? raw.x : 40,
           y: typeof raw.y === 'number' ? raw.y : 40,
           width: typeof raw.width === 'number' ? raw.width : 420,
@@ -380,9 +385,11 @@ export function normalizeWorkbookMeta(raw: unknown): WorkbookMeta {
 export function encodeWorkbookMeta(meta: WorkbookMeta): string {
   const json = JSON.stringify(meta);
   try {
-    return `b64:${btoa(unescape(encodeURIComponent(json)))}`;
+    // toWellFormed: без него encodeURIComponent на одиночном суррогате бросал URIError.
+    return `b64:${btoa(unescape(encodeURIComponent(json.toWellFormed())))}`;
   } catch {
-    return json;
+    // Пустая строка, а не сырой JSON: SheetJS портит в нём не-ASCII, и стили терялись.
+    return '';
   }
 }
 
@@ -829,6 +836,13 @@ function parseNumeric(value: string): number | null {
   return Number.isFinite(num) ? num : null;
 }
 
+/** dd.mm.yyyy по UTC: локальное время сдвигало бы дату. */
+function formatRuDate(date: Date): string {
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  return `${day}.${month}.${date.getUTCFullYear()}`;
+}
+
 /** Форматирует отображаемое значение с учётом числового формата ячейки. */
 export function formatCellValue(value: string, format?: NumberFormat): string {
   if (!format || format === 'general' || format === 'text' || value === '') return value;
@@ -842,13 +856,9 @@ export function formatCellValue(value: string, format?: NumberFormat): string {
     case 'percent':
       return `${numberFormatter.format(num * 100)}%`;
     case 'date': {
-      // Excel-серийная дата: 1 = 01.01.1900
-      if (num > 20000 && num < 80000) {
-        const date = new Date(Date.UTC(1899, 11, 30) + num * 86400000);
-        return date.toLocaleDateString('ru-RU');
-      }
-      const parsed = new Date(value);
-      return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleDateString('ru-RU');
+      // Значения 0…1 — день 0 с долей суток: new Date(0.5) давало 30.04.2000.
+      if (num < 1) return num >= 0 ? '00.01.1900' : value;
+      return formatRuDate(dateFromSerial(num));
     }
     default:
       return value;

@@ -11,6 +11,7 @@ const fs = require('fs');
 const os = require('os');
 const iconv = require('iconv-lite');
 const { registerCommonCheckIpc } = require('./common-ipc');
+const { createCheckSandbox } = require('./sandbox');
 
 
 /** Корень проекта — поиск каталога с package.json и dist/ (устойчиво к глубине). */
@@ -27,10 +28,19 @@ function resolveProjectRoot() {
   return path.join(__dirname, '..');
 }
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(os.tmpdir(), 'ws-integration-' + Date.now());
+const SANDBOX = process.env.WS_CHECK_SANDBOX || createCheckSandbox('integration', ROOT);
 
 const out: any = { steps: [], errors: [] };
-const step = (name, value) => out.steps.push({ name, ...value });
+// Пишем результат после каждого шага: если набор зависнет, по файлу видно,
+// на какой проверке это случилось (раньше JSON появлялся только в конце).
+const step = (name, value) => {
+  out.steps.push({ name, ...value });
+  try {
+    fs.writeFileSync(path.join(ROOT, 'integration-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // запись диагностики не должна ломать сам прогон
+  }
+};
 
 app.disableHardwareAcceleration();
 
@@ -251,8 +261,36 @@ function registerHandlers(): any {
   });
 }
 
+/**
+ * Необработанный reject раньше оставлял процесс висеть без результата:
+ * набор «зависал» без единой подсказки. Пишем причину в JSON и выходим.
+ */
+function failFast(error: unknown): void {
+  out.fatal = (error as Error)?.stack || String(error);
+  try {
+    fs.writeFileSync(path.join(ROOT, 'integration-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // даже запись диагностики может не удаться
+  }
+  app.exit(1);
+}
+process.on('unhandledRejection', failFast);
+process.on('uncaughtException', failFast);
+
+/** Отметка фазы: если прогон зависнет, в JSON видно, где именно. */
+const mark = (phase: string) => {
+  out.phase = phase;
+  try {
+    fs.writeFileSync(path.join(ROOT, 'integration-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // диагностика не должна мешать прогону
+  }
+};
+
 app.whenReady().then(async () => {
+  mark('ready');
   registerHandlers();
+  mark('handlers');
 
   /* ---------- Подготовка тестовых данных ---------- */
   fs.mkdirSync(SANDBOX, { recursive: true });
@@ -265,6 +303,7 @@ app.whenReady().then(async () => {
   // Файл UTF-16 LE с BOM — проверяем автоопределение
   fs.writeFileSync(path.join(SANDBOX, 'utf16.txt'), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('UTF16 текст\n', 'utf16le')]));
 
+  mark('before-window');
   const win = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -274,10 +313,13 @@ app.whenReady().then(async () => {
       sandbox: false,
     },
   });
+  mark('window-created');
 
   try {
     await win.loadFile(path.join(ROOT, 'dist', 'index.html'));
+    mark('loaded');
     await sleep(1200);
+    mark('slept');
 
     // Вызываем IPC строго через preload — как это делает приложение
     const api = `window.electronAPI`;
@@ -354,11 +396,14 @@ app.whenReady().then(async () => {
     const cd = await call(`return await ${api}.createDirectory(${JSON.stringify(nd)})`);
     const existsDeep = fs.existsSync(nd);
     const delDir = await call(`return await ${api}.deletePath(${JSON.stringify(baseDir)})`);
+    // Диагностический текст ошибки держим отдельным ключом только когда он есть:
+    // раннер считает провалом любое пустое значение, включая null.
     step('directories', {
       createSuccess: cd.success,
-      createError: cd.error ?? null,
+      noUnexpectedError: !cd.error,
       createdRecursively: existsDeep,
       deletedRecursively: delDir.success && !fs.existsSync(baseDir),
+      ...(cd.error ? { createErrorText: cd.error } : {}),
     });
 
     /* 7. Поиск по имени */
@@ -426,13 +471,36 @@ app.whenReady().then(async () => {
     /* 14. Проверка формы API, который видит рендерер */
     const apiShape = await call(`return { keys: Object.keys(${api}), count: Object.keys(${api}).length }`);
     step('preloadApiSurface', apiShape);
+
+    /* 15. Форма ответов обновления и диагностики: заглушка common-ipc обязана
+     * совпадать с боевыми обработчиками, иначе проверка проходит на пустом ответе. */
+    const appVersion = await call(`return await ${api}.getAppVersion()`);
+    const updateInfo = await call(`return await ${api}.checkForUpdates()`);
+    const diagnostics = await call(`return await ${api}.diagnosticsReport()`);
+    step('updateCheckShape', {
+      versionFromPackage:
+        typeof appVersion === 'string' && /^\d+\.\d+\.\d+/.test(appVersion) && appVersion !== '0.0.0-check',
+      supportedFalse: updateInfo.success === true && updateInfo.supported === false,
+      currentVersionMatches: updateInfo.currentVersion === appVersion,
+      errorTextPresent: typeof updateInfo.error === 'string' && updateInfo.error.length > 0,
+      diagnosticsSuccess: diagnostics.success === true && Boolean(diagnostics.report),
+      diagnosticsVersion: Boolean(diagnostics.report) && diagnostics.report.app?.version === appVersion,
+      diagnosticsShape:
+        Boolean(diagnostics.report) &&
+        typeof diagnostics.report.system?.versions?.electron === 'string' &&
+        Array.isArray(diagnostics.report.logs),
+    });
   } catch (err) {
     out.errors.push(err.stack || String(err));
   }
 
+  // Финальная запись: фаза 'slept' оставалась последней и врала о том, что
+  // прогон не дошёл до конца.
+  out.phase = 'done';
+  out.finished = true;
   fs.writeFileSync(path.join(ROOT, 'integration-check.json'), JSON.stringify(out, null, 2), 'utf-8');
   try {
     fs.rmSync(SANDBOX, { recursive: true, force: true });
   } catch {}
-  app.exit(0);
+  app.exit(out.errors.length > 0 ? 1 : 0);
 });

@@ -54,6 +54,11 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+/**
+ * Только адреса релизных артефактов GitHub. Любой *.githubusercontent.com
+ * (raw, gist, camo) отдаёт пользовательский контент — по такой ссылке
+ * под loader-ом оказывался бы произвольный WorkSpace.exe.
+ */
 function isAllowedUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -61,11 +66,52 @@ function isAllowedUrl(value: string): boolean {
     return (
       url.hostname === 'github.com' ||
       url.hostname === 'api.github.com' ||
-      url.hostname.endsWith('.githubusercontent.com')
+      url.hostname === 'objects.githubusercontent.com' ||
+      url.hostname === 'release-assets.githubusercontent.com'
     );
   } catch {
     return false;
   }
+}
+
+/**
+ * Обновления, скачанные и проверенные в этом сеансе: версия → каталог
+ * распаковки. installUpdate принимает только их — иначе рендерер мог бы
+ * указать на произвольный локальный каталог с подменённым загрузчиком.
+ */
+const preparedUpdates = new Map<string, string>();
+
+/**
+ * Что именно предложила проверка обновлений. Рендерер не может подменить ни
+ * адрес, ни архив, ни хеш: `update:download` принимает только версию, а всё
+ * остальное берёт отсюда.
+ */
+interface KnownRelease {
+  assetUrl: string;
+  assetName: string;
+  size?: number;
+  digest: string;
+}
+const knownReleases = new Map<string, KnownRelease>();
+
+function rememberRelease(info: UpdateInfo): void {
+  if (!info.latestVersion || !info.assetUrl || !info.assetName) return;
+  const digest = String(info.assetDigest || '');
+  // Без хеша скачивание не разрешается: подменённый архив иначе не отличить
+  // от настоящего.
+  if (!/^sha256:[0-9a-f]{64}$/i.test(digest)) return;
+  knownReleases.set(info.latestVersion, {
+    assetUrl: info.assetUrl,
+    assetName: info.assetName,
+    size: info.size,
+    digest,
+  });
+}
+
+function isInsideTemp(target: string): boolean {
+  const tempRoot = path.resolve(app.getPath('temp')).toLowerCase();
+  const resolved = path.resolve(target).toLowerCase();
+  return resolved === tempRoot || resolved.startsWith(tempRoot + path.sep);
 }
 
 function pickAsset(assets: ReleaseAsset[]): ReleaseAsset | null {
@@ -144,11 +190,12 @@ async function checkForUpdates(): Promise<UpdateInfo> {
       error: 'Проверка обновлений доступна только в собранной portable-версии WorkSpace',
     };
   }
+  let info: UpdateInfo;
   try {
-    return await checkViaApi();
+    info = await checkViaApi();
   } catch (apiError) {
     try {
-      return await checkViaReleasePage();
+      info = await checkViaReleasePage();
     } catch (pageError) {
       return {
         success: false,
@@ -158,6 +205,8 @@ async function checkForUpdates(): Promise<UpdateInfo> {
       };
     }
   }
+  rememberRelease(info);
+  return info;
 }
 
 function runFile(command: string, args: string[], timeout = 10 * 60 * 1000): Promise<void> {
@@ -174,7 +223,10 @@ async function extractZip(zipPath: string, destination: string): Promise<void> {
   await fs.promises.mkdir(destination, { recursive: true });
   try {
     await runFile('tar', ['-xf', zipPath, '-C', destination]);
-  } catch {
+  } catch (tarError) {
+    // Причина отказа tar не должна пропадать: Expand-Archive обычно ругается
+    // уже на свои проблемы, и без первой ошибки разбираться не с чем.
+    console.warn('[Обновление] tar не смог распаковать архив:', (tarError as Error).message);
     const escaped = destination.replace(/'/g, "''");
     const escapedZip = zipPath.replace(/'/g, "''");
     await runFile('powershell', [
@@ -210,28 +262,34 @@ function sendProgress(phase: 'download' | 'extract' | 'install', received: numbe
 
 async function downloadUpdate(payload: {
   version: string;
-  assetUrl: string;
-  assetName: string;
-  size?: number;
-  digest?: string;
 }): Promise<{ success: boolean; zipPath?: string; extractDir?: string; version?: string; error?: string }> {
   try {
-    if (!isAllowedUrl(payload.assetUrl)) {
+    // Ни адрес, ни имя архива, ни хеш из рендерера не принимаются: только
+    // версия, которую до этого предложила проверка обновлений.
+    const version = String(payload?.version ?? '');
+    const release = knownReleases.get(version);
+    if (!release) {
+      throw new Error(
+        'Обновление этой версии не проверялось в текущем сеансе: без контрольной суммы GitHub ' +
+          'скачивание не разрешается. Откройте релиз и обновитесь вручную.'
+      );
+    }
+    if (!isAllowedUrl(release.assetUrl)) {
       throw new Error('Ссылка на обновление должна вести на GitHub');
     }
-    const baseName = payload.assetName.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const root = path.join(app.getPath('temp'), `WorkSpace-update-${payload.version}`);
+    const baseName = release.assetName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const root = path.join(app.getPath('temp'), `WorkSpace-update-${version}`);
     await fs.promises.rm(root, { recursive: true, force: true });
     await fs.promises.mkdir(root, { recursive: true });
     const zipPath = path.join(root, baseName);
 
-    const response = await net.fetch(payload.assetUrl, {
+    const response = await net.fetch(release.assetUrl, {
       headers: { 'User-Agent': USER_AGENT },
     });
     if (!response.ok || !response.body) {
       throw new Error(`Не удалось скачать обновление: HTTP ${response.status}`);
     }
-    const total = Number(response.headers.get('content-length')) || payload.size || 0;
+    const total = Number(response.headers.get('content-length')) || release.size || 0;
     const reader = response.body.getReader();
     const stream = fs.createWriteStream(zipPath);
     const hash = crypto.createHash('sha256');
@@ -259,12 +317,11 @@ async function downloadUpdate(payload: {
       await new Promise<void>((resolve) => stream.end(() => resolve()));
     }
 
-    if (payload.digest && payload.digest.startsWith('sha256:')) {
-      const actual = `sha256:${hash.digest('hex')}`;
-      if (actual.toLowerCase() !== payload.digest.toLowerCase()) {
-        await fs.promises.rm(root, { recursive: true, force: true });
-        throw new Error('SHA-256 скачанного файла не совпадает с GitHub');
-      }
+    // Хеш обязателен: knownReleases хранит только записи с sha256.
+    const actual = `sha256:${hash.digest('hex')}`;
+    if (actual.toLowerCase() !== release.digest.toLowerCase()) {
+      await fs.promises.rm(root, { recursive: true, force: true });
+      throw new Error('SHA-256 скачанного файла не совпадает с GitHub');
     }
 
     sendProgress('extract', 0, 1);
@@ -272,7 +329,8 @@ async function downloadUpdate(payload: {
     await extractZip(zipPath, extracted);
     const sourceRoot = await findSourceRoot(extracted);
     sendProgress('extract', 1, 1);
-    return { success: true, zipPath, extractDir: sourceRoot, version: payload.version };
+    preparedUpdates.set(version, path.resolve(sourceRoot));
+    return { success: true, zipPath, extractDir: sourceRoot, version };
   } catch (error) {
     return { success: false, error: (error as Error).message };
   }
@@ -330,6 +388,16 @@ function installUpdate(payload: {
     return { success: false, error: 'Обновление доступно только в собранной версии' };
   }
 
+  const expected = preparedUpdates.get(String(payload?.version));
+  const resolvedExtract = path.resolve(String(payload?.extractDir ?? ''));
+  if (!expected || resolvedExtract !== expected || !isInsideTemp(resolvedExtract)) {
+    return {
+      success: false,
+      error: 'Обновление не подготовлено этим сеансом — скачайте его заново.',
+    };
+  }
+  payload = { ...payload, extractDir: resolvedExtract };
+
   const appDir = path.dirname(process.execPath);
   const target = path.dirname(appDir);
   if (
@@ -359,7 +427,6 @@ function installUpdate(payload: {
   // Загрузчик новой версии ждёт завершения приложения, поэтому его файл занят.
   // Тогда новый загрузчик кладём рядом: на старте он переименует старый образ
   // и встанет на его место.
-  let launcherStaged = false;
   try {
     fs.copyFileSync(path.join(payload.extractDir, 'WorkSpace.exe'), path.join(target, 'WorkSpace.exe'));
   } catch (error) {
@@ -375,15 +442,15 @@ function installUpdate(payload: {
         path.join(payload.extractDir, 'WorkSpace.exe'),
         path.join(target, 'WorkSpace.exe.new')
       );
-      launcherStaged = true;
     } catch (stageError) {
       return {
         success: false,
         error: `Не удалось подготовить загрузчик: ${(stageError as Error).message}`,
       };
     }
+    // Флаг наружу не передаётся: судьбу WorkSpace.exe.new решает загрузчик.
+    console.info('[Обновление] загрузчик подготовлен как WorkSpace.exe.new');
   }
-  void launcherStaged;
 
   // Среду Electron заменить на ходу нельзя — кладём рядом, загрузчик поставит
   // её на место перед следующим запуском.

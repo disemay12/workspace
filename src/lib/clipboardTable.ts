@@ -28,17 +28,21 @@ function cellText(cell: HTMLTableCellElement): string {
 /** Разворачивает <table> в матрицу строк с учётом colspan/rowspan. */
 function tableToMatrix(table: HTMLTableElement): string[][] {
   const grid: string[][] = [];
-  const spans: Record<string, { remaining: number; value: string }> = {};
+  /** Объединение сверху: до какой строки (endRow) тянется значение. */
+  const spans: Record<string, { endRow: number; value: string }> = {};
 
   const takeSpans = (r: number, startCol: number): number => {
     let c = startCol;
     for (;;) {
       const key = r + ':' + c;
       const span = spans[key];
-      if (!span || span.remaining <= 0) break;
+      if (!span || r > span.endRow) break;
+      delete spans[key];
       if (!grid[r]) grid[r] = [];
       grid[r][c] = span.value;
-      span.remaining -= 1;
+      // rowspan > 2: переносим занятость на следующую строку, иначе
+      // объединение растягивалось всего на две строки.
+      if (span.endRow > r) spans[r + 1 + ':' + c] = span;
       c += 1;
     }
     return c;
@@ -56,7 +60,7 @@ function tableToMatrix(table: HTMLTableElement): string[][] {
 
       for (let k = 0; k < colSpan; k++) {
         grid[r][c] = value;
-        if (rowSpan > 1) spans[r + 1 + ':' + c] = { remaining: rowSpan - 1, value };
+        if (rowSpan > 1) spans[r + 1 + ':' + c] = { endRow: r + rowSpan - 1, value };
         c += 1;
       }
       c = takeSpans(r, c);

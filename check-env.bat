@@ -3,6 +3,10 @@ chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 title WorkSpace - Diagnostics
+REM Usage: check-env.bat
+REM          - interactive run, waits for a keypress at the end
+REM        check-env.bat /nopause
+REM          - script/CI run, never pauses
 
 echo.
 echo  ============================================
@@ -11,6 +15,9 @@ echo  ============================================
 echo.
 
 set "PROBLEMS=0"
+REM Предупреждения не влияют на код возврата: диагностика годится для CI,
+REM где ELECTRON_RUN_AS_NODE выставляется окружением и это не поломка.
+set "WARNINGS=0"
 
 REM ---------- Node.js ----------
 set "NODE_VER="
@@ -48,7 +55,7 @@ if not defined ELECTRON_RUN_AS_NODE goto no_envvar
 echo  [WARN] ELECTRON_RUN_AS_NODE is set - it blocks Electron startup
 echo         The .bat launchers clear it automatically.
 echo         For manual runs use: set "ELECTRON_RUN_AS_NODE="
-set /a PROBLEMS+=1
+set /a WARNINGS+=1
 goto envvar_done
 :no_envvar
 echo  [OK]   ELECTRON_RUN_AS_NODE not set
@@ -81,12 +88,22 @@ REM ---------- Summary ----------
 echo.
 echo  --------------------------------------------
 if not "%PROBLEMS%"=="0" goto has_problems
+if not "%WARNINGS%"=="0" goto has_warnings
 echo   No problems found - run start-dev.bat
 goto summary_done
 :has_problems
-echo   Problems found: %PROBLEMS%
+echo   Problems found: %PROBLEMS% (warnings: %WARNINGS%)
+goto summary_done
+:has_warnings
+echo   No problems found, warnings: %WARNINGS%
 :summary_done
 echo  --------------------------------------------
 echo.
-pause
-endlocal
+
+REM Код возврата отражает результат: 1 при найденных проблемах, иначе 0.
+REM pause только при интерактивном запуске: без аргументов. С ключом /nopause
+REM (или любым другим) скрипт не ждёт клавишу и годится для CI.
+set "EXIT_CODE=0"
+if not "%PROBLEMS%"=="0" set "EXIT_CODE=1"
+if "%~1"=="" pause
+endlocal & exit /b %EXIT_CODE%

@@ -315,17 +315,68 @@ app.whenReady().then(async () => {
       })
     `);
 
+    // Диагностика пустого дерева: без неё «hasLog: false» не отличить от
+    // «рендерер не отрисовался вовсе» — видно только по тексту страницы.
+    results.bootMounted = await win.webContents.executeJavaScript(
+      'Boolean(document.querySelector("#root")?.children.length)'
+    );
+    results.bootSnippet = await win.webContents.executeJavaScript(
+      'document.body.innerText.replace(/\\s+/g, " ").slice(0, 400)'
+    );
+
     results.initialLayout = await win.webContents.executeJavaScript(probeLayout);
+    // Боковая панель могла открыться в режиме поиска (состояние сессии от
+    // прошлого прогона): дерева в DOM тогда нет, и все проверки ниже падали.
+    await win.webContents.executeJavaScript(`
+      (() => {
+        if (document.querySelector('[data-file-tree]')) return true;
+        const tab = [...document.querySelectorAll('button')].find(
+          (node) => /^Файлы$/.test((node.textContent || '').trim())
+        );
+        if (tab) tab.click();
+        return Boolean(tab);
+      })()
+    `);
+    await sleep(800);
+    // Дерево по умолчанию скрывает служебные файлы (server.log) и
+    // прокручивается: без переключателя и прокрутки проверки ложно падали.
+    await win.webContents.executeJavaScript(`
+      new Promise((resolve) => {
+        const toggle = [...document.querySelectorAll('button')].find((b) =>
+          /Показать скрытые файлы/.test(b.getAttribute('title') || '')
+        );
+        if (toggle) toggle.click();
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            const row = document.querySelector('[title^="Заметки.md"]');
+            let el = row instanceof HTMLElement ? row.parentElement : null;
+            while (el && !(el.scrollHeight > el.clientHeight + 8)) el = el.parentElement;
+            if (el) el.scrollTop = el.scrollHeight;
+            requestAnimationFrame(() => resolve(true));
+          })
+        );
+      })
+    `);
     results.fileTreeLoaded = await win.webContents.executeJavaScript(`
       (() => {
-        const t = document.body.innerText;
+        // Ищем только в контейнере дерева и только видимые строки:
+        // document.body.textContent давал true узлам из вкладок, поиска и
+        // скрытых файлов, к дереву отношения не имеющим.
+        const tree = document.querySelector('[data-file-tree]');
+        const names = tree
+          ? [...tree.querySelectorAll('[title]')]
+              .filter((node) => node.offsetParent !== null)
+              .map((node) => (node.getAttribute('title') || '').split(' — ')[0])
+          : [];
+        const has = (name) => names.includes(name);
         return {
-          hasMarkdown: t.includes('Заметки.md'),
-          hasJson: t.includes('config.json'),
-          hasLog: t.includes('server.log'),
-          hasPython: t.includes('script.py'),
-          hasLegacy: t.includes('legacy.txt'),
-          hasFolder: t.includes('Подпапка'),
+          containerFound: Boolean(tree),
+          hasMarkdown: has('Заметки.md'),
+          hasJson: has('config.json'),
+          hasLog: has('server.log'),
+          hasPython: has('script.py'),
+          hasLegacy: has('legacy.txt'),
+          hasFolder: has('Подпапка'),
         };
       })()
     `);
@@ -333,8 +384,10 @@ app.whenReady().then(async () => {
     /* ---- Открываем Markdown-файл кликом по дереву ---- */
     await win.webContents.executeJavaScript(`
       (() => {
-        const node = [...document.querySelectorAll('div')].find(
-          (d) => d.textContent?.trim() === 'Заметки.md' && d.className.includes('cursor-pointer')
+        // Строка дерева содержит не только имя (размер и дата в той же
+        // строке), поэтому ищем по title: он начинается с имени.
+        const node = [...document.querySelectorAll('[title]')].find(
+          (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'Заметки.md'
         );
         if (node) node.click();
         return !!node;
@@ -349,6 +402,8 @@ app.whenReady().then(async () => {
         return {
           tabCreated: t.includes('Заметки.md'),
           hasPreview: !!preview,
+          // Утверждение — непустой HTML предпросмотра; длина остаётся диагностикой.
+          previewHasContent: Boolean(preview && preview.innerHTML.length > 0),
           previewHtmlLen: preview ? preview.innerHTML.length : 0,
           hasHeading: !!document.querySelector('.ws-prose h1'),
           hasList: !!document.querySelector('.ws-prose ul, .ws-prose ol'),
@@ -423,8 +478,10 @@ app.whenReady().then(async () => {
       (() => {
         const t = document.body.innerText;
         if (!t.includes('config.json')) return false;
-        const node = [...document.querySelectorAll('div')].find(
-          (d) => d.textContent?.trim() === 'config.json' && d.className.includes('cursor-pointer')
+        // Строка дерева содержит не только имя (размер и дата в той же
+        // строке), поэтому ищем по title: он начинается с имени.
+        const node = [...document.querySelectorAll('[title]')].find(
+          (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'config.json'
         );
         if (node) node.click();
         return !!node;
@@ -436,6 +493,8 @@ app.whenReady().then(async () => {
       (() => ({
         hasMonaco: !!document.querySelector('.monaco-editor'),
         hasMinimap: !!document.querySelector('.minimap'),
+        // Утверждение — есть отрисованные строки; их число остаётся диагностикой.
+        hasLines: document.querySelectorAll('.view-line').length > 0,
         lineCount: document.querySelectorAll('.view-line').length,
         // Виджет поиска Monaco создаёт лениво, поэтому здесь его ещё нет —
         // работоспособность Ctrl+F проверяется отдельным шагом ниже.
@@ -449,6 +508,34 @@ app.whenReady().then(async () => {
         const ta = document.querySelector('.monaco-editor textarea');
         if (ta) ta.focus();
         return !!ta;
+      })()
+    `);
+    // sendInputEvent доходит до Monaco только когда окно в фокусе:
+    // без этого виджет поиска не открывался и проверка ложно падала.
+    win.focus();
+    win.webContents.focus();
+    await sleep(200);
+    // Monaco слушает keydown на скрытом textarea: событие из DOM надёжнее
+    // sendInputEvent, который в неактивном окне терялся.
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const ta = document.querySelector('.monaco-editor textarea');
+        if (!ta) return false;
+        ta.focus();
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+          ta.dispatchEvent(
+            new KeyboardEvent(type, {
+              key: 'f',
+              code: 'KeyF',
+              keyCode: 70,
+              which: 70,
+              ctrlKey: true,
+              bubbles: true,
+              cancelable: true,
+            })
+          );
+        }
+        return true;
       })()
     `);
     await win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'F', modifiers: ['control'] });
@@ -499,10 +586,17 @@ app.whenReady().then(async () => {
 
     await win.webContents.executeJavaScript(`
       (() => {
-        const node = [...document.querySelectorAll('div')].find(
-          (d) => d.textContent?.trim() === 'Финансы.xlsx' && d.className.includes('cursor-pointer')
+        // Строка дерева содержит не только имя (размер и дата в той же
+        // строке), поэтому ищем по title: он начинается с имени.
+        const node = [...document.querySelectorAll('[title]')].find(
+          (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'Финансы.xlsx'
         );
-        if (node) node.click();
+        // Двойной щелчок: одиночный открывает вкладку-предпросмотр, а её
+        // saveTab отказывается писать — проверки сохранения ложно падали.
+        if (node) {
+          node.click();
+          node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        }
         return !!node;
       })()
     `);
@@ -535,23 +629,68 @@ app.whenReady().then(async () => {
     `);
 
     /* ---- Форматирование ячейки и сохранение в файл ---- */
-    await win.webContents.executeJavaScript(`
-      (() => {
-        const bold = document.querySelector('button[title="Полужирный (Ctrl+B)"]');
-        if (bold) bold.click();
-        return !!bold;
-      })()
-    `);
-    await sleep(700);
-    results.excelFormatting = await win.webContents.executeJavaScript(`
-      (() => {
-        const cell = [...document.querySelectorAll('tbody td')]
-          .find((td) => td.textContent.trim() === 'Товар');
-        return {
-          boldApplied: !!cell && getComputedStyle(cell).fontWeight === '700',
-        };
-      })()
-    `);
+    // Выбор ячейки и нажатие «Полужирный» идут в одном скрипте с кадром
+    // ожидания: обработчик читает выделение из состояния React, и клик,
+    // отправленный до коммита, форматировал другую ячейку.
+    const applyBold = () =>
+      win.webContents.executeJavaScript(`
+        (async () => {
+          const cell = [...document.querySelectorAll('tbody td')].find(
+            (td) => td.textContent.trim() === 'Товар'
+          );
+          if (!cell) return false;
+          cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, buttons: 1 }));
+          await new Promise((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(resolve))
+          );
+          const bold = document.querySelector('button[title="Полужирный (Ctrl+B)"]');
+          if (bold) bold.click();
+          return Boolean(bold);
+        })()
+      `);
+    const readBold = () =>
+      win.webContents.executeJavaScript(`
+        (() => {
+          const cell = [...document.querySelectorAll('tbody td')].find(
+            (td) => td.textContent.trim() === 'Товар'
+          );
+          return !!cell && getComputedStyle(cell).fontWeight === '700';
+        })()
+      `);
+    // Сетка дорисовывается после открытия книги (на повторном прогоне дольше),
+    // поэтому клик повторяется, пока формат не появится: без этого проверка
+    // зависела от скорости машины.
+    let boldApplied = false;
+    let boldClicked = false;
+    for (let attempt = 0; attempt < 3 && !boldApplied; attempt += 1) {
+      boldClicked = (await applyBold()) || boldClicked;
+      for (let wait = 0; wait < 6 && !boldApplied; wait += 1) {
+        await sleep(250);
+        boldApplied = Boolean(await readBold());
+      }
+    }
+    results.excelFormatting = {
+      boldApplied,
+      // Диагностика: состояние сетки и найденной ячейки на момент проверки.
+      diagWeight: await win.webContents.executeJavaScript(`
+        (() => {
+          const cells = [...document.querySelectorAll('tbody td')];
+          const cell = cells.find((td) => td.textContent.trim() === 'Товар');
+          return cell ? getComputedStyle(cell).fontWeight : 'нет-ячейки';
+        })()
+      `),
+      diagTables: await win.webContents.executeJavaScript('document.querySelectorAll("table").length'),
+      // Диагностика: нашлась ли кнопка «Полужирный» в момент клика и что было до него.
+      diagBoldClick: boldClicked ? 1 : 0,
+      diagBefore: await win.webContents.executeJavaScript(`
+        (() => {
+          const cell = [...document.querySelectorAll('tbody td')].find(
+            (td) => td.textContent.trim() === 'Товар'
+          );
+          return cell ? cell.getAttribute('style') || 'нет-style' : 'нет-ячейки';
+        })()
+      `),
+    };
 
     // Числовой формат: выбираем ячейку с числом и включаем «Финансовый»
     await win.webContents.executeJavaScript(`
@@ -663,22 +802,46 @@ app.whenReady().then(async () => {
       })()
     `);
     await sleep(1800);
-    const savedWorkbook = XLSX.read(fs.readFileSync(path.join(SANDBOX, 'Финансы.xlsx')), {
-      type: 'buffer',
-    });
-    const savedRawMeta = (savedWorkbook.Custprops as Record<string, string> | undefined)
-      ?.WorkSpaceStyles;
-    const savedMeta =
-      typeof savedRawMeta === 'string' && savedRawMeta.startsWith('b64:')
-        ? Buffer.from(savedRawMeta.slice(4), 'base64').toString('utf8')
-        : savedRawMeta;
-    const savedSheet = savedWorkbook.Sheets['Продажи'] as
-      | { '!merges'?: unknown[] }
-      | undefined;
-    results.excelPersistence = {
-      stylesSaved: typeof savedMeta === 'string' && savedMeta.includes('"bold":true'),
-      mergeSaved: Array.isArray(savedSheet?.['!merges']) && savedSheet['!merges'].length === 1,
-    };
+    // Диагностика сохранения: если сериализация упала, редактор показывает
+    // заметку — иначе «stylesSaved: false» не отличить от сбоя записи.
+    results.excelSaveNoticeSnippet = await win.webContents.executeJavaScript(`
+      (() => {
+        const t = document.body.textContent || '';
+        const found = t.match(/Не удалось[^.]{0,120}|Ошибка сохранения[^.]{0,80}|Сохранено[^.]{0,60}/);
+        return found ? found[0] : '';
+      })()
+    `);
+    // Отсутствие файла — именованный провал, а не fatal всего набора.
+    const savedPath = path.join(SANDBOX, 'Финансы.xlsx');
+    let savedExists = true;
+    try {
+      const savedStat = fs.statSync(savedPath);
+      results.excelSavedMetaStat = { exists: true, size: savedStat.size, mtime: savedStat.mtimeMs };
+    } catch {
+      savedExists = false;
+      results.excelSavedMetaStat = { exists: false };
+    }
+
+    if (savedExists) {
+      const savedWorkbook = XLSX.read(fs.readFileSync(savedPath), {
+        type: 'buffer',
+      });
+      const savedRawMeta = (savedWorkbook.Custprops as Record<string, string> | undefined)
+        ?.WorkSpaceStyles;
+      const savedMeta =
+        typeof savedRawMeta === 'string' && savedRawMeta.startsWith('b64:')
+          ? Buffer.from(savedRawMeta.slice(4), 'base64').toString('utf8')
+          : savedRawMeta;
+      const savedSheet = savedWorkbook.Sheets['Продажи'] as
+        | { '!merges'?: unknown[] }
+        | undefined;
+      results.excelPersistence = {
+        stylesSaved: typeof savedMeta === 'string' && savedMeta.includes('"bold":true'),
+        mergeSaved: Array.isArray(savedSheet?.['!merges']) && savedSheet['!merges'].length === 1,
+      };
+    } else {
+      results.excelPersistence = { stylesSaved: false, mergeSaved: false };
+    }
 
     // Сортировка: выбираем B2 (10) и сортируем по возрастанию
     await win.webContents.executeJavaScript(`
@@ -700,11 +863,16 @@ app.whenReady().then(async () => {
     await sleep(700);
     results.excelSort = await win.webContents.executeJavaScript(`
       (() => {
+        // Маркер выпадающего списка «▾» и прочие украшения отбрасываются:
+        // иначе отсортированная пятёрка не проходила по ^\\d+$ и проверка
+        // сообщала провал при верной сортировке.
         const values = [...document.querySelectorAll('tbody tr')]
-          .map((tr) => tr.querySelectorAll('td')[2]?.textContent.trim() || '')
+          .map((tr) => (tr.querySelectorAll('td')[2]?.textContent || '').replace(/[^\\d.,-]/g, '').trim())
           .filter((value) => /^\\d+$/.test(value));
         return {
           sortedAsc: values[0] === '5' && values[1] === '10' && values[2] === '15',
+          // Диагностика: фактический порядок колонки после сортировки.
+          values,
         };
       })()
     `);
@@ -738,7 +906,6 @@ app.whenReady().then(async () => {
     /* ---- Примечание к ячейке ---- */
     await win.webContents.executeJavaScript(`
       (() => {
-        window.prompt = () => 'Проверочное примечание';
         const rows = [...document.querySelectorAll('tbody tr')];
         const cell = rows[0]?.querySelectorAll('td')[1];
         if (cell) cell.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 120, clientY: 160 }));
@@ -755,6 +922,32 @@ app.whenReady().then(async () => {
       })()
     `);
     await sleep(500);
+    // Примечание вводится в собственном модале редактора (askText), а не через
+    // window.prompt: значение ставим нативным сеттером, иначе React его не увидит.
+    results.excelCommentFlow = await win.webContents.executeJavaScript(`
+      (() => {
+        // Раньше возвращались строки 'no-input'/'no-ok' — непустые, поэтому
+        // раннер считал шаг успешным. Теперь это явные булевы утверждения.
+        const dialog = document.querySelector('[role="dialog"]');
+        const input = dialog?.querySelector('input');
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (input && setter) {
+          setter.call(input, 'Проверочное примечание');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        const ok = dialog
+          ? [...dialog.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === 'OK')
+          : null;
+        if (ok) ok.click();
+        return {
+          dialogOpened: Boolean(dialog),
+          inputFound: Boolean(input),
+          valueEntered: Boolean(input && setter),
+          okClicked: Boolean(ok),
+        };
+      })()
+    `);
+    await sleep(700);
     results.excelComment = await win.webContents.executeJavaScript(`
       (() => {
         const rows = [...document.querySelectorAll('tbody tr')];
@@ -796,10 +989,14 @@ app.whenReady().then(async () => {
     await sleep(800);
     results.excelChart = await win.webContents.executeJavaScript(`
       (() => {
-        const svg = document.querySelector('svg[role="img"]');
-        const t = document.body.innerText;
+        // Заголовок диаграммы лежит в aria-label SVG, а не в тексте страницы:
+        // поиск по innerText не находил созданную диаграмму.
+        const labels = [...document.querySelectorAll('svg[role="img"]')]
+          .map((node) => node.getAttribute('aria-label') || '')
+          .filter(Boolean);
         return {
-          chartCreated: !!svg && t.includes('Диаграмма 1'),
+          chartCreated: labels.some((label) => /Диаграмма/.test(label)),
+          diagLabels: labels.slice(0, 5),
         };
       })()
     `);
@@ -1035,8 +1232,10 @@ app.whenReady().then(async () => {
     await sleep(1200);
     await win.webContents.executeJavaScript(`
       (() => {
-        const node = [...document.querySelectorAll('div')].find(
-          (d) => d.textContent?.trim() === 'sample.exe' && d.className.includes('cursor-pointer')
+        // Строка дерева содержит не только имя (размер и дата в той же
+        // строке), поэтому ищем по title: он начинается с имени.
+        const node = [...document.querySelectorAll('[title]')].find(
+          (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'sample.exe'
         );
         if (node) node.click();
         return !!node;
@@ -1066,8 +1265,10 @@ app.whenReady().then(async () => {
     await sleep(3500);
     await win.webContents.executeJavaScript(`
       (() => {
-        const node = [...document.querySelectorAll('div')].find(
-          (d) => d.textContent?.trim() === 'Финансы.xlsx' && d.className.includes('cursor-pointer')
+        // Строка дерева содержит не только имя (размер и дата в той же
+        // строке), поэтому ищем по title: он начинается с имени.
+        const node = [...document.querySelectorAll('[title]')].find(
+          (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'Финансы.xlsx'
         );
         if (node) node.click();
         return !!node;
@@ -1171,5 +1372,7 @@ app.whenReady().then(async () => {
     );
   }
 
-  app.exit(0);
+  // Код выхода должен отражать результат: иначе упавший набор выглядит
+  // успешным для любого запуска мимо run-all-checks.
+  app.exit(results.fatal || errors.length > 0 ? 1 : 0);
 });

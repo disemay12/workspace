@@ -10,7 +10,6 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 
 function resolveProjectRoot() {
   let dir = __dirname;
@@ -26,7 +25,11 @@ function resolveProjectRoot() {
 }
 
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(os.tmpdir(), 'ws-cors-test-' + Date.now());
+// os.tmpdir() на этой машине (TEMP=C:\Temp) не даёт создавать каталоги:
+// mkdirSync падал с EPERM, набор умирал на unhandled rejection и «висел» до
+// таймаута. Общий helper выбирает доступный каталог.
+const { createCheckSandbox } = require('./sandbox');
+const SANDBOX = createCheckSandbox('cors', ROOT);
 
 const out = { steps: [], errors: [], progress: [] };
 const step = (name, value) => out.steps.push({ name, ...value });
@@ -38,6 +41,17 @@ const mark = (label) => {
 };
 
 app.disableHardwareAcceleration();
+
+/** Падение до watchdog должно попадать в отчёт, а не выглядеть зависанием. */
+function failFast(reason) {
+  try {
+    out.errors.push(String(reason));
+    fs.writeFileSync(path.join(ROOT, 'cors-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {}
+  app.exit(1);
+}
+process.on('unhandledRejection', (error) => failFast(error));
+process.on('uncaughtException', (error) => failFast(error));
 
 const WATCHDOG_MS = 120_000;
 setTimeout(() => {
@@ -83,8 +97,6 @@ app.whenReady().then(async () => {
   ipcMain.handle('fs:saveFileDialog', () => null);
   ipcMain.handle('fs:openFileDialog', () => null);
   ipcMain.handle('fs:showInExplorer', () => ({ success: true }));
-
-  fs.mkdirSync(SANDBOX, { recursive: true });
 
   const win = new BrowserWindow({
     width: 1500, height: 940, show: false,
@@ -247,5 +259,5 @@ app.whenReady().then(async () => {
   mark('завершение');
   fs.writeFileSync(path.join(ROOT, 'cors-check.json'), JSON.stringify(out, null, 2), 'utf-8');
   try { fs.rmSync(SANDBOX, { recursive: true, force: true }); } catch {}
-  app.exit(0);
+  app.exit(out.errors.length > 0 ? 1 : 0);
 });

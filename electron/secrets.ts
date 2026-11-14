@@ -44,20 +44,24 @@ function locateSecretsFile(): string | null {
   // 1. Профиль пользователя: единственное место, которое переживает обновление.
   candidates.push(path.join(app.getPath('userData'), 'secrets.local.ps1'));
 
-  // 2. Рядом с исполняемым файлом / текущим рабочим каталогом
-  candidates.push(path.join(process.cwd(), 'secrets.local.ps1'));
+  // 2. Рядом с исполняемым файлом (portable-сборка кладёт конфиг рядом).
+  candidates.push(path.join(path.dirname(process.execPath), 'secrets.local.ps1'));
 
-  // 2. В каталоге приложения (dev: корень проекта; prod: рядом с ресурсами)
+  // 3. В каталоге приложения (dev: корень проекта; prod: рядом с ресурсами)
   candidates.push(path.join(__dirname, '..', 'secrets.local.ps1'));
   candidates.push(path.join(__dirname, '..', '..', 'secrets.local.ps1'));
 
-  // 3. Подъём вверх по дереву от cwd (до 5 уровней)
-  let dir = process.cwd();
-  for (let i = 0; i < 5; i++) {
-    candidates.push(path.join(dir, 'secrets.local.ps1'));
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+  // 4. Поиск по рабочему каталогу — только при разработке. В собранной
+  // программе cwd произвольный: запуск через ярлык из скачанной папки иначе
+  // подсовывал бы чужой secrets.local.ps1 с чужим API_BASE_URL и ключом.
+  if (!app.isPackaged) {
+    let dir = process.cwd();
+    for (let i = 0; i < 5; i++) {
+      candidates.push(path.join(dir, 'secrets.local.ps1'));
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
   }
 
   for (const candidate of candidates) {

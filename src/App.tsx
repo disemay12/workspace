@@ -7,14 +7,13 @@ import {
   X,
   Files,
   Sparkles,
-  Maximize2,
   Save,
   Pencil,
   Download,
   Eye,
 } from 'lucide-react';
 
-import { OpenTab, ChatMessage, AIProvider, FileItem, ChatAttachment, FileType } from './types';
+import { OpenTab, FileItem, ChatAttachment, FileType } from './types';
 import { fileSystemService, getFileType } from './services/fileSystemService';
 import { getSheetController } from './services/sheetBridge';
 import { getPptxController } from './services/pptBridge';
@@ -34,7 +33,7 @@ import { listSnapshots, pruneSnapshots, writeSnapshot } from './services/autosav
 import { copyDiagnosticsReport, installDiagnosticsHooks } from './services/diagnostics';
 import type { NotificationKind } from './lib/notifyRules';
 import { useLocalStorage } from './hooks/useLocalStorage';
-import { cn, baseName, dirName, extName, joinPath, uid } from './lib/utils';
+import { cn, baseName, dirName, extName, joinPath, stripCodeFence, uid } from './lib/utils';
 import { docxText, pptxText, tabToDocumentText, htmlToPlainText } from './lib/documentText';
 import { extractLegacyDocText } from './lib/legacyDoc';
 import { docxBase64ToHtml, htmlToDocxBase64 } from './lib/docx';
@@ -42,7 +41,6 @@ import { applyAutoFitColumns } from './lib/xlsxColumns';
 import { resolveWorkspacePath as resolvePathInsideWorkspace } from './lib/workspacePath';
 import { resolveImageSource } from './lib/imageSource';
 import {
-  getDocumentSession,
   kindForTab,
   listDocumentSessions,
   registerDocumentSession,
@@ -155,6 +153,22 @@ function columnLabel(index: number): string {
   return label;
 }
 
+/**
+ * Поле ввода в фокусе: глобальные сочетания не должны перехватывать набор.
+ * contentEditable (тело документа Word) намеренно не считаем полем — Ctrl+S
+ * там обязателен.
+ */
+function isTextFieldTarget(target: EventTarget | null): boolean {
+  const element = target as HTMLElement | null;
+  if (!element || !element.tagName || element.isContentEditable) return false;
+  if (element.tagName === 'TEXTAREA') return true;
+  if (element.tagName !== 'INPUT') return false;
+  const type = (element as HTMLInputElement).type;
+  return !['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'file', 'color'].includes(
+    type
+  );
+}
+
 const App: React.FC = () => {
   const ws = useWorkspace();
   const ai = useAISettings();
@@ -193,14 +207,26 @@ const App: React.FC = () => {
   // Автосохранение: снимок несохранённых вкладок раз в 2 секунды после правки.
   useEffect(() => {
     const dirty = ws.tabs.filter((tab) => tab.isDirty && tab.content);
-    if (dirty.length === 0) return;
-    const timer = window.setTimeout(() => {
+    const snapshotAll = () => {
       for (const tab of dirty) void writeSnapshot(tab);
+    };
+    const timer = window.setTimeout(() => {
+      snapshotAll();
+      // Чистим и тогда, когда грязных вкладок нет: иначе снимок пережившего
+      // сохранение файла черновика «восстановится» поверх свежего файла.
       void pruneSnapshots(
         ws.tabs.filter((tab) => !tab.isDirty).map((tab) => tab.path)
       );
     }, 2000);
-    return () => window.clearTimeout(timer);
+    // Набор не прерывается: таймер сбрасывается на каждое нажатие, поэтому
+    // при закрытии окна снимок делается немедленно.
+    window.addEventListener('pagehide', snapshotAll);
+    window.addEventListener('beforeunload', snapshotAll);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pagehide', snapshotAll);
+      window.removeEventListener('beforeunload', snapshotAll);
+    };
   }, [ws.tabs]);
 
   // Восстановление после сбоя: поднимаем снимки в вкладки и сразу их убираем.
@@ -210,8 +236,18 @@ const App: React.FC = () => {
       const snapshots = await listSnapshots();
       if (cancelled || snapshots.length === 0) return;
       let restored = 0;
+      const stale: string[] = [];
       for (const snapshot of snapshots) {
         try {
+          // Снимок старее изменённого файла восстанавливать нельзя: он затрёт
+          // правки, сохранённые после того, как снимок был записан. Но и
+          // удалять его молча нельзя — файл могли тронуть извне, и в снимке
+          // остаётся единственная копия.
+          const stat = await fileSystemService.statFile(snapshot.path);
+          if (!stat.isDirectory && snapshot.savedAt <= stat.mtimeMs) {
+            stale.push(snapshot.name || snapshot.path);
+            continue;
+          }
           const tabId = await ws.openFile(snapshot.path);
           if (!tabId) continue;
           ws.updateTabContent(tabId, snapshot.content);
@@ -224,6 +260,12 @@ const App: React.FC = () => {
       }
       if (!cancelled && restored > 0) {
         ws.flash(`Восстановлены несохранённые документы: ${restored}`);
+      }
+      if (!cancelled && stale.length > 0) {
+        ws.flash(
+          `Файлы изменены извне, черновики не восстановлены: ${stale.slice(0, 3).join(', ')}` +
+            (stale.length > 3 ? ' и другие' : '')
+        );
       }
     })();
     return () => {
@@ -350,7 +392,9 @@ const App: React.FC = () => {
     if (fingerprint === layoutSavedRef.current) return;
     const timer = window.setTimeout(() => {
       layoutSavedRef.current = fingerprint;
-      void window.electronAPI?.sessionPatch?.({ layout: layoutState });
+      // Канал может отсутствовать (старый preload, веб-режим, проверочные
+      // наборы): отказ не должен превращаться в unhandled rejection.
+      void window.electronAPI?.sessionPatch?.({ layout: layoutState })?.catch?.(() => undefined);
     }, 600);
     return () => window.clearTimeout(timer);
   }, [aiPanelOpen, terminalOpen, searchPanelOpen, ws.tabs, ws.activeTab]);
@@ -451,7 +495,7 @@ const App: React.FC = () => {
     try {
       // saveAll возвращает список неудачных файлов: решение о выходе
       // принимается по фактическому результату записи, а не по состоянию UI.
-      const { saved, failed } = await ws.saveAll();
+      const { saved, failed } = await saveAllWithEditors();
       if (failed.length === 0) {
         ws.flash(saved > 0 ? `Сохранено файлов: ${saved}` : 'Все файлы уже сохранены');
         doExit();
@@ -499,10 +543,73 @@ const App: React.FC = () => {
   /* ============================================================
      Горячие клавиши (Этап 6.3)
      ============================================================ */
+
+  /**
+   * Сериализаторы редакторов по id вкладки. Ctrl+S обязан идти через них:
+   * tab.content обновляется через setTabs и на момент сохранения отстаёт,
+   * то есть на диск уходит предыдущая версия, а UI рапортует успех.
+   */
+  const editorSaversRef = useRef(new Map<string, () => void | Promise<unknown>>());
+  const registerEditorSaver = useCallback(
+    (tabId: string, saver: (() => void | Promise<unknown>) | null) => {
+      if (saver) editorSaversRef.current.set(tabId, saver);
+      else editorSaversRef.current.delete(tabId);
+    },
+    []
+  );
+
+  /** Сохранение вкладки через её редактор: он отдаёт живое содержимое. */
+  const saveTabWithEditor = useCallback(async (tabId: string): Promise<boolean> => {
+    const saver = editorSaversRef.current.get(tabId);
+    if (saver) return (await saver()) !== false;
+    return wsRef.current.saveTab(tabId);
+  }, []);
+
+  const saveActiveTab = useCallback(async () => {
+    const current = wsRef.current;
+    if (current.activeTabId) await saveTabWithEditor(current.activeTabId);
+  }, [saveTabWithEditor]);
+
+  /**
+   * ws.saveAll идёт мимо редакторов: Word теряет последние 400 мс правок,
+   * Excel в оконном режиме пишет book без догруженных строк. Поэтому массовое
+   * сохранение тоже проходит через сериализаторы вкладок.
+   */
+  const saveAllWithEditors = useCallback(async (): Promise<{ saved: number; failed: string[] }> => {
+    const dirty = wsRef.current.tabs.filter((tab) => tab.isDirty);
+    const failed: string[] = [];
+    let saved = 0;
+    for (const tab of dirty) {
+      const ok = await saveTabWithEditor(tab.id);
+      if (ok) saved += 1;
+      else failed.push(tab.name);
+    }
+    return { saved, failed };
+  }, [saveTabWithEditor]);
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
+      // Сочетания не работают при наборе текста, поверх диалогов и на повторе
+      // (удержанный Ctrl+S писал файл десятки раз).
+      if (e.repeat || e.isComposing) return;
+      if (
+        settingsOpen ||
+        saveAsOpen ||
+        quickOpenOpen ||
+        commandOpen ||
+        newFileDialog.open ||
+        renameDialog.open ||
+        inlineTarget
+      ) {
+        return;
+      }
+      // Сочетания не работают при наборе текста, но Ctrl+S — исключение:
+      // в таблице фокус часто стоит в строке формул или в ячейке, и
+      // сохранение там должно срабатывать.
+      const saveCombo = (e.key === 's' || e.key === 'S') && !e.repeat;
+      if (isTextFieldTarget(e.target) && !saveCombo) return;
 
       // Ctrl+Shift+P — командная палитра
       if ((e.key === 'P' || e.key === 'p') && e.shiftKey) {
@@ -527,10 +634,10 @@ const App: React.FC = () => {
         return;
       }
 
-      // Ctrl+S — сохранить активную вкладку
+      // Ctrl+S — сохранить активную вкладку (через сериализатор редактора)
       if (e.key === 's' && !e.shiftKey && !e.altKey) {
         e.preventDefault();
-        if (ws.activeTabId) void ws.saveTab(ws.activeTabId);
+        void saveActiveTab();
         return;
       }
 
@@ -547,7 +654,7 @@ const App: React.FC = () => {
       // Ctrl+Alt+S — сохранить все
       if (e.key === 's' && e.altKey) {
         e.preventDefault();
-        void ws.saveAll().then(({ saved, failed }) => {
+        void saveAllWithEditors().then(({ saved, failed }) => {
           if (failed.length === 0) {
             ws.flash(saved > 0 ? `Сохранено файлов: ${saved}` : 'Нет изменений для сохранения');
           } else {
@@ -609,63 +716,85 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ws.activeTabId, ws.tabs, ws.rootPath, ws.saveTab, ws.saveAll]);
+  }, [
+    ws.activeTabId,
+    ws.tabs,
+    ws.rootPath,
+    saveAllWithEditors,
+    saveActiveTab,
+    settingsOpen,
+    saveAsOpen,
+    quickOpenOpen,
+    commandOpen,
+    newFileDialog.open,
+    renameDialog.open,
+    inlineTarget,
+  ]);
 
   /* ============================================================
      Открытие файлов и папок из проводника Windows (контекстное меню)
      ============================================================ */
-  useEffect(() => {
-    if (!window.electronAPI?.onOpenExternalPath) return;
-
-    const handleExternalTarget = async (data: { path: string; isDirectory: boolean }) => {
+  const handleExternalTarget = useCallback(
+    async (data: { path: string; isDirectory: boolean }) => {
+      // Функции берём из ref: ws — новый объект каждый рендер, и подписка на
+      // него пересоздавалась на каждое нажатие клавиши.
+      const current = wsRef.current;
       if (!data?.path) return;
       try {
         if (data.isDirectory) {
-          await ws.openWorkspace(data.path);
-          ws.flash(`Открыта папка: ${baseName(data.path)}`);
+          await current.openWorkspace(data.path);
+          current.flash(`Открыта папка: ${baseName(data.path)}`);
           return;
         }
 
         const parentDir = dirName(data.path);
         const revealEnabled = readPreferences().explorerRevealOnOpen;
         if (!revealEnabled) {
-          if (!ws.rootPath) await ws.openWorkspace(parentDir);
-          await ws.openFile(data.path);
-          ws.flash(`Открыт файл: ${baseName(data.path)}`);
+          if (!current.rootPath) await current.openWorkspace(parentDir);
+          await current.openFile(data.path);
+          current.flash(`Открыт файл: ${baseName(data.path)}`);
           return;
         }
         // Файл внутри текущего дерева — только раскрываем и подсвечиваем.
-        const insideCurrent = ws.rootPath ? await ws.revealPath(data.path) : false;
+        const insideCurrent = current.rootPath ? await current.revealPath(data.path) : false;
         if (!insideCurrent) {
           // Иначе корнем становится папка файла: так в проводнике видно его
           // окружение, а не дерево посторонней папки.
-          await ws.openWorkspace(parentDir);
-          await ws.revealPath(data.path);
+          await current.openWorkspace(parentDir);
+          await current.revealPath(data.path);
         }
-        await ws.openFile(data.path);
-        ws.flash(`Открыт файл: ${baseName(data.path)}`);
+        await current.openFile(data.path);
+        current.flash(`Открыт файл: ${baseName(data.path)}`);
       } catch (err) {
-        ws.flash(`Ошибка открытия: ${(err as Error).message}`);
+        wsRef.current.flash(`Ошибка открытия: ${(err as Error).message}`);
       }
-    };
+    },
+    []
+  );
+  const handleExternalTargetRef = useRef(handleExternalTarget);
+  handleExternalTargetRef.current = handleExternalTarget;
 
-    // Проверяем аргумент при холодном запуске
+  // Слушаем открытие при уже работающем приложении (second-instance)
+  useEffect(() => {
+    if (!window.electronAPI?.onOpenExternalPath) return;
+    const unsub = window.electronAPI.onOpenExternalPath((data) => {
+      void handleExternalTargetRef.current(data);
+    });
+    return unsub;
+  }, []);
+
+  // Аргумент холодного запуска спрашиваем ровно один раз: подписка выше
+  // переживает смену настроек, а getInitialExternalPath отдаёт значение при старте.
+  useEffect(() => {
     void window.electronAPI
-      .getInitialExternalPath?.()
+      ?.getInitialExternalPath?.()
       .then((init) => {
-        if (init) void handleExternalTarget(init);
+        if (init) void handleExternalTargetRef.current(init);
       })
       .catch(() => {
         // Проверочные среды могут не регистрировать этот IPC-канал
       });
-
-    // Слушаем открытие при уже работающем приложении (second-instance)
-    const unsub = window.electronAPI.onOpenExternalPath((data) => {
-      void handleExternalTarget(data);
-    });
-
-    return unsub;
-  }, [ws]);
+  }, []);
 
   /* ============================================================
      Запрос контекста у активного редактора (для Ctrl+K)
@@ -706,6 +835,13 @@ const App: React.FC = () => {
     (target: InlineEditTarget, newText: string) => {
       const tab = ws.tabs.find((t) => t.id === target.tabId);
       if (!tab) return;
+      // Пока висело окно AI-правки, документ могли отредактировать: офсеты
+      // протухли, и вставка разрезала бы чужой фрагмент.
+      if (tab.content.slice(target.from, target.to) !== target.original) {
+        ws.flash('Документ изменился — откройте AI-правку заново');
+        setInlineTarget(null);
+        return;
+      }
       const next = tab.content.slice(0, target.from) + newText + tab.content.slice(target.to);
       ws.updateTabContent(target.tabId, next);
       ws.flash('Изменения применены');
@@ -764,7 +900,7 @@ const App: React.FC = () => {
   );
 
   const handleAIApply = useCallback(
-    (action: AIAction, result: string) => {
+    (_action: AIAction, result: string) => {
       ws.flash(result);
     },
     [ws]
@@ -865,7 +1001,9 @@ const App: React.FC = () => {
 
       // Модель может прислать весь ответ чата: вступление, советы по
       // оформлению и обёртку ```. В документ попадает только его текст.
-      const body = extractDocumentContent(text) || text;
+      // Для кода экстрактор тоже нужен (он снимает вступление и фенс), а
+      // отступы внутри фенса он сохраняет.
+      const body = extractDocumentContent(text) || stripCodeFence(text) || text;
 
       if (!EDITABLE_TYPES.has(tab.type)) {
         ws.flash(
@@ -1970,7 +2108,6 @@ const App: React.FC = () => {
 
       if (name.startsWith('video_')) {
         const api = window.electronAPI;
-        const root = current.rootPath || (await fileSystemService.getCurrentWorkspace()) || '';
         const videoTab = tab.type === 'video' ? tab : null;
         const videoBridge = videoTab ? getVideoController(videoTab.id) : undefined;
         const filePath = args.path ? await resolveWorkspacePath(String(args.path)) : videoBridge?.getState()?.filePath;
@@ -2928,13 +3065,13 @@ const App: React.FC = () => {
 
           case 'save': {
             if (action.all) {
-              const { saved, failed } = await ws.saveAll();
+              const { saved, failed } = await saveAllWithEditors();
               return failed.length === 0
                 ? { ok: true, message: `Сохранено файлов: ${saved}` }
                 : fail(`Не сохранено: ${failed.join(', ')}`);
             }
             if (!ws.activeTabId) return fail('Нет активной вкладки');
-            const saved = await ws.saveTab(ws.activeTabId);
+            const saved = await saveTabWithEditor(ws.activeTabId);
             return saved
               ? { ok: true, message: `Сохранено: ${ws.activeTab?.name || 'файл'}` }
               : fail('Не удалось сохранить файл');
@@ -3057,6 +3194,7 @@ const App: React.FC = () => {
       setSidebarOpen,
       setAiPanelOpen,
       setTerminalOpen,
+      saveTabWithEditor,
     ]
   );
 
@@ -3518,7 +3656,9 @@ const App: React.FC = () => {
     const common = {
       tab,
       onChange: (content: string) => ws.updateTabContent(tab.id, content),
-      onSave: () => ws.saveTab(tab.id),
+      // Живое содержимое передаётся явно: tab.content к этому моменту отстаёт.
+      onSave: (content?: string) => ws.saveTab(tab.id, content),
+      onRegisterSave: registerEditorSaver,
       onAskAI: askAI,
       onRequestInlineEdit: openInlineCopilot,
       onViewModeChange: (viewMode: OpenTab['viewMode']) =>
@@ -3618,7 +3758,7 @@ const App: React.FC = () => {
           ws.rootPath &&
           setNewFileDialog({ open: true, parentDir: ws.rootPath, kind: 'file', name: '' })
         }
-        onSave={() => ws.activeTabId && void ws.saveTab(ws.activeTabId)}
+        onSave={() => void saveActiveTab()}
         onSaveAs={() => openSaveAs()}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         onToggleAIPanel={() => setAiPanelOpen((v) => !v)}
@@ -3999,13 +4139,13 @@ const App: React.FC = () => {
                   hint: 'Ctrl+S',
                   run: () => {
                     const tab = ws.activeTab;
-                    if (tab) void ws.saveTab(tab.id);
+                    if (tab) void saveTabWithEditor(tab.id);
                   },
                 },
                 {
                   label: 'Сохранить все файлы',
                   hint: 'Ctrl+Alt+S',
-                  run: () => void ws.saveAll(),
+                  run: () => void saveAllWithEditors(),
                 },
                 {
                   label: 'Сохранить как… (сменить формат)',
@@ -4142,7 +4282,7 @@ const App: React.FC = () => {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         settings={ai.settings}
-        onChangeProvider={(p) => void ai.changeProvider(p)}
+        onChangeProvider={(p) => ai.changeProvider(p)}
         onUpdateSettings={ai.updateSettings}
         onSaveApiKey={ai.saveApiKey}
         availableModels={ai.availableModels}
@@ -4151,7 +4291,7 @@ const App: React.FC = () => {
         initialTab={settingsTab}
         onNotify={notify}
         onBeforeUpdate={async () => {
-          const { failed } = await ws.saveAll();
+          const { failed } = await saveAllWithEditors();
           if (failed.length > 0) {
             ws.flash(`Не удалось сохранить: ${failed.join(', ')} — обновление отменено`);
             return false;
@@ -4334,9 +4474,15 @@ const App: React.FC = () => {
               variant="primary"
               onClick={async () => {
                 const id = unsavedDialog.tabId;
+                // Диалог закрываем только после успешного сохранения: иначе
+                // при отказе записи пользователь считает файл сохранённым.
+                const ok = await saveTabWithEditor(id);
+                if (!ok) {
+                  ws.flash('Не удалось сохранить файл: он остаётся открытым');
+                  return;
+                }
                 setUnsavedDialog({ open: false, tabId: '' });
-                const ok = await ws.saveTab(id);
-                if (ok) ws.closeTab(id);
+                ws.closeTab(id);
               }}
             >
               Сохранить и закрыть

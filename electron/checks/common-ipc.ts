@@ -15,7 +15,30 @@
  * внутри registerIPC() каждого набора — тогда новые обработчики main.ts
  * достаточно добавить один раз, и все сценарии получат их автоматически.
  */
-import { ipcMain, clipboard } from 'electron';
+import { app, ipcMain, clipboard } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
+
+/**
+ * Версия приложения — из package.json: заглушка отдавала '0.0.0-check', и
+ * проверка формы ответа update:check не могла сверить её с боевой.
+ */
+function resolveAppVersion(): string {
+  let dir = __dirname;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8'));
+      if (pkg && typeof pkg.version === 'string') return pkg.version;
+    } catch {
+      // Идём уровнем выше.
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return '0.0.0';
+}
+const APP_VERSION = resolveAppVersion();
 
 /** Состояние избранного на время прогона (в памяти, как в main.ts). */
 const favorites: { path: string; name: string }[] = [];
@@ -138,6 +161,130 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
     }
   });
 
+  /* ---------- Сессия окна ----------
+   * Приложение сохраняет раскладку дебаунсом через session:patch, а при старте
+   * читает session:get. Без этих каналов рендерер получал «No handler
+   * registered» уже на первых секундах и набор падал на ошибках консоли.
+   * Храним в файле песочницы, как main.ts в userData: заглушка в памяти
+   * расходилась с боевой и не проверяла запись. */
+  const sessionFile = sandbox ? path.join(sandbox, 'workspace-session.json') : '';
+  // Раскладка прошлого прогона (открытые вкладки, активный лист) не должна
+  // переноситься в текущий: иначе проверки зависят от порядка запусков —
+  // например, «Полужирный» снимал жирный, уже сохранённый предыдущим прогоном.
+  if (sessionFile) {
+    try {
+      fs.rmSync(sessionFile, { force: true });
+    } catch {
+      // Сессии нет или файл занят — стартуем с пустой раскладки.
+    }
+  }
+  const sessionMemory: Record<string, unknown> = {};
+  const readSession = (): Record<string, unknown> => {
+    if (!sessionFile) return { ...sessionMemory };
+    try {
+      const parsed = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+  handle('session:get', () => readSession());
+  handle('session:patch', (_event, patch: Record<string, unknown> = {}) => {
+    const next = { ...readSession(), ...(patch ?? {}) };
+    if (!sessionFile) Object.assign(sessionMemory, next);
+    else {
+      try {
+        fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+        fs.writeFileSync(sessionFile, JSON.stringify(next, null, 2), 'utf-8');
+      } catch {
+        // Каталог данных может быть недоступен — сессия остаётся в памяти.
+        Object.assign(sessionMemory, next);
+      }
+    }
+    return next;
+  });
+
+  /* ---------- Автосохранение ----------
+   * Снимки читаются на старте (уборка просроченных), поэтому каналы нужны
+   * каждому сценарию, а не только тем, что проверяют восстановление. */
+  const snapshots = new Map<string, unknown>();
+  handle('autosave:write', (_event, name: string, payload: unknown) => {
+    snapshots.set(String(name), payload);
+    return { success: true };
+  });
+  handle('autosave:list', () => ({ success: true, items: [...snapshots.values()] }));
+  /**
+   * Метаданные снимков без содержимого: рендерер опрашивает их заметно чаще
+   * полного списка, и форма совпадает с main.ts (content не отдаётся).
+   */
+  handle('autosave:listMeta', () => ({
+    success: true,
+    items: [...snapshots.entries()].map(([name, payload]) => {
+      const snapshot = (payload ?? {}) as Record<string, unknown>;
+      return {
+        id: snapshot.id,
+        path: snapshot.path,
+        name: snapshot.name ?? name,
+        type: snapshot.type,
+        savedAt: snapshot.savedAt,
+        size: typeof snapshot.content === 'string' ? snapshot.content.length : 0,
+      };
+    }),
+  }));
+  handle('autosave:read', (_event, name: string) => {
+    const snapshot = snapshots.get(String(name));
+    return snapshot === undefined
+      ? { success: false, error: 'снимок не найден' }
+      : { success: true, snapshot };
+  });
+  handle('autosave:remove', (_event, name: string) => {
+    snapshots.delete(String(name));
+    return { success: true };
+  });
+
+  /* ---------- Диагностика и обновления ----------
+   * Рендерер пишет ошибки в diagnostics:log и проверяет обновления на старте.
+   * Форма ответов взята из main.ts/updater.ts: расходившаяся заглушка
+   * (`{success:false}`, версия '0.0.0-check') проходила проверку, хотя боевой
+   * обработчик отдаёт отчёт и настоящую версию. */
+  const diagnostics: { at: number; level: string; message: string }[] = [];
+  handle('diagnostics:log', (_event, level: string, message: string) => {
+    diagnostics.push({
+      at: Date.now(),
+      level: String(level || 'error'),
+      message: String(message ?? '').slice(0, 2000),
+    });
+    if (diagnostics.length > 200) diagnostics.shift();
+    return { success: true };
+  });
+  handle('diagnostics:report', () => ({
+    success: true,
+    report: {
+      app: { version: APP_VERSION, name: 'WorkSpace', packaged: false, locale: app.getLocale() },
+      system: {
+        platform: process.platform,
+        arch: process.arch,
+        release: (process as any).getSystemVersion?.() ?? '',
+        versions: {
+          electron: process.versions.electron,
+          chrome: process.versions.chrome,
+          node: process.versions.node,
+        },
+        paths: { userData: app.getPath('userData'), home: app.getPath('home'), appData: app.getPath('appData') },
+        memoryMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+      },
+      autosave: { dir: sandbox ? path.join(sandbox, 'autosave') : '', snapshots: snapshots.size },
+      logs: [...diagnostics],
+    },
+  }));
+  handle('update:getVersion', () => APP_VERSION);
+  handle('update:check', () => ({
+    success: true,
+    supported: false,
+    currentVersion: APP_VERSION,
+    error: 'Проверка обновлений доступна только в собранной portable-версии WorkSpace',
+  }));
+
   /* ---------- Подтверждение закрытия окна ---------- */
   handle('window:confirmClose', (_event, proceed: boolean) => {
     onConfirmClose?.(Boolean(proceed));
@@ -154,24 +301,44 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
 
   /** Значения, сохранённые самим приложением через aiSettings:save. */
   const savedSettings: Record<string, unknown> = {};
+  /**
+   * Ключи, сохранённые приложением. Боевой обработчик aiSettings:save
+   * шифрует patch.apiKey в data.keys[provider] — заглушка должна делать то же
+   * самое, иначе после импорта ключа приложение выглядит «не настроенным».
+   */
+  const savedKeys: Record<string, string> = {};
 
   handle('aiSettings:load', () => ({
     // Сохранённое приложением дополняется настройками сценария: последние
     // имитируют постоянный файл и потому авторитетнее.
     settings: { ...savedSettings, ...readSettings() },
-    keys: { ...readKeys() },
+    keys: { ...readKeys(), ...savedKeys },
+    keyErrors: [],
+    encryptionUnavailable: false,
+  }));
+
+  // Ключ конкретного провайдера: замена `keys` в load — там только активный.
+  handle('aiSettings:key', (_event, provider: string) => ({
+    key: savedKeys[provider] || readKeys()[provider] || '',
+    unreadable: false,
   }));
 
   handle('aiSettings:save', (_event, patch: Record<string, unknown> = {}) => {
-    const { apiKey: _apiKey, keys: _keys, ...rest } = patch;
+    const { apiKey, keys: _keys, ...rest } = patch;
     Object.assign(savedSettings, rest);
+    const provider = typeof rest.provider === 'string' ? rest.provider : '';
+    if (provider && typeof apiKey === 'string') {
+      if (apiKey.trim()) savedKeys[provider] = apiKey.trim();
+      else delete savedKeys[provider];
+    }
     return { success: true };
   });
 
   /* ---------- Секреты ---------- */
   handle('secrets:describe', () => ({
     found: false,
-    filePath: '',
+    // Путь наружу не отдаётся: интерфейс показывает только имя файла.
+    fileName: '',
     baseUrl: '',
     textModel: '',
     imageModel: '',
@@ -184,14 +351,13 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
 
   /* ---------- Обновления ---------- */
   // В проверках сети нет: интерфейс должен получить понятный ответ без запроса.
-  handle('fs:pathExists', () => false);
-  handle('update:getVersion', () => '0.0.0-check');
-  handle('update:check', () => ({
-    success: true,
-    supported: false,
-    currentVersion: '0.0.0-check',
-    error: 'Проверка обновлений недоступна в проверочном сценарии',
-  }));
+  handle('fs:pathExists', (_event, targetPath: string) => {
+    try {
+      return fs.existsSync(String(targetPath));
+    } catch {
+      return false;
+    }
+  });
   handle('update:download', () => ({ success: false, error: 'Недоступно в проверочном сценарии' }));
   handle('update:install', () => ({ success: false, error: 'Недоступно в проверочном сценарии' }));
 }

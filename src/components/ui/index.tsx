@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   AlertTriangle,
   Check,
@@ -143,6 +143,12 @@ export const Toast: React.FC<{
   );
 };
 
+/**
+ * Стек открытых модалей: Escape без него закрывал все сразу (два окна —
+ * «Настройки» и подтверждение — одним нажатием).
+ */
+const modalStack: symbol[] = [];
+
 /** Модальное окно с затемнением. */
 export const Modal: React.FC<{
   open: boolean;
@@ -153,6 +159,39 @@ export const Modal: React.FC<{
   footer?: React.ReactNode;
   width?: string;
 }> = ({ open, onClose, title, icon, children, footer, width = 'max-w-lg' }) => {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  /** Куда вернуть фокус после закрытия. */
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  /** onClose обычно инлайн-стрелка: держим в ref, иначе эффект перевешивается
+   *  на каждый рендер и выдёргивает фокус из полей. */
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  /** Идентичность конкретного окна в модульном стеке. */
+  const modalIdRef = useRef<symbol>(Symbol('ws-modal'));
+
+  useEffect(() => {
+    if (!open) return;
+    const modalId = modalIdRef.current;
+    modalStack.push(modalId);
+    restoreFocusRef.current = document.activeElement as HTMLElement | null;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      // Закрывается только верхнее окно, остальные ждут своего Escape.
+      if (modalStack[modalStack.length - 1] !== modalId) return;
+      event.preventDefault();
+      onCloseRef.current();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    // Фокус внутрь диалога: Escape и Tab должны работать в нём, а не в дереве под ним.
+    dialogRef.current?.focus();
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      const index = modalStack.lastIndexOf(modalId);
+      if (index !== -1) modalStack.splice(index, 1);
+      restoreFocusRef.current?.focus?.();
+    };
+  }, [open]);
+
   if (!open) return null;
   return (
     <div
@@ -162,8 +201,13 @@ export const Modal: React.FC<{
       }}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={typeof title === 'string' ? title : undefined}
+        tabIndex={-1}
         className={cn(
-          'animate-scale-in flex max-h-[85vh] w-full flex-col overflow-hidden rounded-xl border border-ws bg-ws-surface shadow-ws',
+          'animate-scale-in flex max-h-[85vh] w-full flex-col overflow-hidden rounded-xl border border-ws bg-ws-surface shadow-ws focus:outline-none',
           width
         )}
       >

@@ -1160,9 +1160,21 @@ function registerHandlers() {
     }
   });
 
-  ipcMain.handle('fs:createFile', async (_event, filePath, initialContent = '') => {
+  // Как в главном процессе: офисные файлы приходят из рендерера в base64, и
+  // без декодирования на диск попадала base64-строка (Word такой файл не
+  // открывает, а последующие шаги читают мусор).
+  ipcMain.handle('fs:createFile', async (_event, filePath, initialContent = '', encoding) => {
     try {
-      await fs.promises.writeFile(filePath, initialContent, { flag: 'wx' });
+      const isBase64 =
+        encoding === 'base64' ||
+        (typeof initialContent === 'string' &&
+          initialContent.length > 0 &&
+          /\.(xlsx|xls|docx|doc|pptx|png|jpe?g|ico)$/i.test(filePath) &&
+          /^[A-Za-z0-9+/=\s]+$/.test(initialContent));
+      const payload = isBase64
+        ? Buffer.from(String(initialContent).replace(/\s+/g, ''), 'base64')
+        : initialContent;
+      await fs.promises.writeFile(filePath, payload, { flag: 'wx' });
       return { success: true };
     } catch (err) {
       return { success: false, error: err.message };
@@ -1419,7 +1431,13 @@ async function main() {
           const title = (element.getAttribute('title') || '').split(' — ')[0];
           return title === ${JSON.stringify(DOC_NAME)} && element.className.includes('cursor-pointer');
         });
-        if (node) { node.click(); return true; }
+        // Двойной щелчок: одиночный открывает вкладку-предпросмотр, а её
+        // saveTab отказывается писать — проверки сохранения ложно падали.
+        if (node) {
+          node.click();
+          node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+          return true;
+        }
         return false;
       `);
       if (!opened) await sleep(300);
@@ -1886,11 +1904,12 @@ async function main() {
 
     /* ---------- 8c. Excel: чтение и запись ячеек через AI ---------- */
     const excelOpened = await js(`
-      const nodes = [...document.querySelectorAll('div')]
-        .filter((d) => d.textContent?.trim() === 'Книга.xlsx');
-      if (!nodes.length) return false;
-      const clickable = nodes.find((d) => d.className.includes('cursor-pointer')) || nodes[0];
-      clickable.click();
+      const node = [...document.querySelectorAll('[title]')].find(
+        (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'Книга.xlsx'
+      );
+      if (!node) return false;
+      node.click();
+      node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
       return true;
     `);
     await sleep(3000);
@@ -1944,7 +1963,9 @@ async function main() {
     step('excelZoom', {
       zoomed: /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(excelZoomState?.styleAttr || '') ||
         Number.parseFloat(excelZoomState?.computed || '1') > 1,
-      status: /Масштаб: \d+%/.test(excelZoomState?.status || ''),
+      // Раньше поле называлось status и освобождалось во всех наборах сразу:
+      // регрессия в подписи масштаба не могла стать красной.
+      statusShown: /Масштаб: \d+%/.test(excelZoomState?.status || ''),
     });
 
     const excelSheetSend = await send('Добавь лист Итоги');
@@ -2018,11 +2039,12 @@ async function main() {
 
     /* ---------- 8d. PowerPoint: текст слайда и новый слайд ---------- */
     const pptOpened = await js(`
-      const nodes = [...document.querySelectorAll('div')]
-        .filter((d) => d.textContent?.trim() === 'Презентация.pptx');
-      if (!nodes.length) return false;
-      const clickable = nodes.find((d) => d.className.includes('cursor-pointer')) || nodes[0];
-      clickable.click();
+      const node = [...document.querySelectorAll('[title]')].find(
+        (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'Презентация.pptx'
+      );
+      if (!node) return false;
+      node.click();
+      node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
       return true;
     `);
     await sleep(3000);
@@ -2188,20 +2210,25 @@ async function main() {
       return Boolean(firstSlide);
     `);
     await sleep(400);
-    const pptTextareaFocused = await js(`
-      const canvas = [...document.querySelectorAll('textarea')].find((item) =>
-        item.closest('[style*="aspect-ratio"]')
-      );
+    // Канва слайда не задаёт inline aspect-ratio (вёрстка флексом), а textarea
+    // существует только в режиме правки текста — прежний селектор был мёртвым.
+    // Проверяем реальную возможность: слайд выбран, канва с фигурами на месте.
+    const pptCanvasFocused = await js(`
+      // Ищем фигуры внутри канвы слайда. React сериализует style как
+      // «position: absolute» (с пробелом), поэтому атрибутный селектор
+      // [style*="position:absolute"] молчал; позицию читаем из CSSOM.
+      const canvas = document.querySelector('[data-slide-canvas]');
       if (!canvas) return false;
-      canvas.focus();
-      return true;
+      return [...canvas.querySelectorAll('*')].some(
+        (el) => el instanceof HTMLElement && el.style.position === 'absolute' && el.offsetWidth > 0 && el.offsetHeight > 0
+      );
     `);
     await sleep(400);
     const pptSelectionSend = await send('Что выделено на слайде?');
     await sleep(1600);
     const pptPageText = await js('return document.body.innerText');
     step('pptxSelection', {
-      focused: Boolean(pptSelectFocused && pptTextareaFocused),
+      focused: Boolean(pptSelectFocused && pptCanvasFocused),
       sent: pptSelectionSend.sent,
       idle: pptSelectionSend.idle,
       read: pptPageText.includes('Выделена фигура заголовка'),
@@ -2209,11 +2236,12 @@ async function main() {
 
     /* ---------- 8e. Markdown: точечная замена через md_replace ---------- */
     const mdOpened = await js(`
-      const nodes = [...document.querySelectorAll('div')]
-        .filter((d) => d.textContent?.trim() === 'Второй.md');
-      if (!nodes.length) return false;
-      const clickable = nodes.find((d) => d.className.includes('cursor-pointer')) || nodes[0];
-      clickable.click();
+      const node = [...document.querySelectorAll('[title]')].find(
+        (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'Второй.md'
+      );
+      if (!node) return false;
+      node.click();
+      node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
       return true;
     `);
     await sleep(2500);
@@ -2939,13 +2967,15 @@ async function main() {
     step('wordZoom', {
       zoomed: /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(wordZoomState?.styleAttr || '') ||
         Number.parseFloat(wordZoomState?.computed || '1') > 1,
-      status: /Масштаб: \d+%/.test(wordZoomState?.status || ''),
+      // Раньше поле называлось status и освобождалось во всех наборах сразу.
+      statusShown: /Масштаб: \d+%/.test(wordZoomState?.status || ''),
     });
 
     const renameMenuOpened = await js(`
-      const nodes = [...document.querySelectorAll('div')]
-        .filter((node) => (node.textContent || '').trim() === 'Третий.md');
-      const node = nodes.find((item) => item.className.includes('cursor-pointer')) || nodes[0];
+      // Строка дерева содержит ещё размер и дату — ищем по title.
+      const node = [...document.querySelectorAll('[title]')].find(
+        (item) => (item.getAttribute('title') || '').split(' — ')[0] === 'Третий.md'
+      );
       if (!node) return false;
       node.dispatchEvent(new MouseEvent('contextmenu', {
         bubbles: true,
@@ -2998,7 +3028,7 @@ async function main() {
   mock.server.close();
   imageServer.close();
   writeOut();
-  app.exit(0);
+  app.exit(out.errors.length > 0 ? 1 : 0);
 }
 
 app.whenReady().then(() => {

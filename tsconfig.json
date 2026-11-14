@@ -12,6 +12,11 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
+    // Ловит забытый break в switch: без флага такой провал виден только в проде.
+    "noFallthroughCasesInSwitch": true,
+    // Мёртвый код (неиспользуемые импорты/локали/параметры) валит typecheck.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noEmit": true,
     "jsx": "react-jsx",
     "types": ["node"],

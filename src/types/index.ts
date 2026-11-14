@@ -338,6 +338,8 @@ declare global {
   copyPath: (source: string, target: string) => Promise<{ success: boolean; error?: string }>;
   autosaveWrite?: (name: string, payload: unknown) => Promise<{ success: boolean; error?: string }>;
   autosaveList?: () => Promise<{ success: boolean; items?: unknown[]; error?: string }>;
+  /** Только метаданные снимков: содержимое не гоняется через IPC. */
+  autosaveListMeta?: () => Promise<{ success: boolean; items?: unknown[]; error?: string }>;
   autosaveRead?: (name: string) => Promise<{ success: boolean; snapshot?: unknown; error?: string }>;
   autosaveRemove?: (name: string) => Promise<{ success: boolean; error?: string }>;
   diagnosticsLog?: (level: string, message: string) => Promise<{ success: boolean }>;
@@ -407,10 +409,14 @@ declare global {
       /** Постоянные настройки AI из профиля пользователя. */
       loadAiSettings?: () => Promise<{
         settings: Partial<AISettings>;
+        /** Ключ только активного провайдера: остальные — через aiSettingsKey. */
         keys: Record<string, string>;
         /** Провайдеры, чьи ключи не расшифровались на этом компьютере. */
         keyErrors?: string[];
+        /** Шифрование ОС недоступно: ключ лежит в файле без защиты. */
+        encryptionUnavailable?: boolean;
       }>;
+      aiSettingsKey?: (provider: string) => Promise<{ key: string; unreadable: boolean }>;
       saveAiSettings?: (patch: Partial<AISettings> & { apiKey?: string }) => Promise<{ success: boolean }>;
 
       /* ---------- Обновления с GitHub ---------- */
@@ -418,8 +424,9 @@ declare global {
       checkForUpdates?: () => Promise<UpdateCheckResult>;
       downloadUpdate?: (info: {
         version: string;
-        assetUrl: string;
-        assetName: string;
+        /** Не используются: адрес, имя и хеш архива берёт главный процесс. */
+        assetUrl?: string;
+        assetName?: string;
         size?: number;
         digest?: string;
       }) => Promise<UpdateDownloadResult>;
@@ -433,7 +440,7 @@ declare global {
       /** Метаданные файла secrets.local.ps1 — без самого ключа. */
       describeSecrets: () => Promise<{
         found: boolean;
-        filePath: string;
+        fileName: string;
         baseUrl?: string;
         textModel?: string;
         imageModel?: string;

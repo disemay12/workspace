@@ -270,7 +270,8 @@ function matrixFromSheet(sheet: XLSX.WorkSheet): string[][] {
 
 function matrixToMarkdown(matrix: string[][]): string {
   if (matrix.length === 0) return '';
-  const width = Math.max(...matrix.map((row) => row.length));
+  // Спред Math.max(...) на таблице в сотни тысяч строк даёт RangeError.
+  const width = matrix.reduce((max, row) => Math.max(max, row.length), 0);
   const grid = matrix.map((row) => [
     ...row.map((cell) => String(cell ?? '').replace(/\|/g, '\\|').replace(/\n/g, '<br>')),
     ...Array(Math.max(0, width - row.length)).fill(''),
@@ -296,21 +297,6 @@ function htmlFromWorkbook(source: ConversionSource): string {
     const html = XLSX.utils.sheet_to_html(workbook.Sheets[name]);
     return workbook.SheetNames.length > 1 ? `<h2>${escapeHtml(name)}</h2>${html}` : html;
   }).join('');
-}
-
-function htmlFromMatrix(matrix: string[][], title?: string): string {
-  if (matrix.length === 0) return '<p></p>';
-  const rows = matrix
-    .map(
-      (row, index) =>
-        `<tr>${row
-          .map((cell) =>
-            index === 0 ? `<th>${escapeHtml(String(cell ?? ''))}</th>` : `<td>${escapeHtml(String(cell ?? ''))}</td>`
-          )
-          .join('')}</tr>`
-    )
-    .join('');
-  return `${title ? `<h2>${escapeHtml(title)}</h2>` : ''}<table>${rows}</table>`;
 }
 
 export function htmlDocumentShell(title: string, bodyHtml: string): string {

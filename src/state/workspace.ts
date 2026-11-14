@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { FileItem, OpenTab, FileType } from '../types';
 import { fileSystemService, getFileType } from '../services/fileSystemService';
-import { extName, baseName, joinPath, uid } from '../lib/utils';
+import { extName, baseName, dirName, joinPath, uid } from '../lib/utils';
 import { generateDocxBase64, generateExcelBase64 } from '../services/aiActions';
 import { htmlToDocxBase64 } from '../lib/docx';
 import { BLANK_PPTX_BASE64 } from '../lib/pptxTemplate';
 import { docxPathFor, extractLegacyDocText, plainTextToHtml } from '../lib/legacyDoc';
+import { dropSnapshotsForPath } from '../services/autosave';
 import {
   type ConversionFormat,
   convertDocument,
@@ -16,6 +17,21 @@ import {
 const BINARY_TYPES: FileType[] = ['word', 'powerpoint', 'image'];
 /** Excel читается как base64 (xlsx/xls), CSV/TSV — как текст. */
 const isBinaryExcel = (ext: string) => ext === 'xlsx' || ext === 'xls';
+
+/** Путь в одном виде: регистр и разделители в Windows различаются между IPC и UI. */
+function normalizePath(value: string): string {
+  return (value || '').replace(/\//g, '\\').toLowerCase().replace(/\\+$/, '');
+}
+
+function samePath(a: string, b: string): boolean {
+  return normalizePath(a) === normalizePath(b);
+}
+
+/**
+ * Очередь сохранений на вкладку. Два перекрывающихся сохранения завершались в
+ * произвольном порядке, и старое содержимое могло лечь на диск поверх нового.
+ */
+const saveQueues = new Map<string, Promise<unknown>>();
 
 export interface TreeState {
   [dirPath: string]: FileItem[];
@@ -36,17 +52,42 @@ export function useWorkspace() {
 
   // Ref для доступа к актуальным вкладкам внутри асинхронных колбэков
   const tabsRef = useRef<OpenTab[]>([]);
-  tabsRef.current = tabs;
+  // Идентификаторы панелей для тех же колбэков: состояние к моменту вызова отстаёт.
+  const activeTabIdRef = useRef('');
+  const secondaryTabIdRef = useRef('');
+  // Синхронизация после коммита: ref не должен указывать на отброшенный рендер.
+  useLayoutEffect(() => {
+    tabsRef.current = tabs;
+    activeTabIdRef.current = activeTabId;
+    secondaryTabIdRef.current = secondaryTabId;
+  }, [tabs, activeTabId, secondaryTabId]);
   /** Открытия файлов в процессе: защита от двойного клика и гонок. */
   const pendingOpenRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const previewOpenSeqRef = useRef(0);
 
+  const flashTimerRef = useRef<number | null>(null);
+
   const flash = useCallback((message: string) => {
     setStatusMessage(message);
-    window.setTimeout(() => {
+    // Один таймер: иначе на каждое сообщение остаётся висящий setTimeout.
+    if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      flashTimerRef.current = null;
       setStatusMessage((prev) => (prev === message ? '' : prev));
     }, 3200);
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+    };
+  }, []);
+
+  // Вторичная панель не может показывать ту же вкладку, что основная:
+  // редактор получил бы два независимых состояния одного файла.
+  useEffect(() => {
+    if (secondaryTabId && secondaryTabId === activeTabId) setSecondaryTabId('');
+  }, [activeTabId, secondaryTabId]);
 
   /* ---------------- Файловое дерево ---------------- */
 
@@ -88,7 +129,7 @@ export function useWorkspace() {
   const toggleFavorite = useCallback(async (dirPath: string) => {
     const next = await fileSystemService.toggleFavorite(dirPath);
     setFavorites(next);
-    const added = next.some((item) => item.path === dirPath);
+    const added = next.some((item) => samePath(item.path, dirPath));
     flash(added ? 'Добавлено в избранное' : 'Убрано из избранного');
   }, [flash]);
 
@@ -146,10 +187,9 @@ export function useWorkspace() {
   const revealPath = useCallback(
     async (filePath: string): Promise<boolean> => {
       if (!rootPath) return false;
-      const normalize = (value: string) => value.toLowerCase().replace(/\//g, '\\');
-      const root = normalize(rootPath).replace(/\\+$/, '');
-      const target = normalize(filePath);
-      if (target !== root && !target.startsWith(root + '\\')) return false;
+      const root = normalizePath(rootPath);
+      const target = normalizePath(filePath);
+      if (target !== root && !target.startsWith(`${root}\\`)) return false;
 
       const base = rootPath.replace(/[\\/]+$/, '');
       const relative = filePath.slice(base.length).replace(/^[\\/]+/, '');
@@ -203,44 +243,78 @@ export function useWorkspace() {
   );
 
   /* ---------------- Отслеживание изменений на диске ---------------- */
+
+  // Подписка на события ФС одна на всё время жизни хука: expandedDirs меняет
+  // идентичность на каждый expand/collapse, а переподписка теряет события,
+  // пришедшие между рендерами.
+  const watcherRef = useRef({ rootPath, expandedDirs, loadDirectory, readTabContent, flash });
+  watcherRef.current = { rootPath, expandedDirs, loadDirectory, readTabContent, flash };
+
   useEffect(() => {
     if (!window.electronAPI?.onWorkspaceChanged) return;
+    let timer: number | null = null;
+    const pendingDirs = new Set<string>();
+
+    const flushTree = async () => {
+      timer = null;
+      const dirs = Array.from(pendingDirs);
+      pendingDirs.clear();
+      for (const dir of dirs) await watcherRef.current.loadDirectory(dir);
+    };
+
     const unsub = window.electronAPI.onWorkspaceChanged(async ({ fullPath }) => {
-      // 1. Обновляем файловое дерево для открытых каталогов
-      if (rootPath) {
-        const expanded = Array.from(expandedDirs);
-        for (const dir of expanded) {
-          await loadDirectory(dir);
+      const current = watcherRef.current;
+
+      // 1. Перечитываем только затронутые каталоги и с дебаунсом: событий ФС
+      // много (каждое сохранение), полное дерево на каждое — лишний трафик.
+      if (current.rootPath) {
+        if (fullPath) {
+          const parent = dirName(fullPath);
+          if (current.expandedDirs.has(fullPath)) pendingDirs.add(fullPath);
+          if (parent !== fullPath && current.expandedDirs.has(parent)) pendingDirs.add(parent);
+          if (parent === current.rootPath) pendingDirs.add(current.rootPath);
+        } else {
+          pendingDirs.add(current.rootPath);
+        }
+        if (pendingDirs.size > 0) {
+          if (timer) window.clearTimeout(timer);
+          timer = window.setTimeout(() => void flushTree(), 250);
         }
       }
 
       // 2. Проверяем, не открыт ли изменённый файл в одной из вкладок
-      if (fullPath) {
-        const normalizedChanged = fullPath.toLowerCase().replace(/\\/g, '/');
-        const openTab = tabsRef.current.find(
-          (t) => t.path.toLowerCase().replace(/\\/g, '/') === normalizedChanged
-        );
-        if (openTab) {
-          if (!openTab.isDirty) {
-            // Файл не редактировался пользователем — автообновляем
-            try {
-              const { content } = await readTabContent(openTab.path, openTab.type, openTab.extension);
-              setTabs((prev) =>
-                prev.map((t) =>
-                  t.id === openTab.id ? { ...t, content, initialContent: content, isDirty: false } : t
-                )
-              );
-            } catch {
-              // Игнорируем ошибку чтения (например, если файл удалён)
-            }
-          } else {
-            flash(`Внимание: открытый файл "${openTab.name}" изменён на диске`);
-          }
+      if (!fullPath) return;
+      const openTab = tabsRef.current.find((t) => samePath(t.path, fullPath));
+      if (!openTab) return;
+      if (!openTab.isDirty) {
+        // Файл не редактировался пользователем — автообновляем
+        try {
+          const { content } = await current.readTabContent(
+            openTab.path,
+            openTab.type,
+            openTab.extension
+          );
+          setTabs((prev) =>
+            prev.map((t) => {
+              if (t.id !== openTab.id) return t;
+              // Пока читали файл, вкладку могли начать править: прочитанное устарело.
+              if (t.isDirty || t.content !== openTab.content) return t;
+              return { ...t, content, initialContent: content, isDirty: false };
+            })
+          );
+        } catch {
+          // Файл могли удалить или переименовать — вкладку не трогаем.
         }
+      } else {
+        current.flash(`Внимание: открытый файл "${openTab.name}" изменён на диске`);
       }
     });
-    return unsub;
-  }, [rootPath, expandedDirs, loadDirectory, readTabContent, flash]);
+
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      unsub();
+    };
+  }, []);
 
   const openFile = useCallback(
     async (
@@ -249,9 +323,17 @@ export function useWorkspace() {
       forceNewTab = false,
       preview = false
     ) => {
-      const samePath = (a: string, b: string) =>
-        a.toLowerCase().replace(/\\/g, '/') === b.toLowerCase().replace(/\\/g, '/');
       const existing = tabsRef.current.find((t) => samePath(t.path, filePath));
+      // Панели не показывают одну вкладку: уже открытая в основной остаётся в ней.
+      const openInPane = (id: string) => {
+        if (targetPane === 'secondary') {
+          if (id !== activeTabIdRef.current) setSecondaryTabId(id);
+          setSplitEnabled(true);
+          return;
+        }
+        if (id === secondaryTabIdRef.current) setSecondaryTabId('');
+        setActiveTabId(id);
+      };
       if (existing && !forceNewTab) {
         if (!preview && existing.isPreview) {
           // Двойной клик по файлу из предпросмотра превращает ту же вкладку
@@ -272,16 +354,11 @@ export function useWorkspace() {
             setSecondaryTabId((cur) => (staleIds.has(cur) ? '' : cur));
           }
         }
-        if (targetPane === 'secondary') {
-          setSecondaryTabId(existing.id);
-          setSplitEnabled(true);
-        } else {
-          setActiveTabId(existing.id);
-        }
+        openInPane(existing.id);
         return existing.id;
       }
 
-      const key = filePath.toLowerCase().replace(/\\/g, '/');
+      const key = normalizePath(filePath);
       const pending = pendingOpenRef.current.get(key);
       if (pending) {
         const id = await pending;
@@ -291,12 +368,7 @@ export function useWorkspace() {
               prev.map((t) => (t.id === id ? { ...t, isPreview: false } : t))
             );
           }
-          if (targetPane === 'secondary') {
-            setSecondaryTabId(id);
-            setSplitEnabled(true);
-          } else {
-            setActiveTabId(id);
-          }
+          openInPane(id);
         }
         return id;
       }
@@ -336,12 +408,7 @@ export function useWorkspace() {
             isPreview: preview,
           };
           setTabs((prev) => [...prev, tab]);
-          if (targetPane === 'secondary') {
-            setSecondaryTabId(tab.id);
-            setSplitEnabled(true);
-          } else {
-            setActiveTabId(tab.id);
-          }
+          openInPane(tab.id);
           return tab.id;
         }
 
@@ -364,12 +431,7 @@ export function useWorkspace() {
           };
 
           setTabs((prev) => [...prev, tab]);
-          if (targetPane === 'secondary') {
-            setSecondaryTabId(tab.id);
-            setSplitEnabled(true);
-          } else {
-            setActiveTabId(tab.id);
-          }
+          openInPane(tab.id);
           return tab.id;
         } catch (err) {
           flash(`Ошибка открытия файла: ${(err as Error).message}`);
@@ -390,23 +452,29 @@ export function useWorkspace() {
   );
 
   const closeTab = useCallback((tabId: string) => {
-    setTabs((prev) => {
-      const idx = prev.findIndex((t) => t.id === tabId);
-      if (idx === -1) return prev;
-      const next = prev.filter((t) => t.id !== tabId);
+    const prev = tabsRef.current;
+    const idx = prev.findIndex((t) => t.id === tabId);
+    if (idx === -1) return;
+    const closing = prev[idx];
+    const next = prev.filter((t) => t.id !== tabId);
+    const nextActiveId =
+      activeTabIdRef.current === tabId
+        ? next[Math.min(idx, next.length - 1)]?.id ?? ''
+        : activeTabIdRef.current;
 
-      setActiveTabId((currentActive) => {
-        if (currentActive !== tabId) return currentActive;
-        const fallback = next[Math.min(idx, next.length - 1)];
-        return fallback ? fallback.id : '';
-      });
-      setSecondaryTabId((currentSecondary) => {
-        if (currentSecondary !== tabId) return currentSecondary;
-        const fallback = next.find((t) => t.id !== tabId);
-        return fallback ? fallback.id : '';
-      });
-      return next;
+    // Выбор следующей активной вкладки — снаружи апдейтера: апдейтер должен
+    // оставаться чистым, иначе в StrictMode побочный вызов выполнится дважды.
+    setTabs(next);
+    setActiveTabId(nextActiveId);
+    setSecondaryTabId((currentSecondary) => {
+      if (currentSecondary === tabId) {
+        const fallback = next[0]?.id ?? '';
+        return fallback === nextActiveId ? '' : fallback;
+      }
+      return currentSecondary === nextActiveId ? '' : currentSecondary;
     });
+    // Черновик закрытой вкладки иначе «восстановится» при следующем запуске.
+    if (closing.isDirty) void dropSnapshotsForPath(closing.path);
   }, []);
 
   /** Редактирование содержимого вкладки с пересчётом флага несохранённых изменений. */
@@ -422,6 +490,8 @@ export function useWorkspace() {
           ...t,
           content,
           encoding: switchToBase64 ? ('base64' as const) : t.encoding,
+          // Первая правка снимает предпросмотр: иначе saveTab отказывает, а клик по дереву теряет черновик.
+          isPreview: content === t.initialContent ? t.isPreview : false,
           isDirty: content !== t.initialContent,
         };
       })
@@ -432,54 +502,101 @@ export function useWorkspace() {
     setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, ...patch } : t)));
   }, []);
 
-  const saveTab = useCallback(
-    async (tabId: string): Promise<boolean> => {
-      const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (!tab) return false;
-      if (tab.isPreview) {
-        flash('Это предпросмотр. Откройте файл двойным кликом или кнопкой «Редактировать»');
-        return false;
-      }
-      if (tab.encoding === 'path') {
-        flash('Этот файл открыт только для просмотра');
-        return false;
-      }
-      try {
-        // .doc перезаписать нельзя: внутри OLE2, а мы держим OOXML.
-        // Сохраняем рядом .docx и переключаем вкладку на него.
-        if (tab.extension === 'doc') {
-          const target = docxPathFor(tab.path);
-          await fileSystemService.writeFile(target, tab.content, 'base64');
+  /**
+   * Запись вкладки на диск.
+   * contentOverride — живое содержимое редактора: tab.content обновляется через
+   * setTabs и к моменту вызова отстаёт на один рендер (иначе на диск уходит
+   * предыдущая версия, а UI рапортует успех).
+   */
+  const runSave = useCallback(
+    async (tabId: string, contentOverride?: string): Promise<boolean> => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        // Вкладку перечитываем внутри задачи: между вызовом и записью её могли
+        // переименовать, и путь из замыкания уже указывает в никуда.
+        const tab = tabsRef.current.find((t) => t.id === tabId);
+        if (!tab) return false;
+        if (tab.isPreview) {
+          flash('Это предпросмотр. Откройте файл двойным кликом или кнопкой «Редактировать»');
+          return false;
+        }
+        if (tab.encoding === 'path') {
+          flash('Этот файл открыт только для просмотра');
+          return false;
+        }
+        const written = contentOverride ?? tab.content;
+        try {
+          // .doc перезаписать нельзя: внутри OLE2, а мы держим OOXML.
+          // Сохраняем рядом .docx и переключаем вкладку на него.
+          if (tab.extension === 'doc') {
+            const target = docxPathFor(tab.path);
+            await fileSystemService.writeFile(target, written, 'base64');
+            setTabs((prev) =>
+              prev.map((t) =>
+                t.id === tabId
+                  ? {
+                      ...t,
+                      path: target,
+                      name: baseName(target),
+                      extension: 'docx',
+                      isDirty: t.content !== written,
+                      initialContent: written,
+                    }
+                  : t
+              )
+            );
+            // Снимок старого пути после записи не нужен: иначе следующий запуск
+            // «восстановит» черновик поверх свежего файла.
+            await dropSnapshotsForPath(tab.path);
+            await refreshTree();
+            flash(`Сохранено как ${baseName(target)} — исходный .doc не изменён`);
+            return true;
+          }
+          await fileSystemService.writeFile(tab.path, written, tab.encoding);
+          const renamed = tabsRef.current.find((t) => t.id === tabId);
+          // Путь сменился во время записи: пишем заново по актуальному.
+          if (renamed && !samePath(renamed.path, tab.path)) continue;
           setTabs((prev) =>
             prev.map((t) =>
               t.id === tabId
                 ? {
                     ...t,
-                    path: target,
-                    name: baseName(target),
-                    extension: 'docx',
-                    isDirty: false,
-                    initialContent: t.content,
+                    // Правки, набранные во время записи, остаются несохранёнными.
+                    isDirty: t.content !== written,
+                    initialContent: written,
                   }
                 : t
             )
           );
-          await refreshTree();
-          flash(`Сохранено как ${baseName(target)} — исходный .doc не изменён`);
+          await dropSnapshotsForPath(tab.path);
+          flash(`Сохранено: ${tab.name}`);
           return true;
+        } catch (err) {
+          flash(`Ошибка сохранения: ${(err as Error).message}`);
+          return false;
         }
-        await fileSystemService.writeFile(tab.path, tab.content, tab.encoding);
-        setTabs((prev) =>
-          prev.map((t) => (t.id === tabId ? { ...t, isDirty: false, initialContent: t.content } : t))
-        );
-        flash(`Сохранено: ${tab.name}`);
-        return true;
-      } catch (err) {
-        flash(`Ошибка сохранения: ${(err as Error).message}`);
-        return false;
       }
+      flash('Сохранение отменено: файл переименован во время записи');
+      return false;
     },
     [flash, refreshTree]
+  );
+
+  const saveTab = useCallback(
+    async (tabId: string, contentOverride?: string): Promise<boolean> => {
+      const previous = saveQueues.get(tabId) ?? Promise.resolve();
+      const task = previous.then(
+        () => runSave(tabId, contentOverride),
+        () => runSave(tabId, contentOverride)
+      );
+      saveQueues.set(tabId, task);
+      try {
+        return await task;
+      } finally {
+        // Очередь не держим: иначе карта растёт на каждую закрытую вкладку.
+        if (saveQueues.get(tabId) === task) saveQueues.delete(tabId);
+      }
+    },
+    [runSave]
   );
 
   /**
@@ -533,9 +650,7 @@ export function useWorkspace() {
         await refreshTree();
         const targetExt = extName(targetPath);
         const targetName = baseName(targetPath);
-        const existing = tabsRef.current.find(
-          (t) => t.path.toLowerCase() === targetPath.toLowerCase()
-        );
+        const existing = tabsRef.current.find((t) => samePath(t.path, targetPath));
         const nextContent =
           result.kind === 'data' ? result.content : existing?.content ?? '';
         if (existing) {
@@ -717,14 +832,15 @@ export function useWorkspace() {
 
   const renamePath = useCallback(
     async (oldPath: string, newName: string): Promise<boolean> => {
-      const parent = oldPath.slice(0, Math.max(oldPath.lastIndexOf('\\'), oldPath.lastIndexOf('/')));
+      // dirName не режет последний символ у пути без разделителя (slice(0, -1)).
+      const parent = dirName(oldPath);
       const newPath = joinPath(parent, newName);
       try {
         await fileSystemService.renamePath(oldPath, newPath);
         // Обновляем открытые вкладки, указывающие на переименованный путь
         setTabs((prev) =>
           prev.map((t) =>
-            t.path === oldPath
+            samePath(t.path, oldPath)
               ? { ...t, path: newPath, name: newName, extension: extName(newName) }
               : t
           )
@@ -744,18 +860,24 @@ export function useWorkspace() {
     async (targetPath: string): Promise<boolean> => {
       try {
         await fileSystemService.deletePath(targetPath);
-        // Закрываем вкладки удалённого файла или файлов внутри удалённой папки
-        setTabs((prev) => {
-          const remaining = prev.filter(
-            (t) => t.path !== targetPath && !t.path.startsWith(`${targetPath}\\`) && !t.path.startsWith(`${targetPath}/`)
-          );
-          if (remaining.length !== prev.length) {
-            setActiveTabId((cur) =>
-              remaining.some((t) => t.id === cur) ? cur : remaining[0]?.id || ''
-            );
-          }
-          return remaining;
+        // Закрываем вкладки удалённого файла или файлов внутри удалённой папки.
+        // Выбор активной — снаружи апдейтера: он должен оставаться чистым.
+        const prev = tabsRef.current;
+        const target = normalizePath(targetPath);
+        const remaining = prev.filter((t) => {
+          const tabPath = normalizePath(t.path);
+          return tabPath !== target && !tabPath.startsWith(`${target}\\`);
         });
+        if (remaining.length !== prev.length) {
+          const removed = prev.filter((t) => !remaining.includes(t));
+          setTabs(remaining);
+          setActiveTabId((cur) =>
+            remaining.some((t) => t.id === cur) ? cur : remaining[0]?.id || ''
+          );
+          setSecondaryTabId((cur) => (remaining.some((t) => t.id === cur) ? cur : ''));
+          // Черновик удалённого файла не должен всплыть при следующем запуске.
+          for (const tab of removed) if (tab.isDirty) void dropSnapshotsForPath(tab.path);
+        }
         await refreshTree();
         flash(`Удалено: ${baseName(targetPath)}`);
         return true;

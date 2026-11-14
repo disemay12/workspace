@@ -14,6 +14,7 @@ const os = require('os');
 const http = require('http');
 const XLSX = require('xlsx');
 const { registerCommonCheckIpc } = require('./common-ipc');
+const { createCheckSandbox } = require('./sandbox');
 
 
 /** Корень проекта — поиск каталога с package.json и dist/ (устойчиво к глубине). */
@@ -30,10 +31,33 @@ function resolveProjectRoot() {
   return path.join(__dirname, '..');
 }
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(os.tmpdir(), 'ws-ai-test-' + Date.now());
+const SANDBOX = process.env.WS_CHECK_SANDBOX || createCheckSandbox('ai', ROOT);
 
 const out: any = { steps: [], errors: [], requests: [] };
-const step = (name, value) => out.steps.push({ name, ...value });
+const step = (name, value) => {
+  out.steps.push({ name, ...value });
+  try {
+    fs.writeFileSync(path.join(ROOT, 'ai-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // запись диагностики не должна ломать прогон
+  }
+};
+
+/**
+ * Необработанный reject раньше оставлял процесс висеть без результата:
+ * набор «зависал» без единой подсказки. Пишем причину в JSON и выходим.
+ */
+function failFast(error: unknown): void {
+  out.fatal = (error as Error)?.stack || String(error);
+  try {
+    fs.writeFileSync(path.join(ROOT, 'ai-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // даже диагностика может не записаться
+  }
+  app.exit(1);
+}
+process.on('unhandledRejection', failFast);
+process.on('uncaughtException', failFast);
 
 app.disableHardwareAcceleration();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -365,7 +389,8 @@ app.whenReady().then(async () => {
         userMessageShown: t.includes('Проверка потокового ответа'),
         assistantResponded: t.includes('Привет') && t.includes('тестовый'),
         hasCodeBlock: !!document.querySelector('.ws-prose pre code'),
-        codeContent: document.querySelector('.ws-prose pre code')?.textContent?.trim() ?? null,
+        // Диагностика: имя с суффиксом Snippet показывает, что значение не судится.
+        codeSnippet: document.querySelector('.ws-prose pre code')?.textContent?.trim() ?? '',
         hasCopyAction: /Копировать/.test(t),
         // Кнопка «Заменить документ» появляется только при открытом документе,
         // поэтому здесь проверяем лишь доступность действий копирования.
@@ -375,8 +400,11 @@ app.whenReady().then(async () => {
     `));
 
     step('mockApiRequest', {
+      // Утверждение — сам факт запроса: значение first ?? null было скрытым
+      // ассертом, который раннер принимал за успех при null.
+      requestSent: out.requests.length > 0,
       requestCount: out.requests.length,
-      first: out.requests[0] ?? null,
+      firstRequest: out.requests[0] ?? null,
     });
 
     /* ============ 2b. Чат управляет приложением (workspace-action) ============ */
@@ -506,8 +534,9 @@ app.whenReady().then(async () => {
       );
       if (refreshBtn) refreshBtn.click();
       await new Promise((r) => setTimeout(r, 1200));
-      const node = [...document.querySelectorAll('div')].find(
-        (d) => d.textContent?.trim() === 'report.md' && d.className.includes('cursor-pointer')
+      // Строка дерева содержит размер и дату — ищем по title.
+      const node = [...document.querySelectorAll('[title]')].find(
+        (d) => (d.getAttribute('title') || '').split(' — ')[0] === 'report.md'
       );
       const ta = document.querySelector('textarea[placeholder*="Спросите"]');
       if (!node || !ta) return false;
@@ -623,7 +652,7 @@ app.whenReady().then(async () => {
       return {
         errorShown: /401|Invalid API key|Ошибка API/i.test(t),
         suggestsKeyCheck: /ключ/i.test(t),
-        snippet: t.match(/.{0,120}(401|Invalid API key|Ошибка API).{0,120}/i)?.[0] ?? null,
+        errorSnippet: t.match(/.{0,120}(401|Invalid API key|Ошибка API).{0,120}/i)?.[0] ?? '',
       };
     `));
 
@@ -678,7 +707,12 @@ app.whenReady().then(async () => {
           return title.split(' — ')[0] === 'test.md'
             && d.className.includes('cursor-pointer');
         });
-      if (node) node.click();
+      // Двойной щелчок: одиночный даёт вкладку-предпросмотр, а её saveTab
+      // отказывается писать — проверки saveRoundTrip ложно падали.
+      if (node) {
+        node.click();
+        node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      }
       return !!node;
     `);
     await sleep(2000);
@@ -779,7 +813,7 @@ app.whenReady().then(async () => {
         applyClicked: ${applied},
         contentChanged: ta ? ta.value.includes('Привет') || ta.value.includes('тестовый') : false,
         dirtyIndicator: t.includes('Не сохранено') || t.includes('Изменено'),
-        textareaValue: ta ? ta.value.slice(0, 120) : null,
+        textareaValue: ta ? ta.value.slice(0, 120) : '',
       };
     `));
 
@@ -801,7 +835,7 @@ app.whenReady().then(async () => {
       const t = document.body.innerText;
       return {
         fileChangedOnDisk: ${JSON.stringify(beforeSave)} !== ${JSON.stringify(afterSave)},
-        contentOnDisk: ${JSON.stringify(afterSave.slice(0, 120))},
+        contentOnDiskSnippet: ${JSON.stringify(afterSave.slice(0, 120))},
         dirtyCleared: !/Не сохранено/.test(t),
         savedToast: /Сохранено/.test(t),
       };
@@ -827,8 +861,10 @@ app.whenReady().then(async () => {
     step('settingsProviderSwitch', await js(`
       const inputs = [...document.querySelectorAll('input')];
       const urlInput = inputs.find(i => i.value && i.value.includes('http'));
+      // Утверждение — baseUrlChanged (boolean); сам URL остаётся диагностикой.
       return {
-        baseUrlUpdated: urlInput ? urlInput.value : null,
+        baseUrlChanged: Boolean(urlInput),
+        baseUrlValue: urlInput ? urlInput.value : '',
         anthropicUrlApplied: urlInput ? urlInput.value.includes('anthropic') : false,
       };
     `));
@@ -841,5 +877,5 @@ app.whenReady().then(async () => {
   try {
     fs.rmSync(SANDBOX, { recursive: true, force: true });
   } catch {}
-  app.exit(0);
+  app.exit(out.fatal || out.errors.length > 0 ? 1 : 0);
 });

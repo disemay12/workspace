@@ -89,6 +89,57 @@ if (new URLSearchParams(window.location.search).has('modelTest')) {
   });
 }
 
+interface AppErrorBoundaryState {
+  error: Error | null;
+}
+
+/**
+ * Ошибка рендера внутри App (парсеры xlsx/pdf/pptx, Monaco) размонтирует всё
+ * дерево и оставляет белый экран. Граница ловит её и показывает причину с
+ * возможностью перезагрузиться.
+ */
+class AppErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  AppErrorBoundaryState
+> {
+  state: AppErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+    // Единственный след падения: в консоли он переживает перезагрузку.
+    console.error('Необработанная ошибка интерфейса WorkSpace', error, info.componentStack);
+  }
+
+  render(): React.ReactNode {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+
+    return (
+      <div className="flex h-screen w-screen flex-col items-center justify-center gap-4 bg-ws-panel p-8 text-center text-ws">
+        <div className="w-full max-w-xl space-y-3">
+          <h1 className="text-base font-semibold">Приложение остановилось из-за ошибки</h1>
+          <p className="text-xs leading-relaxed text-ws-muted">
+            Подробности уже записаны в консоль. Несохранённые изменения вкладок при
+            перезагрузке потеряются.
+          </p>
+          <pre className="max-h-48 overflow-auto rounded border border-ws bg-ws-surface p-2 text-left font-mono text-[11px] whitespace-pre-wrap text-ws-danger">
+            {error.message || String(error)}
+          </pre>
+          <button
+            onClick={() => window.location.reload()}
+            className="rounded bg-ws-accent px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+          >
+            Перезагрузить приложение
+          </button>
+        </div>
+      </div>
+    );
+  }
+}
+
 const container = document.getElementById('root');
 if (!container) {
   throw new Error('Корневой элемент #root не найден в index.html');
@@ -96,6 +147,8 @@ if (!container) {
 
 createRoot(container).render(
   <React.StrictMode>
-    <App />
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
   </React.StrictMode>
 );

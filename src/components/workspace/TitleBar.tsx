@@ -12,7 +12,6 @@ import {
   Sun,
   Columns2,
   PanelLeft,
-  PanelRight,
   Settings,
   Sparkles,
   FileSearch,

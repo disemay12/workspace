@@ -13,7 +13,7 @@
  * Ключ API передаётся из рендерера при каждом запросе и нигде не сохраняется
  * в главном процессе.
  */
-import { ipcMain, net, BrowserWindow } from 'electron';
+import { ipcMain, net } from 'electron';
 
 interface StreamRequest {
   /** Уникальный идентификатор запроса для сопоставления событий. */
@@ -27,24 +27,47 @@ interface StreamRequest {
 /** Активные запросы — позволяют прервать генерацию по кнопке «Стоп». */
 const activeRequests = new Map<string, Electron.ClientRequest>();
 
-function sendToRenderer(channel: string, payload: unknown) {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) {
-      win.webContents.send(channel, payload);
-    }
+/**
+ * Адрес провайдера: только http(s), иначе net.request пойдёт по file:/ftp:.
+ */
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(String(value ?? ''));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
   }
 }
+
+/** Простой дольше этого означает, что провайдер замолчал: генерация прерывается. */
+const IDLE_TIMEOUT_MS = 120_000;
 
 export function registerAiProxy() {
   /**
    * Запуск стримингового запроса к провайдеру.
    * Ответ приходит в рендерер событиями `ai:chunk` / `ai:end` / `ai:error`.
+   *
+   * События идут только в окно, которое начало запрос: широковещательная
+   * рассылка отправляла чанки ответа и ошибки в offscreen-окна экспорта и в
+   * окна хостингов картинок, загрузившие сторонние страницы.
    */
-  ipcMain.handle('ai:stream', async (_event, req: StreamRequest) => {
+  ipcMain.handle('ai:stream', async (event, req: StreamRequest) => {
+    const reply = (channel: string, payload: unknown) => {
+      if (event.sender.isDestroyed()) return;
+      event.sender.send(channel, payload);
+    };
+    if (!req || typeof req !== 'object') {
+      return { started: false, error: 'Некорректный запрос' };
+    }
+
     const { requestId, url, method, headers, body } = req;
 
     if (!url) {
-      sendToRenderer('ai:error', { requestId, message: 'Не указан URL запроса' });
+      reply('ai:error', { requestId, message: 'Не указан URL запроса' });
+      return { started: false };
+    }
+    if (!isHttpUrl(url)) {
+      reply('ai:error', { requestId, message: 'Неподдерживаемый протокол запроса' });
       return { started: false };
     }
 
@@ -61,6 +84,34 @@ export function registerAiProxy() {
 
       activeRequests.set(requestId, request);
 
+      let idleTimer: NodeJS.Timeout | undefined;
+      let finished = false;
+      const stopIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = undefined;
+      };
+      const finish = () => {
+        finished = true;
+        stopIdle();
+        activeRequests.delete(requestId);
+      };
+      const touchIdle = () => {
+        stopIdle();
+        idleTimer = setTimeout(() => {
+          if (finished) return;
+          // Провайдер замолчал: без этого запись в activeRequests оставалась
+          // навсегда, `ai:end` не приходил и окно висело в «генерации».
+          try {
+            request.abort();
+          } catch {
+            // запрос уже завершён
+          }
+          finish();
+          reply('ai:error', { requestId, message: 'Превышен таймаут ожидания ответа API' });
+        }, IDLE_TIMEOUT_MS);
+      };
+      touchIdle();
+
       request.on('response', (response) => {
         const status = response.statusCode || 0;
         const responseHeaders: Record<string, string> = {};
@@ -68,17 +119,18 @@ export function registerAiProxy() {
           responseHeaders[k] = Array.isArray(v) ? v.join(', ') : String(v);
         }
 
-        sendToRenderer('ai:response', { requestId, status, headers: responseHeaders });
+        reply('ai:response', { requestId, status, headers: responseHeaders });
 
         // Не-200 ответы читаем целиком, чтобы показать текст ошибки
         if (status < 200 || status >= 300) {
           let errBody = '';
           response.on('data', (chunk: Buffer) => {
+            touchIdle();
             errBody += chunk.toString('utf-8');
           });
           response.on('end', () => {
-            activeRequests.delete(requestId);
-            sendToRenderer('ai:error', {
+            finish();
+            reply('ai:error', {
               requestId,
               status,
               message: errBody.slice(0, 2000),
@@ -88,23 +140,24 @@ export function registerAiProxy() {
         }
 
         response.on('data', (chunk: Buffer) => {
-          sendToRenderer('ai:chunk', { requestId, chunk: chunk.toString('utf-8') });
+          touchIdle();
+          reply('ai:chunk', { requestId, chunk: chunk.toString('utf-8') });
         });
 
         response.on('end', () => {
-          activeRequests.delete(requestId);
-          sendToRenderer('ai:end', { requestId });
+          finish();
+          reply('ai:end', { requestId });
         });
 
         response.on('error', (err: Error) => {
-          activeRequests.delete(requestId);
-          sendToRenderer('ai:error', { requestId, message: err.message });
+          finish();
+          reply('ai:error', { requestId, message: err.message });
         });
       });
 
       request.on('error', (err: Error) => {
-        activeRequests.delete(requestId);
-        sendToRenderer('ai:error', {
+        finish();
+        reply('ai:error', {
           requestId,
           message: err.message,
           // Различаем сетевые сбои и ошибки API
@@ -118,7 +171,7 @@ export function registerAiProxy() {
       return { started: true };
     } catch (err) {
       activeRequests.delete(requestId);
-      sendToRenderer('ai:error', { requestId, message: (err as Error).message });
+      reply('ai:error', { requestId, message: (err as Error).message });
       return { started: false };
     }
   });
@@ -139,6 +192,10 @@ export function registerAiProxy() {
   /** Прогрев соединения — снижает задержку первого запроса. */
   ipcMain.handle('ai:probe', async (_event, url: string) => {
     return new Promise((resolve) => {
+      if (!isHttpUrl(url)) {
+        resolve({ reachable: false, error: 'Неподдерживаемый протокол' });
+        return;
+      }
       try {
         const request = net.request({ method: 'HEAD', url });
         const timer = setTimeout(() => {
@@ -173,6 +230,9 @@ export function registerAiProxy() {
       _event,
       req: { provider: string; baseUrl?: string; apiKey?: string }
     ): Promise<{ success: boolean; models: string[]; error?: string }> => {
+      if (!req || typeof req !== 'object' || !req.provider) {
+        return { success: false, models: [], error: 'Не указан провайдер' };
+      }
       const { provider, baseUrl, apiKey } = req;
 
       function requestJson(url: string, headers: Record<string, string>): Promise<any> {
@@ -237,8 +297,8 @@ export function registerAiProxy() {
 
         if (provider === 'gemini') {
           const base = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
-          const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey.trim())}` : '';
-          const url = `${base}/models${keyParam}`;
+          // Ключ только заголовком: в query string он оседал в логах прокси.
+          const url = `${base}/models`;
           const headers: Record<string, string> = apiKey ? { 'x-goog-api-key': apiKey.trim() } : {};
           const data = await requestJson(url, headers);
           if (Array.isArray(data?.models)) {

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * OAuth 2.0 Google: отдельные согласия для Диска и YouTube.
  *
  * Почему раздельно: `youtube.upload` — чувствительный scope, и при общем
@@ -10,7 +10,8 @@
  * Токены шифруются `safeStorage` (DPAPI в Windows) и хранятся только в главном
  * процессе; в браузер уходит лишь статус.
  */
-import { app, safeStorage, shell } from 'electron';
+import { app, safeStorage } from 'electron';
+import { openExternalSafe } from './safeOpen';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -299,7 +300,8 @@ interface LoopbackResult {
  * браузера не прерывает ожидание кода.
  */
 function awaitAuthorizationCode(
-  authUrlBuilder: (redirectUri: string) => string
+  authUrlBuilder: (redirectUri: string) => string,
+  expectedState: string
 ): Promise<LoopbackResult> {
   return new Promise<LoopbackResult>((resolve, reject) => {
     let settled = false;
@@ -329,6 +331,14 @@ function awaitAuthorizationCode(
       const error = url.searchParams.get('error');
       const state = url.searchParams.get('state') ?? '';
 
+      // Без сверки state любой процесс на машине мог доставить свой код на
+      // 127.0.0.1 и привязать приложение к чужому аккаунту.
+      if (expectedState && state !== expectedState) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(htmlError('Запрос авторизации не от этого приложения. Повторите подключение.'));
+        return;
+      }
+
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       if (code) {
         res.end(HTML_OK);
@@ -342,7 +352,6 @@ function awaitAuthorizationCode(
       }
       // Посторонний запрос без кода — отвечаем и ждём дальше.
       res.end(htmlError('Код авторизации не получен'));
-      void state;
     };
 
     let boundPort = 0;
@@ -372,7 +381,7 @@ function awaitAuthorizationCode(
       current.listen(port, '127.0.0.1', () => {
         boundPort = (current.address() as { port: number }).port;
         const authUrl = authUrlBuilder(`http://127.0.0.1:${boundPort}`);
-        void shell.openExternal(authUrl);
+        openExternalSafe(authUrl);
       });
     };
 
@@ -458,8 +467,10 @@ export async function connectService(service: GoogleService): Promise<GoogleConn
   const { clientId } = googleConfig();
 
   try {
-    const result = await awaitAuthorizationCode((redirectUri) =>
-      buildAuthUrl({ clientId, service, redirectUri, state, codeChallenge: challenge })
+    const result = await awaitAuthorizationCode(
+      (redirectUri) =>
+        buildAuthUrl({ clientId, service, redirectUri, state, codeChallenge: challenge }),
+      state
     );
     await exchangeCode(service, result.code, result.redirectUri, verifier);
     const store = readGoogleStore();

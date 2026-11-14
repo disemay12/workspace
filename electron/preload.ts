@@ -226,6 +226,8 @@ const electronAPI = {
     ipcRenderer.invoke('autosave:write', name, payload),
   autosaveList: (): Promise<{ success: boolean; items?: unknown[]; error?: string }> =>
     ipcRenderer.invoke('autosave:list'),
+  autosaveListMeta: (): Promise<{ success: boolean; items?: unknown[]; error?: string }> =>
+    ipcRenderer.invoke('autosave:listMeta'),
   autosaveRead: (name: string): Promise<{ success: boolean; snapshot?: unknown; error?: string }> =>
     ipcRenderer.invoke('autosave:read', name),
   autosaveRemove: (name: string): Promise<{ success: boolean; error?: string }> =>
@@ -298,7 +300,8 @@ const electronAPI = {
   /** Метаданные файла секретов — без самого ключа. */
   describeSecrets: (): Promise<{
     found: boolean;
-    filePath: string;
+    /** Только имя файла: полный путь из интерфейса не нужен. */
+    fileName: string;
     baseUrl?: string;
     textModel?: string;
     imageModel?: string;
@@ -540,8 +543,14 @@ const electronAPI = {
       activePresetId?: string;
       modelsCache?: Record<string, string[]>;
     };
+    /** Ключ только активного провайдера: остальные запрашиваются по одному. */
     keys: Record<string, string>;
+    keyErrors: string[];
+    encryptionUnavailable: boolean;
   }> => ipcRenderer.invoke('aiSettings:load'),
+  /** Ключ конкретного провайдера: нужен при переключении провайдера. */
+  aiSettingsKey: (provider: string): Promise<{ key: string; unreadable: boolean }> =>
+    ipcRenderer.invoke('aiSettings:key', provider),
   saveAiSettings: (patch: {
     provider?: string;
     baseUrl?: string;
