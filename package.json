@@ -1,6 +1,6 @@
 {
   "name": "workspace",
-  "version": "1.4.9",
+  "version": "1.4.10",
   "description": "WorkSpace",
   "main": "dist-electron/main.js",
   "author": "WorkSpace",
@@ -21,6 +21,7 @@
     "checks:build": "tsc -p electron/checks/tsconfig.json",
     "checks:sync": "node scripts/sync-checks.js",
     "checks": "npm run checks:build && npm run checks:sync && node dist-electron/run-all-checks.js",
+    "checks:live": "npm run checks:build && npm run checks:sync && node dist-electron/run-all-checks.js --live",
     "pack": "npm run build && electron-builder --win --x64 --dir",
     "dist": "npm run build && electron-builder --win --x64",
     "build:portable": "node scripts/build-portable.js",
@@ -51,6 +52,7 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@electron/asar": "^3.4.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
@@ -66,5 +68,50 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.4",
     "wait-on": "^9.5.1"
+  },
+  "build": {
+    "appId": "ru.workspace.desktop",
+    "productName": "WorkSpace",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "!dist-electron/electron/**",
+      "!dist-electron/*-check.js",
+      "!dist-electron/run-all-checks.js",
+      "!dist-electron/common-ipc.js",
+      "!dist-electron/sandbox.js",
+      "!dist-electron/smoke.js",
+      "!dist-electron/src/**",
+      "package.json",
+      "!secrets.local.*",
+      "!**/*.local.ps1",
+      "!**/ai-settings.json",
+      "!**/gdrive.json",
+      "!**/workspace-session.json",
+      "!**/*-check.json",
+      "!**/*.7z",
+      "!**/*.log",
+      "!**/final-report.txt",
+      "!test-workspace*/**",
+      "!**/*.map"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }
