@@ -33,6 +33,7 @@ import { listSnapshots, pruneSnapshots, writeSnapshot } from './services/autosav
 import { copyDiagnosticsReport, installDiagnosticsHooks } from './services/diagnostics';
 import type { NotificationKind } from './lib/notifyRules';
 import { useLocalStorage } from './hooks/useLocalStorage';
+import { useUpdateCheck } from './hooks/useUpdateCheck';
 import { cn, baseName, dirName, extName, joinPath, stripCodeFence, uid } from './lib/utils';
 import { docxText, pptxText, tabToDocumentText, htmlToPlainText } from './lib/documentText';
 import { extractLegacyDocText } from './lib/legacyDoc';
@@ -127,7 +128,6 @@ import {
   guessFormat,
   normalizeConversionFormat,
 } from './services/documentConversion';
-import type { UpdateCheckResult } from './types';
 
 /** Форматы, в которые приложение умеет записывать правки ИИ. */
 const EDITABLE_TYPES = new Set<FileType>(['word', 'excel', 'markdown', 'richtext', 'text', 'code']);
@@ -406,8 +406,6 @@ const App: React.FC = () => {
   const [saveAsOpen, setSaveAsOpen] = useState(false);
   const [saveAsTabId, setSaveAsTabId] = useState('');
   const [saveAsBusy, setSaveAsBusy] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
-  const [updateDismissed, setUpdateDismissed] = useState(false);
   /** Команда, отправленная AI в терминал: выполняется после монтирования панели. */
   const [terminalCommand, setTerminalCommand] = useState<{ id: string; command: string } | null>(null);
   const [inlineTarget, setInlineTarget] = useState<InlineEditTarget | null>(null);
@@ -438,6 +436,15 @@ const App: React.FC = () => {
   const [bootError, setBootError] = useState('');
 
   const isElectron = fileSystemService.isElectron();
+
+  /**
+   * Проверка обновлений идёт сама: при старте, с повторами при сетевом сбое,
+   * при возврате в окно и раз в несколько часов. Баннер показывается сразу,
+   * как только версия найдена, — без нажатия «Проверить обновление».
+   */
+  const updateCheck = useUpdateCheck(isElectron);
+  const updateInfo = updateCheck.info;
+  const updateDismissed = updateCheck.dismissed;
 
   // Запрещаем браузеру открывать перетащенные файлы вместо приложения:
   // обработчик чата получает их, а окно не должно уходить на file://.
@@ -519,25 +526,6 @@ const App: React.FC = () => {
     }
     void ws.initWorkspace().catch((err) => setBootError((err as Error).message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isElectron]);
-
-  /* ---- Тихая проверка обновлений при запуске ---- */
-  useEffect(() => {
-    if (!isElectron || !window.electronAPI?.checkForUpdates) return;
-    const check = window.electronAPI.checkForUpdates;
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      try {
-        const info = await check();
-        if (!cancelled && info?.success && info.available) setUpdateInfo(info);
-      } catch {
-        // Нет сети или GitHub недоступен — приложение работает как обычно.
-      }
-    }, 4000);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
   }, [isElectron]);
 
   /* ============================================================
@@ -3780,7 +3768,10 @@ const App: React.FC = () => {
       />
 
       {updateInfo?.available && !updateDismissed && (
-        <div className="flex items-center gap-2 border-b border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-[11px] text-ws">
+        <div
+          data-update-banner
+          className="flex items-center gap-2 border-b border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-[11px] text-ws"
+        >
           <Download size={13} className="shrink-0 text-sky-400" />
           <span className="min-w-0 flex-1 truncate">
             Доступна новая версия WorkSpace {updateInfo.latestVersion}
@@ -3791,14 +3782,14 @@ const App: React.FC = () => {
             onClick={() => {
               setSettingsTab('system');
               setSettingsOpen(true);
-              setUpdateDismissed(true);
+              updateCheck.dismiss();
             }}
             className="shrink-0 rounded bg-sky-600 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-sky-500"
           >
             Обновить
           </button>
           <button
-            onClick={() => setUpdateDismissed(true)}
+            onClick={() => updateCheck.dismiss()}
             title="Скрыть"
             className="shrink-0 rounded p-0.5 text-ws-faint hover:bg-ws-hover hover:text-ws"
           >
@@ -4290,6 +4281,10 @@ const App: React.FC = () => {
         modelsCache={ai.modelsCache}
         initialTab={settingsTab}
         onNotify={notify}
+        // Найденное при старте обновление должно быть видно и в настройках:
+        // панель открывается с уже известным результатом, без ещё одного нажатия.
+        initialUpdate={updateInfo}
+        onCheckUpdates={() => updateCheck.checkNow({ manual: true })}
         onBeforeUpdate={async () => {
           const { failed } = await saveAllWithEditors();
           if (failed.length > 0) {
