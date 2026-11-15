@@ -53,6 +53,8 @@ const keep = new Set([
   'safeOpen.js',
   // Границы путей: main.ts, video.ts, imageHost.ts.
   'fsGuard.js',
+  // Контракт ответа update:check: updater.ts (main) и проверочный стенд.
+  'updateInfo.js',
 ]);
 
 for (const entry of fs.readdirSync(path.join(srcRoot, 'dist-electron'), { withFileTypes: true })) {
