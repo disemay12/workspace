@@ -52,8 +52,10 @@ export function escapeRawHtml(raw: string): string {
     const candidate = close === -1 ? source.slice(open) : source.slice(open, close + 1);
     const match = TAG_RE.exec(candidate);
     if (!match) {
-      // `<` + не буква — по спецификации HTML это текст, а не тег.
-      out += candidate;
+      // `<` + не буква — по спецификации HTML это текст, а не тег, но отдавать
+      // его сырым нельзя: браузер закроет текстовый `<` и разберёт следующий,
+      // поэтому `<<img src=x onerror=...>` проходил фильтр целиком.
+      out += escapeHtml(candidate);
     } else {
       const tag = match[2].toLowerCase();
       if (!RAW_HTML_TAGS.has(tag)) out += escapeHtml(candidate);
@@ -79,7 +81,9 @@ function isSafeUrl(value: string, schemes: Set<string>, allowDataImage: boolean)
   if (!text) return false;
   // Схема ищется до первого разделителя пути: `foo/bar:baz` — не схема.
   const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(text);
-  if (!schemeMatch) return !text.startsWith('//');
+  // Относительный адрес. `//host` и `\\host` браузер разбирает как
+  // протокол-относительную ссылку на чужой хост, а не как путь.
+  if (!schemeMatch) return !/^[\\/]{2}/.test(text);
   const scheme = `${schemeMatch[1].toLowerCase()}:`;
   if (schemes.has(scheme)) return true;
   if (allowDataImage && scheme === 'data:') return /^data:image\/(png|jpe?g|gif|webp|bmp);/i.test(text);

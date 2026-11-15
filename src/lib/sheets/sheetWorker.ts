@@ -9,7 +9,7 @@
  * запросы `{ id, kind: 'read' }` из воркера в клиент.
  */
 import * as XLSX from 'xlsx';
-import { fromExcelFormula, toExcelFormula } from '../formulaEngine';
+import { fromExcelFormula } from '../formulaEngine';
 
 export interface SheetMeta {
   name: string;
@@ -27,8 +27,6 @@ export type WorkerRequest =
   | { id: number; kind: 'openCsv'; path: string; name: string; encoding: string; chunkSize?: number }
   | { id: number; kind: 'openXlsx'; bytes: ArrayBuffer; name: string; ext: string }
   | { id: number; kind: 'getWindow'; sheet: string; start: number; count: number }
-  | { id: number; kind: 'setCells'; sheet: string; edits: CellEdit[] }
-  | { id: number; kind: 'save' }
   | { id: number; kind: 'meta' }
   | { id: number; kind: 'close' };
 
@@ -53,11 +51,6 @@ class CsvTable {
   private inQuotes = false;
   private length = 0;
   private lastByte = -1;
-  private endsWithNewline = false;
-  /** Файл был в CRLF — сохраняем те же переводы строк. */
-  private crlf = false;
-  /** Правки поверх файла: применяются при чтении окна и при сохранении. */
-  private readonly edits = new Map<number, Map<number, string | number | boolean | null>>();
 
   constructor(
     private readonly delimiter: string,
@@ -75,8 +68,6 @@ class CsvTable {
       // 0x22 и 0x0A совпадают в UTF-8 и windows-1251 — сканируем байты.
       if (byte === 0x22) this.inQuotes = !this.inQuotes;
       else if (byte === 0x0a && !this.inQuotes) {
-        const prev = index > 0 ? chunk[index - 1] : this.lastByte;
-        if (prev === 0x0d) this.crlf = true;
         this.rowStarts.push(this.length + index + 1);
         this.rowCount++;
       }
@@ -87,8 +78,7 @@ class CsvTable {
 
   /** Учитывает последнюю строку без завершающего перевода строки. */
   finish(): void {
-    this.endsWithNewline = this.length === 0 || this.lastByte === 0x0a;
-    if (this.length > 0 && !this.endsWithNewline) this.rowCount++;
+    if (this.length > 0 && this.lastByte !== 0x0a) this.rowCount++;
   }
 
   get rows(): number {
@@ -99,75 +89,18 @@ class CsvTable {
     return Math.max(1, this.colCount);
   }
 
-  get charset(): string {
-    return this.encoding;
-  }
-
   setCols(count: number): void {
     this.colCount = Math.max(1, count);
   }
 
-  /** Правка ячейки: файл на диске до сохранения не трогаем. */
-  edit(row: number, col: number, value: string | number | boolean | null): void {
-    let rowEdits = this.edits.get(row);
-    if (!rowEdits) {
-      rowEdits = new Map();
-      this.edits.set(row, rowEdits);
-    }
-    rowEdits.set(col, value);
-  }
-
-  /** Окно строк: нужный байтовый диапазон файла плюс накопленные правки. */
+  /** Окно строк: нужный байтовый диапазон файла. */
   async window(start: number, count: number): Promise<Row[]> {
     const from = Math.max(0, start);
     const to = Math.min(this.rowCount, from + Math.max(0, count));
     if (to <= from) return [];
     const begin = this.startOffset(from);
     const end = to >= this.rowCount ? this.length : this.startOffset(to);
-    const rows = await this.parseRange(begin, end);
-    for (let index = 0; index < rows.length; index += 1) {
-      const rowEdits = this.edits.get(from + index);
-      if (!rowEdits) continue;
-      const row = rows[index];
-      for (const [col, value] of rowEdits) {
-        while (row.length <= col) row.push('');
-        row[col] = value;
-      }
-    }
-    return rows;
-  }
-
-  /**
-   * CSV в байтах: пачка строк кодируется сразу и уходит в список кусков,
-   * поэтому полного текста файла в памяти не живёт.
-   */
-  async toBytes(): Promise<Uint8Array> {
-    const encoder = new TextEncoder();
-    const eol = this.crlf ? '\r\n' : '\n';
-    const parts: Uint8Array[] = [];
-    // TextEncoder умеет только UTF-8, поэтому не-UTF-8 источник помечаем BOM:
-    // без него повторное открытие файла как windows-1251 даёт кракозябры.
-    if (!/^utf-?8/i.test(this.charset)) parts.push(new Uint8Array([0xef, 0xbb, 0xbf]));
-    const batch = 4096;
-    for (let start = 0; start < this.rowCount; start += batch) {
-      const rows = await this.window(start, batch);
-      if (rows.length === 0) break;
-      const last = start + rows.length >= this.rowCount;
-      const text =
-        rows
-          .map((row) => row.map((cell) => csvField(cell, this.delimiter)).join(this.delimiter))
-          .join(eol) + (!last || this.endsWithNewline ? eol : '');
-      parts.push(encoder.encode(text));
-    }
-    let total = 0;
-    for (const part of parts) total += part.byteLength;
-    const result = new Uint8Array(total);
-    let at = 0;
-    for (const part of parts) {
-      result.set(part, at);
-      at += part.byteLength;
-    }
-    return result;
+    return this.parseRange(begin, end);
   }
 
   private startOffset(row: number): number {
@@ -252,14 +185,6 @@ function detectDelimiter(sample: string): string {
   return best;
 }
 
-/** Поле CSV: кавычки только когда без них поле не прочитать обратно. */
-function csvField(value: string | number | boolean | null, delimiter: string): string {
-  if (value === null || value === undefined) return '';
-  const text = typeof value === 'string' ? value : String(value);
-  if (!text.includes(delimiter) && !/[\r\n"]/.test(text)) return text;
-  return '"' + text.replace(/"/g, '""') + '"';
-}
-
 /* ============================================================
    XLSX: книга целиком в памяти воркера
    ============================================================ */
@@ -268,85 +193,39 @@ function csvField(value: string | number | boolean | null, delimiter: string): s
 const MAX_SHEET_ROWS = 1_048_576;
 const MAX_SHEET_COLS = 16_384;
 
+type DenseRows = (XLSX.CellObject[] | undefined)[];
+
 /**
- * Ячейка листа: SheetJS с `dense: true` держит строки массивом массивов,
- * разреженный лист — по адресам вроде 'A1'.
+ * Раскладка листа: SheetJS с `dense: true` держит строки массивом массивов —
+ * в самом листе или в `!data` (версии библиотеки различаются), разреженный
+ * лист — по адресам вроде 'A1'. Всё прочее читать не умеем и молчать нельзя:
+ * пустой лист выглядел как потеря данных.
  */
+function sheetLayout(
+  worksheet: XLSX.WorkSheet
+): { kind: 'dense'; rows: DenseRows } | { kind: 'sparse'; cells: Record<string, unknown> } {
+  if (Array.isArray(worksheet)) {
+    return { kind: 'dense', rows: worksheet as unknown as DenseRows };
+  }
+  const data = (worksheet as Record<string, unknown>)['!data'];
+  if (Array.isArray(data)) return { kind: 'dense', rows: data as unknown as DenseRows };
+  if (typeof worksheet === 'object' && worksheet !== null) {
+    return { kind: 'sparse', cells: worksheet as Record<string, unknown> };
+  }
+  throw new Error('Неизвестный формат листа XLSX');
+}
+
 function cellAt(worksheet: XLSX.WorkSheet, r: number, c: number): XLSX.CellObject | undefined {
-  if (Array.isArray(worksheet)) {
-    const row = (worksheet as unknown as (XLSX.CellObject[] | undefined)[])[r];
-    return row?.[c];
-  }
-  return worksheet[XLSX.utils.encode_cell({ r, c })] as XLSX.CellObject | undefined;
-}
-
-function setCellAt(
-  worksheet: XLSX.WorkSheet,
-  r: number,
-  c: number,
-  cell: XLSX.CellObject | undefined
-): void {
-  if (Array.isArray(worksheet)) {
-    const rows = worksheet as unknown as (XLSX.CellObject[] | undefined)[];
-    while (rows.length <= r) rows.push([]);
-    const row = rows[r] ?? (rows[r] = []);
-    if (cell) row[c] = cell;
-    else delete row[c];
-    return;
-  }
-  const address = XLSX.utils.encode_cell({ r, c });
-  if (cell) (worksheet as Record<string, unknown>)[address] = cell;
-  else delete (worksheet as Record<string, unknown>)[address];
-}
-
-/** Расширяет !ref: пустой или битый ref — не ошибка, лист начинается с этой ячейки. */
-function touchRange(worksheet: XLSX.WorkSheet, r: number, c: number): void {
-  const base = worksheet['!ref'];
-  if (!base) {
-    worksheet['!ref'] = XLSX.utils.encode_cell({ r, c });
-    return;
-  }
-  try {
-    const range = XLSX.utils.decode_range(base);
-    if (r < range.s.r) range.s.r = r;
-    if (c < range.s.c) range.s.c = c;
-    if (r > range.e.r) range.e.r = r;
-    if (c > range.e.c) range.e.c = c;
-    worksheet['!ref'] = XLSX.utils.encode_range(range);
-  } catch {
-    worksheet['!ref'] = XLSX.utils.encode_cell({ r, c });
-  }
-}
-
-/** Правка ячейки в самой книге: формула хранится в формате файла Excel. */
-function writeCell(worksheet: XLSX.WorkSheet, edit: CellEdit): void {
-  const value = edit.v;
-  if (typeof value === 'string' && value.startsWith('=')) {
-    // В файле аргументы через запятую; кэш пуст, иначе Excel показал бы текст формулы.
-    setCellAt(worksheet, edit.r, edit.c, {
-      t: 'n',
-      f: toExcelFormula(value).slice(1),
-    });
-    return;
-  }
-  if (value === null || value === '') {
-    setCellAt(worksheet, edit.r, edit.c, undefined);
-    return;
-  }
-  if (typeof value === 'number') {
-    setCellAt(worksheet, edit.r, edit.c, { t: 'n', v: value });
-    return;
-  }
-  if (typeof value === 'boolean') {
-    setCellAt(worksheet, edit.r, edit.c, { t: 'b', v: value });
-    return;
-  }
-  setCellAt(worksheet, edit.r, edit.c, { t: 's', v: String(value) });
+  const layout = sheetLayout(worksheet);
+  if (layout.kind === 'dense') return layout.rows[r]?.[c];
+  return layout.cells[XLSX.utils.encode_cell({ r, c })] as XLSX.CellObject | undefined;
 }
 
 class XlsxTable {
   private workbook: XLSX.WorkBook;
   private order: string[] = [];
+  /** Размеры листов: считается один раз на книгу, сбрасывается только загрузкой новой. */
+  private readonly dimCache = new Map<string, { rows: number; cols: number }>();
 
   constructor(workbook: XLSX.WorkBook) {
     this.workbook = workbook;
@@ -364,15 +243,22 @@ class XlsxTable {
   /**
    * Размеры листа по фактическим данным: после форматирования целого столбца
    * Excel пишет !ref="A1:XFD1048576", и окно 4000 строк разворачивалось в 65 млн ячеек.
+   *
+   * Перебор всех ячеек кэшируется: прокрутка листа спрашивает окна подряд, и
+   * полный скан на каждый запрос давал O(окно × ячейки). Состав ячеек после
+   * загрузки книги не меняется, поэтому кэш живёт вместе с книгой.
    */
   private dims(sheet: string): { rows: number; cols: number } {
+    const cached = this.dimCache.get(sheet);
+    if (cached) return cached;
     const worksheet = this.worksheet(sheet);
     if (!worksheet) return { rows: 0, cols: 1 };
     const limit = this.refLimit(worksheet);
     let rows = 0;
     let cols = 1;
-    if (Array.isArray(worksheet)) {
-      const dense = worksheet as unknown as (XLSX.CellObject[] | undefined)[];
+    const layout = sheetLayout(worksheet);
+    if (layout.kind === 'dense') {
+      const dense = layout.rows;
       for (let r = 0; r < dense.length; r += 1) {
         const row = dense[r];
         if (!row || row.length === 0) continue;
@@ -384,8 +270,7 @@ class XlsxTable {
         if (last + 1 > cols) cols = last + 1;
       }
     } else {
-      const sparse = worksheet as Record<string, unknown>;
-      for (const key of Object.keys(sparse)) {
+      for (const key of Object.keys(layout.cells)) {
         if (!key || key.charCodeAt(0) === 0x21 /* ! */) continue;
         try {
           const cell = XLSX.utils.decode_cell(key);
@@ -397,10 +282,12 @@ class XlsxTable {
         }
       }
     }
-    return {
+    const result = {
       rows: Math.min(rows, limit.rows, MAX_SHEET_ROWS),
       cols: Math.min(Math.max(1, cols), limit.cols, MAX_SHEET_COLS),
     };
+    this.dimCache.set(sheet, result);
+    return result;
   }
 
   /** Верхняя граница из !ref; ref на весь лист о данных не говорит, поэтому отбрасывается. */
@@ -445,40 +332,6 @@ class XlsxTable {
     }
     return result;
   }
-
-  /** Правки применяем к исходной книге: она же уходит в файл при сохранении. */
-  setCells(sheet: string, edits: CellEdit[]): void {
-    let worksheet = this.worksheet(sheet);
-    if (!worksheet) {
-      worksheet = {};
-      this.workbook.Sheets[sheet] = worksheet;
-    }
-    for (const edit of edits) {
-      if (!Number.isFinite(edit.r) || !Number.isFinite(edit.c)) continue;
-      if (edit.r < 0 || edit.c < 0) continue;
-      writeCell(worksheet, edit);
-      touchRange(worksheet, edit.r, edit.c);
-    }
-  }
-
-  /**
-   * Сохранение: пишем ту же книгу, а не собранную заново из матрицы.
-   * Пересборка через book_new/aoa_to_sheet теряла !merges, ширины и высоты
-   * ячеек, число-форматы, примечания и закрепление.
-   *
-   * ВАЖНО: CE не переносит при записи оформление ячеек и диаграммы (стили
-   * пишет injectStylesIntoXlsx), поэтому редактор сохраняет через
-   * flushWindowed → syncWorkbook, а не этим путём.
-   */
-  toBytes(ext: string, vbaraw?: unknown): ArrayBuffer {
-    const bookVBA = ext === 'xlsm';
-    if (vbaraw) (this.workbook as { vbaraw?: unknown }).vbaraw = vbaraw;
-    return XLSX.write(this.workbook, {
-      bookType: bookVBA ? 'xlsm' : 'xlsx',
-      type: 'array',
-      bookVBA,
-    }) as ArrayBuffer;
-  }
 }
 
 function cellValue(cell: XLSX.CellObject | undefined): string | number | boolean | null {
@@ -498,9 +351,6 @@ function cellValue(cell: XLSX.CellObject | undefined): string | number | boolean
 let csv: CsvTable | null = null;
 let csvName = '';
 let xlsx: XlsxTable | null = null;
-let vbaRaw: unknown = null;
-/** Расширение открытой книги: от него зависит формат записи макросов. */
-let sheetExt: 'xlsx' | 'xlsm' = 'xlsx';
 /** Поколение открытия: устаревшее открытие не коммитит состояние после await. */
 let openGeneration = 0;
 
@@ -635,10 +485,7 @@ function openXlsx(request: Extract<WorkerRequest, { kind: 'openXlsx' }>): SheetM
     cellNF: false,
     cellText: false,
     sheetStubs: false,
-    bookVBA: request.ext === 'xlsm',
   });
-  vbaRaw = (workbook as { vbaraw?: unknown }).vbaraw ?? null;
-  sheetExt = request.ext === 'xlsm' ? 'xlsm' : 'xlsx';
   xlsx = new XlsxTable(workbook);
   return xlsx.meta();
 }
@@ -682,42 +529,11 @@ scope.onmessage = (event) => {
             .catch((err) => fail(request.id, err));
         } else fail(request.id, 'Таблица не открыта');
         break;
-      case 'setCells':
-        if (xlsx) {
-          xlsx.setCells(request.sheet, request.edits);
-          reply(request.id);
-        } else if (csv) {
-          // Файл на диске до сохранения не трогаем: правки живут в индексе.
-          for (const edit of request.edits) csv.edit(edit.r, edit.c, edit.v);
-          reply(request.id);
-        } else fail(request.id, 'Таблица не открыта');
-        break;
-      case 'save': {
-        if (xlsx) {
-          const bytes = xlsx.toBytes(sheetExt, vbaRaw);
-          reply(request.id, bytes, [bytes]);
-          break;
-        }
-        if (csv) {
-          const table = csv;
-          void table
-            .toBytes()
-            .then((bytes) => {
-              const buffer = bytes.buffer as ArrayBuffer;
-              reply(request.id, buffer, [buffer]);
-            })
-            .catch((err) => fail(request.id, err));
-          break;
-        }
-        fail(request.id, 'Таблица не открыта');
-        break;
-      }
       case 'close':
         // Незавершённый openCsv не должен вернуть состояние после закрытия.
         openGeneration += 1;
         csv = null;
         xlsx = null;
-        vbaRaw = null;
         rejectPendingReads(new Error('Таблица закрыта'));
         reply(request.id);
         break;

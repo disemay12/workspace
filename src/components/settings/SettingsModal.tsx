@@ -26,6 +26,7 @@ import { aiService } from '../../services/aiService';
 import { cn } from '../../lib/utils';
 import { Button, Field, Input, Modal, Select, Textarea } from '../ui';
 import { DEFAULT_PROFILES, mergeProfiles, nextProfileId } from '../../lib/aiProfiles';
+import type { UpdateCheckResult } from '../../types';
 import { IntegrationsSettings } from './IntegrationsSettings';
 import { SystemSettings } from './SystemSettings';
 import { AppearanceSettings } from './AppearanceSettings';
@@ -43,6 +44,10 @@ interface Props {
   initialTab?: Tab;
   onNotify?: (message: string) => void;
   onBeforeUpdate?: () => Promise<boolean>;
+  /** Результат автопроверки при запуске: панель открывается без нового запроса. */
+  initialUpdate?: UpdateCheckResult | null;
+  /** Ручная проверка идёт через общий хук, чтобы баннер обновился сразу. */
+  onCheckUpdates?: () => Promise<UpdateCheckResult | null>;
 }
 
 type Tab = 'provider' | 'model' | 'prompt' | 'keys' | 'integrations' | 'system' | 'appearance';
@@ -72,6 +77,8 @@ export const SettingsModal: React.FC<Props> = ({
   initialTab = 'provider',
   onNotify,
   onBeforeUpdate,
+  initialUpdate,
+  onCheckUpdates,
 }) => {
   const [tab, setTab] = useState<Tab>(initialTab);
 
@@ -247,13 +254,18 @@ export const SettingsModal: React.FC<Props> = ({
   }, [tab, settings.provider]);
 
   const handleClearKey = async (provider: AIProvider) => {
-    await keyVault.set(provider, '');
-    const list = await keyVault.listConfigured();
-    setConfiguredProviders(list);
+    // Удаление обязано затронуть и постоянное хранилище профиля: локальная
+    // копия — не источник истины, из файла ключ вернулся бы при следующей смене.
+    const removed = await keyVault.remove(provider, settings);
+    if (!removed.ok) {
+      setTestResult({ ok: false, message: removed.error || 'Не удалось удалить ключ' });
+    }
     if (provider === settings.provider) {
       setKeyDraft('');
       await onSaveApiKey('');
     }
+    const list = await keyVault.listConfigured();
+    setConfiguredProviders(list);
   };
 
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -805,7 +817,14 @@ export const SettingsModal: React.FC<Props> = ({
       )}
 
       {tab === 'integrations' && <IntegrationsSettings onNotify={onNotify || (() => undefined)} />}
-      {tab === 'system' && <SystemSettings onNotify={onNotify} onBeforeUpdate={onBeforeUpdate} />}
+      {tab === 'system' && (
+        <SystemSettings
+          onNotify={onNotify}
+          onBeforeUpdate={onBeforeUpdate}
+          initialUpdate={initialUpdate}
+          onCheckUpdates={onCheckUpdates}
+        />
+      )}
       {tab === 'appearance' && <AppearanceSettings onNotify={onNotify} />}
     </Modal>
   );

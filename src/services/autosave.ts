@@ -22,9 +22,47 @@ export interface AutosaveSnapshot {
 }
 
 /** Путь в одном виде: снимок на диске и вкладка должны совпасть по файлу. */
+function normalizePath(value: string): string {
+  return (value || '').replace(/\//g, '\\').toLowerCase();
+}
+
 function samePath(a: string, b: string): boolean {
-  const normalize = (value: string) => (value || '').replace(/\//g, '\\').toLowerCase();
-  return normalize(a) === normalize(b);
+  return normalizePath(a) === normalizePath(b);
+}
+
+/**
+ * Закрытые вкладки. Снимок ставится в очередь снимком состояния, а запись идёт
+ * через несколько `await`: вкладка, закрытая между проверкой и записью, иначе
+ * вернула бы при следующем запуске черновик, который пользователь выбросил.
+ */
+const closedPaths = new Map<string, number>();
+const CLOSED_PATH_TTL_MS = 30_000;
+
+/** Вкладку закрыли с отказом от сохранения: её снимок писать нельзя. */
+export function noteClosedPath(filePath: string): void {
+  const key = normalizePath(filePath);
+  if (!key) return;
+  const now = Date.now();
+  for (const [path, at] of closedPaths) {
+    if (now - at >= CLOSED_PATH_TTL_MS) closedPaths.delete(path);
+  }
+  closedPaths.set(key, now);
+}
+
+/** Файл открыли снова: запрет на снимок снимается. */
+export function noteOpenedPath(filePath: string): void {
+  closedPaths.delete(normalizePath(filePath));
+}
+
+function isClosedRecently(filePath: string): boolean {
+  const key = normalizePath(filePath);
+  const at = closedPaths.get(key);
+  if (at === undefined) return false;
+  if (Date.now() - at >= CLOSED_PATH_TTL_MS) {
+    closedPaths.delete(key);
+    return false;
+  }
+  return true;
 }
 
 const FNV64_OFFSET = 0xcbf29ce484222325n;
@@ -145,11 +183,14 @@ async function snapshotNameFor(filePath: string): Promise<string> {
 export async function writeSnapshot(tab: OpenTab): Promise<boolean> {
   const api = window.electronAPI;
   if (!api?.autosaveWrite) return false;
+  if (isClosedRecently(tab.path)) return false;
   if (!shouldSnapshot({ isDirty: tab.isDirty, content: tab.content, maxBytes: MAX_BYTES })) {
     return false;
   }
   try {
     const id = await snapshotNameFor(tab.path);
+    // Вкладку могли закрыть, пока выбиралось имя снимка.
+    if (isClosedRecently(tab.path)) return false;
     const snapshot: AutosaveSnapshot = {
       id,
       path: tab.path,
@@ -198,10 +239,16 @@ export async function dropSnapshot(id: string): Promise<void> {
   }
 }
 
-/** Убирает снимки конкретного файла: имя могло получить суффикс при коллизии. */
-export async function dropSnapshotsForPath(filePath: string): Promise<void> {
+/**
+ * Убирает снимки конкретного файла: имя могло получить суффикс при коллизии.
+ * olderThan — начало записи файла: снимки, сделанные позже, содержат правки,
+ * которых в записанном файле нет, и стирать их нельзя.
+ */
+export async function dropSnapshotsForPath(filePath: string, olderThan?: number): Promise<void> {
   for (const snapshot of await readSnapshotMeta()) {
-    if (samePath(snapshot.path, filePath)) await dropSnapshot(snapshot.id);
+    if (!samePath(snapshot.path, filePath)) continue;
+    if (olderThan !== undefined && Number(snapshot.savedAt) > olderThan) continue;
+    await dropSnapshot(snapshot.id);
   }
 }
 

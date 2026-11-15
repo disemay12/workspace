@@ -18,6 +18,7 @@
 import { app, ipcMain, clipboard } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
+import { loadUpdateInfoContract } from './updateContract';
 
 /**
  * Версия приложения — из package.json: заглушка отдавала '0.0.0-check', и
@@ -42,6 +43,8 @@ const APP_VERSION = resolveAppVersion();
 
 /** Состояние избранного на время прогона (в памяти, как в main.ts). */
 const favorites: { path: string; name: string }[] = [];
+/** Песочница добавляется в избранное один раз — как стартовое состояние. */
+let favoritesSeeded = false;
 
 /**
  * Каналы, уже зарегистрированные helper'ом. Electron не даёт публичного способа
@@ -77,6 +80,13 @@ export interface CommonCheckIpcOptions {
   getAiSettings?: () => Record<string, unknown>;
   /** Функция, возвращающая актуальные ключи провайдеров. */
   getAiKeys?: () => Record<string, string>;
+  /**
+   * Ответ канала `update:check`. По умолчанию — боевая ветка «сборка не
+   * portable»; сценарий, проверяющий баннер обновления, подставляет сюда
+   * `available: true`, чтобы интерфейс получил доступную версию сам, без
+   * нажатия «Проверить обновление».
+   */
+  updateCheck?: Record<string, unknown>;
 }
 
 /**
@@ -92,6 +102,7 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
     aiKeys,
     getAiSettings,
     getAiKeys,
+    updateCheck,
   } = options;
 
   /**
@@ -104,25 +115,31 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
    */
   const handle = (channel: string, listener: (event: any, ...args: any[]) => any) => {
     if (registeredChannels.has(channel)) return;
-    registeredChannels.add(channel);
     try {
       ipcMain.handle(channel, listener);
     } catch (err) {
-      // Канал уже занят вызывающим сценарием — это нормально, оставляем его версию.
+      // Терпима ровно одна причина — канал уже занят вызывающим сценарием:
+      // оставляем его версию. Всё остальное — настоящая ошибка регистрации, и
+      // глотать её нельзя: канал считался рабочим, а invoke падал в рендерере.
+      if (!/second handler|already (?:has a )?handler/i.test((err as Error).message)) throw err;
       registeredChannels.add(channel);
-      void err;
+      console.warn(`[common-ipc] канал ${channel} уже занят сценарием:`, (err as Error).message);
+      return;
     }
+    registeredChannels.add(channel);
   };
 
-  /* ---------- Избранное ---------- */
-  handle('fs:getFavorites', () => {
-    // Возвращаем песочницу как избранное: наборы проверяют, что список
-    // отрисовался, поэтому пустой массив сделал бы проверку бессмысленной.
-    if (sandbox && !favorites.some((f) => f.path === sandbox)) {
-      return [{ path: sandbox, name: 'Избранное' }];
-    }
-    return favorites.slice();
-  });
+  /* ---------- Избранное ----------
+   * Песочница раньше подмешивалась в ответ fs:getFavorites, а fs:toggleFavorite
+   * сверялся с внутренним массивом, где её не было: снятие избранного
+   * возвращало её снова. Теперь стартовое состояние — настоящая запись, и
+   * add/remove работают по фактическому результату. */
+  if (sandbox && !favoritesSeeded) {
+    favoritesSeeded = true;
+    favorites.push({ path: sandbox, name: 'Избранное' });
+  }
+
+  handle('fs:getFavorites', () => favorites.slice());
 
   handle('fs:toggleFavorite', (_event, dirPath: string) => {
     const exists = favorites.some((f) => f.path === dirPath);
@@ -278,12 +295,10 @@ export function registerCommonCheckIpc(options: CommonCheckIpcOptions = {}): voi
     },
   }));
   handle('update:getVersion', () => APP_VERSION);
-  handle('update:check', () => ({
-    success: true,
-    supported: false,
-    currentVersion: APP_VERSION,
-    error: 'Проверка обновлений доступна только в собранной portable-версии WorkSpace',
-  }));
+  // Форма ответа берётся из единственного определения контракта
+  // (electron/updateInfo.ts): заглушка и integration-check больше не сверяются
+  // каждая со своими литералами.
+  handle('update:check', () => updateCheck ?? loadUpdateInfoContract().unsupportedUpdateInfo(APP_VERSION));
 
   /* ---------- Подтверждение закрытия окна ---------- */
   handle('window:confirmClose', (_event, proceed: boolean) => {

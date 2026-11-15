@@ -244,23 +244,22 @@ app.whenReady().then(async () => {
 
     step('importResult', await js(`
       const t = document.body.innerText;
+      const inp = document.querySelector('input[type=password], input[type=text].font-mono');
       return {
         clicked: ${imported},
         successMessage: /Ключ импортирован/.test(t),
+        // Утверждение — что ключ реально доехал до поля, а не его длина:
+        // число раннер не судит, и импорт «в никуда» проходил незамеченным.
+        // Поле живёт на вкладке «Хранилище», поэтому его отсутствие — честный
+        // false, а длина остаётся диагностикой.
+        keyPresent: Boolean(inp) && inp.value.length > 20,
         messageSnippet: (t.match(/Ключ импортирован[^\\n]*/) || [''])[0],
-        keyInputLength: (() => {
-          // Поле ключа живёт на вкладке «Хранилище», поэтому его отсутствие на
-          // вкладке «Провайдер» — не провал: оставляем число для диагностики.
-          const inp = document.querySelector('input[type=password], input[type=text].font-mono');
-          return inp ? inp.value.length : -1;
-        })(),
+        keyInputLength: inp ? inp.value.length : -1,
       };
     `));
 
     // Закрываем настройки
     mark('закрытие настроек');
-    // Значения-утверждения считаются провалом при false, поэтому здесь только
-    // числа: сколько попыток и сколько диалогов осталось.
     const closeState = await js(`
       const isOpen = () => document.querySelectorAll('[role=dialog]').length;
       const clickClose = () =>
@@ -279,27 +278,49 @@ app.whenReady().then(async () => {
       }
       return { attempts, dialogsLeft: isOpen() };
     `);
-    out.steps.push({ name: 'settingsClose', ...closeState });
+    out.steps.push({
+      name: 'settingsClose',
+      // Утверждение — диалог действительно закрылся. Раньше здесь были только
+      // числа, поэтому «остался открытым» попадало в отчёт без провала.
+      closed: closeState.dialogsLeft === 0,
+      attempts: closeState.attempts,
+      dialogsLeft: closeState.dialogsLeft,
+    });
     await sleep(800);
 
     // Диагностика: что реально легло в постоянное хранилище после импорта.
+    // Ожидание берётся из импортированного endpoint'а (SettingsModal: starimg →
+    // 'starimg', иначе «свой endpoint»), а не из константы: значения раньше ни с
+    // чем не сравнивались, и провал импорта ключа не был виден в отчёте.
+    const expectedProvider = String(secrets?.baseUrl || '').includes('starimg')
+      ? 'starimg'
+      : 'custom';
+    const storeState = await js(`
+      const store = await window.electronAPI.loadAiSettings();
+      const settings = store && store.settings ? store.settings : {};
+      const keys = store && store.keys ? store.keys : {};
+      const keyLengthsByName = {};
+      for (const name of Object.keys(keys)) keyLengthsByName[name] = String(keys[name] || '').length;
+      return {
+        provider: settings.provider || null,
+        keyProviders: Object.keys(keys),
+        keyLengthsByName,
+        statusText: (() => {
+          const bar = document.body.innerText;
+          const line = bar.split('\\n').find((row) => /AI /.test(row));
+          return line ? line.trim().slice(0, 80) : null;
+        })(),
+      };
+    `);
     out.steps.push({
       name: 'afterImportStore',
-      ...(await js(`
-        const store = await window.electronAPI.loadAiSettings();
-        const settings = store && store.settings ? store.settings : {};
-        const keys = store && store.keys ? store.keys : {};
-        return {
-          provider: settings.provider || null,
-          keyProviders: Object.keys(keys),
-          keyLengths: Object.keys(keys).map((name) => keys[name].length),
-          statusText: (() => {
-            const bar = document.body.innerText;
-            const line = bar.split('\\n').find((row) => /AI /.test(row));
-            return line ? line.trim().slice(0, 80) : null;
-          })(),
-        };
-      `)),
+      providerMatchesExpected: storeState.provider === expectedProvider,
+      keyStoredForProvider: (storeState.keyLengthsByName[expectedProvider] || 0) > 20,
+      expectedProvider,
+      provider: storeState.provider,
+      keyProviders: storeState.keyProviders,
+      keyLengthsByName: storeState.keyLengthsByName,
+      statusText: storeState.statusText,
     });
 
     step('statusAfterImport', await js(`

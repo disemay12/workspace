@@ -198,6 +198,7 @@ internal static class Program
 
         string source = null;
         string version = "unknown";
+        string digest = null;
         try
         {
             foreach (string line in File.ReadAllLines(marker))
@@ -217,6 +218,10 @@ internal static class Program
                 {
                     version = value;
                 }
+                else if (key.Equals("sha256", StringComparison.OrdinalIgnoreCase))
+                {
+                    digest = value;
+                }
             }
         }
         catch (Exception error)
@@ -227,6 +232,29 @@ internal static class Program
         if (string.IsNullOrEmpty(source) || !File.Exists(Path.Combine(source, "app", "WorkSpace.exe")))
         {
             Log(userData, "pending update has no valid source: " + (source ?? "<none>"));
+            TryDelete(marker);
+            return false;
+        }
+
+        // Маркер лежит в профиле пользователя, а копирование идёт в папку
+        // программы: источник обязан быть каталогом обновления во временной
+        // папке и сопровождаться контрольной суммой архива. Иначе подмена
+        // одной строки в файле превращалась в запуск произвольного кода.
+        string sourceFull;
+        try
+        {
+            sourceFull = Path.GetFullPath(source);
+        }
+        catch (Exception error)
+        {
+            Log(userData, "pending update source is invalid: " + error.Message);
+            TryDelete(marker);
+            return false;
+        }
+
+        if (!IsInsideTemp(sourceFull) || !HasUpdateFolder(sourceFull) || !IsSha256Hex(digest))
+        {
+            Log(userData, "pending update rejected: " + sourceFull);
             TryDelete(marker);
             return false;
         }
@@ -333,6 +361,47 @@ internal static class Program
         // Резервные копии и снятые образы прошлых обновлений
         return relative.IndexOf(".bak-", StringComparison.OrdinalIgnoreCase) >= 0
             || name.EndsWith(".old", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /** Каталог лежит во временной папке текущего пользователя. */
+    private static bool IsInsideTemp(string path)
+    {
+        string temp = Path.GetFullPath(Path.GetTempPath()).TrimEnd('\\', '/');
+        string normalized = path.TrimEnd('\\', '/');
+        return normalized.Equals(temp, StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith(temp + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /** В пути есть каталог, который создаёт приложение при распаковке обновления. */
+    private static bool HasUpdateFolder(string path)
+    {
+        string[] parts = path.Split(new char[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (string part in parts)
+        {
+            if (part.StartsWith("WorkSpace-update-", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Сумма архива в маркере: 64 шестнадцатеричных символа. */
+    private static bool IsSha256Hex(string value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length != 64)
+        {
+            return false;
+        }
+        foreach (char c in value)
+        {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex)
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static void TryDelete(string path)

@@ -1,4 +1,11 @@
 @echo off
+REM chcp 65001 switched the console codepage and never restored it, so the
+REM caller's console stayed in UTF-8 after the script. Remember the previous
+REM codepage and put it back before exit.
+set "OLDCP="
+for /f "tokens=2 delims=:" %%c in ('chcp') do set "OLDCP=%%c"
+set "OLDCP=%OLDCP: =%"
+if not defined OLDCP set "OLDCP=65001"
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
@@ -15,8 +22,8 @@ echo  ============================================
 echo.
 
 set "PROBLEMS=0"
-REM Предупреждения не влияют на код возврата: диагностика годится для CI,
-REM где ELECTRON_RUN_AS_NODE выставляется окружением и это не поломка.
+REM Warnings do not affect the exit code: the diagnostics stay usable in CI,
+REM where ELECTRON_RUN_AS_NODE is set by the environment and is not a defect.
 set "WARNINGS=0"
 
 REM ---------- Node.js ----------
@@ -100,10 +107,12 @@ echo   No problems found, warnings: %WARNINGS%
 echo  --------------------------------------------
 echo.
 
-REM Код возврата отражает результат: 1 при найденных проблемах, иначе 0.
-REM pause только при интерактивном запуске: без аргументов. С ключом /nopause
-REM (или любым другим) скрипт не ждёт клавишу и годится для CI.
+REM Exit code reflects the result: 1 when problems were found, otherwise 0.
+REM pause only for interactive runs: no arguments. With /nopause (or any other
+REM argument) the script does not wait for a key and is safe for CI.
 set "EXIT_CODE=0"
 if not "%PROBLEMS%"=="0" set "EXIT_CODE=1"
 if "%~1"=="" pause
-endlocal & exit /b %EXIT_CODE%
+REM OLDCP was set before setlocal, so it survives endlocal. The line is expanded
+REM with the current values first, then the codepage of the caller is restored.
+endlocal & chcp %OLDCP% >nul & exit /b %EXIT_CODE%

@@ -4,8 +4,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execSync, execFileSync } = require('child_process');
+const { findForbidden, sha256File } = require('./release-rules');
 
 const rootDir = path.resolve(__dirname, '..');
+const pkg = require(path.join(rootDir, 'package.json'));
 const outDir = path.join(rootDir, 'WorkSpace');
 // Сборка идёт во временный каталог рядом и подменяет готовую папку в конце:
 // rmSync(outDir) в начале оставлял WorkSpace/ полуразобранным при любом сбое,
@@ -129,7 +131,73 @@ function swapInPlace() {
   }
 }
 
+/**
+ * Сверка Electron до сборки: версия из node_modules должна совпадать с
+ * package-lock.json, а распакованный dist — с версией пакета. Раньше рантайм
+ * копировался вообще без проверки, и расхождение (dist от прошлой версии
+ * после npm install) выяснялось уже у пользователя.
+ */
+function verifyElectronDist() {
+  const pkgFile = path.join(rootDir, 'node_modules', 'electron', 'package.json');
+  if (!fs.existsSync(pkgFile)) {
+    throw new Error('Нет node_modules/electron: выполните npm ci.');
+  }
+  const installed = JSON.parse(fs.readFileSync(pkgFile, 'utf8')).version;
+  const locked = JSON.parse(fs.readFileSync(path.join(rootDir, 'package-lock.json'), 'utf8')).packages?.[
+    'node_modules/electron'
+  ]?.version;
+  if (!locked) {
+    throw new Error('В package-lock.json нет записи node_modules/electron: обновите lock-файл.');
+  }
+  if (installed !== locked) {
+    throw new Error(
+      `Electron в node_modules (${installed}) не совпадает с package-lock.json (${locked}): выполните npm ci.`
+    );
+  }
+
+  const distVersionFile = path.join(electronDist, 'version');
+  if (!fs.existsSync(distVersionFile) || !fs.existsSync(path.join(electronDist, 'electron.exe'))) {
+    throw new Error('node_modules/electron/dist не распакован: выполните node node_modules/electron/install.js.');
+  }
+  // dist/version пишет установщик Electron: другое значение означает, что
+  // бинарник остался от предыдущей версии пакета.
+  const distVersion = fs.readFileSync(distVersionFile, 'utf8').trim();
+  if (distVersion !== installed) {
+    throw new Error(
+      `node_modules/electron/dist от версии ${distVersion}, а пакет electron — ${installed}: удалите dist и выполните npm ci.`
+    );
+  }
+  return installed;
+}
+
+/**
+ * Манифест рядом с артефактами: фиксирует версию рантайма (иначе её видно
+ * только в node_modules) и хеш архива, если он уже лежит в release/.
+ */
+function writeBuildManifest(electronVersion) {
+  const releaseDir = path.join(rootDir, 'release');
+  fs.mkdirSync(releaseDir, { recursive: true });
+  const zipName = `WorkSpace-${pkg.version}-win-x64.zip`;
+  const zipPath = path.join(releaseDir, zipName);
+  const hasArchive = fs.existsSync(zipPath);
+  const manifest = {
+    appVersion: pkg.version,
+    electronVersion,
+    archive: hasArchive ? zipName : null,
+    archiveSha256: hasArchive ? sha256File(zipPath) : null,
+    builtAt: new Date().toISOString(),
+  };
+  const manifestPath = path.join(releaseDir, 'build-manifest.json');
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  return manifestPath;
+}
+
 function main() {
+  // 0. Сверка рантайма до пятиминутной сборки
+  console.log('[0/5] Сверка node_modules/electron...');
+  const electronVersion = verifyElectronDist();
+  console.log(`      Electron ${electronVersion}: dist и package-lock.json совпадают`);
+
   // 1. Сборка Vite/Electron (иконка генерируется prebuild-хуком npm)
   console.log('[1/5] Компиляция фронтенда и главного процесса (npm run build)...');
   execSync('npm run build', { cwd: rootDir, stdio: 'inherit' });
@@ -149,6 +217,18 @@ function main() {
   const tempAsar = path.join(os.tmpdir(), `ws-app-${process.pid}.asar`);
   const asarCli = resolveAsarCli();
   try {
+    // Секреты ищутся в stage ДО asar pack: внутри app.asar удалять уже нечего,
+    // поэтому прежний список путей после упаковки был бесполезной защитой.
+    const leaks = findForbidden(stage);
+    if (leaks.length > 0) {
+      // Находку не вычищаем молча: упавшая сборка заметна, а «почищенный»
+      // перед упаковкой ключ — нет (он уже лежит в рабочем дереве).
+      throw new Error(
+        `В пакет попали запрещённые файлы (${leaks.join(', ')}). ` +
+          'Уберите их из источников сборки; правила — scripts/release-rules.js.'
+      );
+    }
+
     // asar запускается как JS-файл под node, без shell: путь к stage приходит из
     // mkdtempSync и может содержать пробелы — склейка в shell-строку на этом ломалась.
     execFileSync(process.execPath, [asarCli, 'pack', stage, tempAsar], { stdio: 'inherit' });
@@ -171,23 +251,6 @@ function main() {
     for (const file of fs.readdirSync(resourcesDir)) {
       if (file.startsWith('app.asar.bak-')) {
         try { fs.unlinkSync(path.join(resourcesDir, file)); } catch {}
-      }
-    }
-
-    // Никакие локальные секреты (secrets.local.ps1, ai-settings.json) НЕ должны попадать в сборку
-    const sensitiveFiles = [
-      path.join(appDir, 'secrets.local.ps1'),
-      path.join(tmpOutDir, 'secrets.local.ps1'),
-      path.join(appDir, 'ai-settings.json'),
-      path.join(tmpOutDir, 'ai-settings.json'),
-      path.join(appDir, 'gdrive.json'),
-      path.join(tmpOutDir, 'gdrive.json'),
-      path.join(appDir, 'workspace-session.json'),
-      path.join(tmpOutDir, 'workspace-session.json'),
-    ];
-    for (const file of sensitiveFiles) {
-      if (fs.existsSync(file)) {
-        try { fs.unlinkSync(file); } catch {}
       }
     }
 
@@ -230,6 +293,8 @@ function main() {
   // Готовую папку подменяем целиком: до этого момента WorkSpace/ не тронута.
   swapInPlace();
 
+  const manifestPath = writeBuildManifest(electronVersion);
+
   console.log('\n========================================================');
   console.log('  СБОРКА УСПЕШНО ЗАВЕРШЕНА В ПАПКУ WorkSpace');
   console.log('========================================================');
@@ -237,6 +302,7 @@ function main() {
   console.log(`Загрузчик:    ${path.join(outDir, 'WorkSpace.exe')} (${launcherSize} KB)`);
   console.log(`Приложение:   ${path.join(outDir, 'app', 'WorkSpace.exe')}`);
   console.log(`Бандл asar:   ${path.join(outDir, 'app', 'resources', 'app.asar')} (${asarSize} MB)`);
+  console.log(`Манифест:     ${manifestPath} (Electron ${electronVersion})`);
   console.log('========================================================\n');
 }
 

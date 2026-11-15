@@ -6,7 +6,7 @@ import { generateDocxBase64, generateExcelBase64 } from '../services/aiActions';
 import { htmlToDocxBase64 } from '../lib/docx';
 import { BLANK_PPTX_BASE64 } from '../lib/pptxTemplate';
 import { docxPathFor, extractLegacyDocText, plainTextToHtml } from '../lib/legacyDoc';
-import { dropSnapshotsForPath } from '../services/autosave';
+import { dropSnapshotsForPath, noteClosedPath, noteOpenedPath } from '../services/autosave';
 import {
   type ConversionFormat,
   convertDocument,
@@ -61,6 +61,40 @@ export function useWorkspace() {
     activeTabIdRef.current = activeTabId;
     secondaryTabIdRef.current = secondaryTabId;
   }, [tabs, activeTabId, secondaryTabId]);
+
+  /**
+   * Вкладки, которые пользователь действительно правил руками.
+   *
+   * Редакторы вызывают `onChange` и программно — Word/Excel ресериализуют
+   * документ сразу после открытия, — поэтому снятие предпросмотра привязано к
+   * вводу, а не к факту изменения содержимого: иначе вкладка, открытая одиночным
+   * кликом, становилась постоянной без участия пользователя.
+   */
+  const userEditedTabsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const markEdited = (event: Event) => {
+      if (!event.isTrusted) return;
+      const target = event.target as HTMLElement | null;
+      if (!target || typeof target.closest !== 'function') return;
+      if (!target.closest('[contenteditable="true"], .monaco-editor')) return;
+      const tabId = activeTabIdRef.current;
+      if (tabId) userEditedTabsRef.current.add(tabId);
+    };
+    const events = ['input', 'paste', 'cut', 'drop', 'keydown'];
+    for (const name of events) document.addEventListener(name, markEdited, true);
+    return () => {
+      for (const name of events) document.removeEventListener(name, markEdited, true);
+    };
+  }, []);
+
+  // Активная вкладка обязана существовать: два закрытия в одном тике иначе
+  // оставляли activeTabId на уже закрытой вкладке.
+  useEffect(() => {
+    if (!activeTabId) return;
+    if (tabs.some((tab) => tab.id === activeTabId)) return;
+    setActiveTabId(tabs[0]?.id ?? '');
+  }, [tabs, activeTabId]);
   /** Открытия файлов в процессе: защита от двойного клика и гонок. */
   const pendingOpenRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const previewOpenSeqRef = useRef(0);
@@ -408,6 +442,9 @@ export function useWorkspace() {
             isPreview: preview,
           };
           setTabs((prev) => [...prev, tab]);
+          // Файл открыли заново: запрет на снимок, оставленный закрытием
+          // вкладки, больше не действует.
+          noteOpenedPath(tab.path);
           openInPane(tab.id);
           return tab.id;
         }
@@ -431,6 +468,7 @@ export function useWorkspace() {
           };
 
           setTabs((prev) => [...prev, tab]);
+          noteOpenedPath(tab.path);
           openInPane(tab.id);
           return tab.id;
         } catch (err) {
@@ -452,29 +490,32 @@ export function useWorkspace() {
   );
 
   const closeTab = useCallback((tabId: string) => {
-    const prev = tabsRef.current;
-    const idx = prev.findIndex((t) => t.id === tabId);
+    const tabsBefore = tabsRef.current;
+    const idx = tabsBefore.findIndex((t) => t.id === tabId);
     if (idx === -1) return;
-    const closing = prev[idx];
-    const next = prev.filter((t) => t.id !== tabId);
+    const closing = tabsBefore[idx];
+    const rest = tabsBefore.filter((t) => t.id !== tabId);
     const nextActiveId =
-      activeTabIdRef.current === tabId
-        ? next[Math.min(idx, next.length - 1)]?.id ?? ''
-        : activeTabIdRef.current;
+      activeTabIdRef.current === tabId ? rest[Math.min(idx, rest.length - 1)]?.id ?? '' : activeTabIdRef.current;
 
-    // Выбор следующей активной вкладки — снаружи апдейтера: апдейтер должен
-    // оставаться чистым, иначе в StrictMode побочный вызов выполнится дважды.
-    setTabs(next);
+    // Удаление — только функциональным апдейтером: `next`, собранный из ref,
+    // отстаёт на коммит, из-за чего второй closeTab в одном тике воскрешал
+    // закрытую вкладку и терял уже поставленные в очередь апдейтеры.
+    setTabs((prev) => (prev.some((t) => t.id === tabId) ? prev.filter((t) => t.id !== tabId) : prev));
     setActiveTabId(nextActiveId);
     setSecondaryTabId((currentSecondary) => {
-      if (currentSecondary === tabId) {
-        const fallback = next[0]?.id ?? '';
-        return fallback === nextActiveId ? '' : fallback;
+      if (currentSecondary !== tabId) {
+        return currentSecondary === nextActiveId ? '' : currentSecondary;
       }
-      return currentSecondary === nextActiveId ? '' : currentSecondary;
+      const fallback = rest[0]?.id ?? '';
+      return fallback === nextActiveId ? '' : fallback;
     });
     // Черновик закрытой вкладки иначе «восстановится» при следующем запуске.
-    if (closing.isDirty) void dropSnapshotsForPath(closing.path);
+    // Запрет ставится до удаления снимков: запись снимка могла идти параллельно.
+    if (closing.isDirty) {
+      noteClosedPath(closing.path);
+      void dropSnapshotsForPath(closing.path);
+    }
   }, []);
 
   /** Редактирование содержимого вкладки с пересчётом флага несохранённых изменений. */
@@ -486,12 +527,16 @@ export function useWorkspace() {
         // читает сам редактор. Как только редактор отдал данные, вкладка
         // становится base64 — иначе сохранение считает файл доступным только для чтения.
         const switchToBase64 = t.encoding === 'path' && Boolean(content) && (t.type === 'pdf' || t.type === 'binary');
+        // Первый настоящий ввод снимает предпросмотр: иначе saveTab отказывает,
+        // а клик по дереву теряет черновик. Программное изменение содержимого
+        // (ресериализация при открытии) предпросмотр не снимает.
+        const clearPreview =
+          t.isPreview && content !== t.initialContent && userEditedTabsRef.current.has(t.id);
         return {
           ...t,
           content,
           encoding: switchToBase64 ? ('base64' as const) : t.encoding,
-          // Первая правка снимает предпросмотр: иначе saveTab отказывает, а клик по дереву теряет черновик.
-          isPreview: content === t.initialContent ? t.isPreview : false,
+          isPreview: clearPreview ? false : t.isPreview,
           isDirty: content !== t.initialContent,
         };
       })
@@ -551,6 +596,9 @@ export function useWorkspace() {
             flash(`Сохранено как ${baseName(target)} — исходный .doc не изменён`);
             return true;
           }
+          // Начало записи: снимки, сделанные позже, содержат правки, которых
+          // в записанном файле нет, и должны остаться.
+          const writeStartedAt = Date.now();
           await fileSystemService.writeFile(tab.path, written, tab.encoding);
           const renamed = tabsRef.current.find((t) => t.id === tabId);
           // Путь сменился во время записи: пишем заново по актуальному.
@@ -567,7 +615,7 @@ export function useWorkspace() {
                 : t
             )
           );
-          await dropSnapshotsForPath(tab.path);
+          await dropSnapshotsForPath(tab.path, writeStartedAt);
           flash(`Сохранено: ${tab.name}`);
           return true;
         } catch (err) {

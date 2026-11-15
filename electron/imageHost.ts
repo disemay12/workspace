@@ -317,9 +317,14 @@ export function registerImageHosts(): void {
   ipcMain.handle(
     'imagehost:open',
     async (_event, hostId: string, filePaths: string[], options: ImageHostOptions = {}) => {
+      // Идентификатор приходит из рендерера: `constructor`/`__proto__` есть в
+      // любом объекте, поэтому проверяем собственный ключ, а не истинность.
+      if (!Object.prototype.hasOwnProperty.call(IMAGE_HOSTS, hostId)) {
+        const result: ImageHostResult = { success: false, skipped: [] };
+        return { ...result, error: 'Неизвестный сайт' };
+      }
       const host = IMAGE_HOSTS[hostId];
       const result: ImageHostResult = { success: false, skipped: [] };
-      if (!host) return { ...result, error: 'Неизвестный сайт' };
 
       const existing = (filePaths || []).filter((file) => file && fs.existsSync(file));
       if (existing.length === 0) return { ...result, error: 'Не выбраны изображения' };

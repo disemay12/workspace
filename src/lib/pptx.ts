@@ -20,6 +20,18 @@ const SLIDE_CT =
 const NOTES_CT =
   'application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml';
 
+/**
+ * Операция не смогла ничего изменить: нет части слайда или его r:id. Раньше
+ * функция молча возвращала исходный base64, и вызывающий считал удаление или
+ * перенос успешным.
+ */
+export class PptxNoopError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PptxNoopError';
+  }
+}
+
 export interface PptxTextShape {
   shapeId: string;
   name: string;
@@ -169,7 +181,7 @@ export async function deletePptxSlide(base64: string, index: number): Promise<st
   const zip = await loadZip(base64);
   const presentation = await readPresentation(zip);
   const part = presentation.slideParts[index];
-  if (!part) return base64;
+  if (!part) throw new PptxNoopError(`Слайд ${index + 1} не найден в презентации`);
 
   let presentationXml = (await zip.file('ppt/presentation.xml')?.async('string')) ?? '';
   let relsXml =
@@ -180,7 +192,9 @@ export async function deletePptxSlide(base64: string, index: number): Promise<st
   // соседний слайд.
   const relId = slideRelId(relsXml, part);
   // Без r:id часть уже удалена, а ссылка осталась — получался битый пакет.
-  if (!relId) return base64;
+  if (!relId) {
+    throw new PptxNoopError(`У слайда ${index + 1} нет r:id: удаление отменено`);
+  }
   const target = findSlideIdEntry(presentationXml, relId) ?? '';
   if (target) presentationXml = presentationXml.replace(target, '');
   // Парный </Relationship> тоже возможен — шаблон не должен зависеть от '/>'.
@@ -208,12 +222,12 @@ export async function movePptxSlide(
   const zip = await loadZip(base64);
   const presentation = await readPresentation(zip);
   const fromPart = presentation.slideParts[from];
-  if (!fromPart) return base64;
+  if (!fromPart) throw new PptxNoopError(`Слайд ${from + 1} не найден в презентации`);
   const file = zip.file('ppt/presentation.xml');
-  if (!file) return base64;
+  if (!file) throw new PptxNoopError('В пакете нет ppt/presentation.xml');
   let xml = await file.async('string');
   const listMatch = /<p:sldIdLst\b[^>]*>([\s\S]*?)<\/p:sldIdLst>/.exec(xml);
-  if (!listMatch) return base64;
+  if (!listMatch) throw new PptxNoopError('В ppt/presentation.xml нет списка слайдов');
 
   const relsXml =
     (await zip.file('ppt/_rels/presentation.xml.rels')?.async('string')) ?? '';
@@ -228,7 +242,9 @@ export async function movePptxSlide(
     if (part && zip.file(normalizeSlideTarget(part))) visibleRaw.push(index);
   });
   const fromRaw = visibleRaw[from];
-  if (fromRaw === undefined) return base64;
+  if (fromRaw === undefined) {
+    throw new PptxNoopError(`Слайд ${from + 1} не связан с частью пакета: перенос отменён`);
+  }
 
   // Порядок строим по индексам entries: сравнение строк выбрасывало оба
   // слайда с одинаковым p:sldId.
@@ -1015,7 +1031,7 @@ function appendRelationship(
   type: string,
   target: string
 ): string {
-  const entry = `<Relationship Id="${id}" Type="${type}" Target="${target}"/>`;
+  const entry = `<Relationship Id="${id}" Type="${escapeXml(type)}" Target="${escapeXml(target)}"/>`;
   if (!relsXml) {
     return (
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +

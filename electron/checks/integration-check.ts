@@ -12,6 +12,7 @@ const os = require('os');
 const iconv = require('iconv-lite');
 const { registerCommonCheckIpc } = require('./common-ipc');
 const { createCheckSandbox } = require('./sandbox');
+const { loadUpdateInfoContract } = require('./updateContract');
 
 
 /** Корень проекта — поиск каталога с package.json и dist/ (устойчиво к глубине). */
@@ -472,17 +473,22 @@ app.whenReady().then(async () => {
     const apiShape = await call(`return { keys: Object.keys(${api}), count: Object.keys(${api}).length }`);
     step('preloadApiSurface', apiShape);
 
-    /* 15. Форма ответов обновления и диагностики: заглушка common-ipc обязана
-     * совпадать с боевыми обработчиками, иначе проверка проходит на пустом ответе. */
+    /* 15. Форма ответов обновления и диагностики: ответ сверяется с контрактом
+     * (electron/updateInfo.ts), а не с литералами, зашитыми в заглушку
+     * common-ipc — иначе заглушка проверяла саму себя. */
     const appVersion = await call(`return await ${api}.getAppVersion()`);
     const updateInfo = await call(`return await ${api}.checkForUpdates()`);
     const diagnostics = await call(`return await ${api}.diagnosticsReport()`);
+    const expectedUnsupported = loadUpdateInfoContract().unsupportedUpdateInfo(appVersion);
     step('updateCheckShape', {
       versionFromPackage:
         typeof appVersion === 'string' && /^\d+\.\d+\.\d+/.test(appVersion) && appVersion !== '0.0.0-check',
-      supportedFalse: updateInfo.success === true && updateInfo.supported === false,
-      currentVersionMatches: updateInfo.currentVersion === appVersion,
-      errorTextPresent: typeof updateInfo.error === 'string' && updateInfo.error.length > 0,
+      // Ответ целиком: success/supported/currentVersion/error и их порядок.
+      unsupportedMatchesContract:
+        JSON.stringify(updateInfo) === JSON.stringify(expectedUnsupported),
+      currentVersionMatches: updateInfo?.currentVersion === appVersion,
+      // Диагностика: что реально пришло в поле ошибки.
+      errorSnippet: typeof updateInfo?.error === 'string' ? updateInfo.error.slice(0, 120) : '',
       diagnosticsSuccess: diagnostics.success === true && Boolean(diagnostics.report),
       diagnosticsVersion: Boolean(diagnostics.report) && diagnostics.report.app?.version === appVersion,
       diagnosticsShape:

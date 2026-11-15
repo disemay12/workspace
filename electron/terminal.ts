@@ -9,6 +9,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { getWorkspaceRoot, isInsidePath } from './fsGuard';
 
 interface TerminalSession {
   id: string;
@@ -72,12 +73,21 @@ function resolveShell(requested?: string): string | null {
 
 /**
  * Терминал даёт рендереру полноценную оболочку: при XSS это исполнение любых
- * команд без диалога. Решение запоминается на сеанс и запрашивается один раз.
+ * команд без диалога. Поэтому ответ спрашивается на каждое окно и живёт
+ * ограниченное время: разрешение, выданное при открытии терминала, не должно
+ * доставаться инъекции в документ через полчаса без нового вопроса.
  */
-let terminalAllowed: boolean | null = null;
+const TERMINAL_GRANT_TTL_MS = 15 * 60 * 1000;
+let terminalGrant: { senderId: number; allowed: boolean; expiresAt: number } | null = null;
 
-async function confirmTerminal(windowGetter: () => BrowserWindow | null): Promise<boolean> {
-  if (terminalAllowed !== null) return terminalAllowed;
+async function confirmTerminal(
+  windowGetter: () => BrowserWindow | null,
+  senderId: number
+): Promise<boolean> {
+  const now = Date.now();
+  if (terminalGrant && terminalGrant.senderId === senderId && terminalGrant.expiresAt > now) {
+    return terminalGrant.allowed;
+  }
   const win = windowGetter();
   const options = {
     type: 'question' as const,
@@ -91,21 +101,32 @@ async function confirmTerminal(windowGetter: () => BrowserWindow | null): Promis
     cancelId: 0,
   };
   const answer = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options);
-  terminalAllowed = answer.response === 1;
-  return terminalAllowed;
+  const allowed = answer.response === 1;
+  // Отказ тоже запоминается, но на то же время: иначе инъекция в документ
+  // заваливает пользователя диалогами, а он не сможет разрешить терминал,
+  // не перезапустив приложение.
+  terminalGrant = { senderId, allowed, expiresAt: now + TERMINAL_GRANT_TTL_MS };
+  return allowed;
 }
 
 export function registerTerminal(windowGetter: () => BrowserWindow | null): void {
-  ipcMain.handle('terminal:create', async (_event, req?: { id?: string; cwd?: string; shell?: string }) => {
+  ipcMain.handle('terminal:create', async (event, req?: { id?: string; cwd?: string; shell?: string }) => {
     const id = req?.id || 'term_' + Math.random().toString(36).substring(2, 9);
     const requestedCwd = req?.cwd;
-    const cwd = requestedCwd && fs.existsSync(requestedCwd) ? requestedCwd : process.cwd();
+    // Рабочий каталог запрашивает интерфейс: вне открытой папки оболочка
+    // стартовала бы в произвольном месте, поэтому такой запрос подменяем
+    // корнем рабочей папки.
+    const root = getWorkspaceRoot();
+    const cwd =
+      requestedCwd && fs.existsSync(requestedCwd) && (!root || isInsidePath(requestedCwd, root))
+        ? requestedCwd
+        : root || process.cwd();
     const isWin = os.platform() === 'win32';
     const shellExe = resolveShell(req?.shell);
     if (!shellExe) {
       return { success: false, error: 'Недопустимая оболочка. Доступны: powershell, pwsh, cmd, bash, sh, zsh, wsl' };
     }
-    if (!(await confirmTerminal(windowGetter))) {
+    if (!(await confirmTerminal(windowGetter, event.sender.id))) {
       return { success: false, error: 'Запуск терминала запрещён пользователем' };
     }
 

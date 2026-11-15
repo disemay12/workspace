@@ -23,17 +23,71 @@ function resolveProjectRoot() {
   return path.join(__dirname, '..');
 }
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(ROOT, 'test-workspace');
+// Свой каталог на прогон: раньше набор читал файлы render-check из общего
+// ROOT/test-workspace, поэтому зависел от порядка запусков и от чужих фикстур.
+const { createCheckSandbox } = require('./sandbox');
+const SANDBOX = createCheckSandbox('feature', ROOT);
 const out: any = {};
 
 app.disableHardwareAcceleration();
 
+/** Падение до основного try должно попадать в отчёт, а не выглядеть зависанием. */
+function failFast(reason) {
+  out.fatal = (reason as Error)?.stack || String(reason);
+  try {
+    fs.writeFileSync(path.join(ROOT, 'feature-check.json'), JSON.stringify(out, null, 2), 'utf-8');
+  } catch {
+    // даже запись диагностики может не удаться
+  }
+  app.exit(1);
+}
+process.on('unhandledRejection', failFast);
+process.on('uncaughtException', failFast);
+
+/**
+ * Собственные фикстуры: поиск ищет «ERROR» в server.log, Quick Open — имена
+ * файлов, поэтому набор не может рассчитывать на файлы другого набора.
+ */
+function createFixtures() {
+  fs.writeFileSync(
+    path.join(SANDBOX, 'server.log'),
+    '2026-01-01 INFO Start\n2026-01-01 ERROR Failed to connect\n2026-01-01 FATAL Shutdown\n',
+    'utf-8'
+  );
+  fs.writeFileSync(
+    path.join(SANDBOX, 'Заметки.md'),
+    '# Заметки\n\nТекст для Quick Open и поиска.\n',
+    'utf-8'
+  );
+  fs.writeFileSync(
+    path.join(SANDBOX, 'config.json'),
+    JSON.stringify({ name: 'workspace', version: '1.0.0' }, null, 2),
+    'utf-8'
+  );
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.whenReady().then(async () => {
+  createFixtures();
+
   // Общие каналы (избранное, буфер обмена, секреты) — иначе рендерер падает
   // на 'fs:getFavorites' и проверки темы/поиска не доходят до интерфейса.
-  registerCommonCheckIpc({ sandbox: SANDBOX });
+  registerCommonCheckIpc({
+    sandbox: SANDBOX,
+    // Автопроверка обновлений должна получить доступную версию: сценарий 6
+    // проверяет, что баннер появляется сам, без нажатия «Проверить обновление».
+    updateCheck: {
+      success: true,
+      supported: true,
+      currentVersion: '1.0.0',
+      latestVersion: '9.9.9',
+      available: true,
+      assetName: 'WorkSpace-9.9.9-win-x64.zip',
+      assetUrl: 'https://github.com/example/workspace/releases/download/v9.9.9/WorkSpace-9.9.9-win-x64.zip',
+      assetDigest: 'sha256:' + '0'.repeat(64),
+    },
+  });
 
   ipcMain.handle('window:isMaximized', () => false);
   ipcMain.handle('window:minimize', () => undefined);
@@ -319,6 +373,31 @@ app.whenReady().then(async () => {
         };
       })()
     `);
+
+    /* ---- 6. Баннер обновления появляется сам ---- */
+    // Ни одного клика по «Проверить обновление»: версия приходит из заглушки
+    // update:check, и рендерер обязан показать баннер после автопроверки.
+    out.updateBanner = await win.webContents.executeJavaScript(`
+      (async () => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await new Promise(r => setTimeout(r, 300));
+        const deadline = Date.now() + 20000;
+        let banner = null;
+        while (Date.now() < deadline) {
+          banner = document.querySelector('[data-update-banner]');
+          if (banner) break;
+          await new Promise(r => setTimeout(r, 250));
+        }
+        const buttons = banner ? [...banner.querySelectorAll('button')] : [];
+        return {
+          appeared: Boolean(banner),
+          mentionsVersion: banner ? banner.textContent.includes('9.9.9') : false,
+          hasUpdateButton: buttons.some((b) => /Обновить/.test(b.textContent || '')),
+          text: banner ? banner.textContent.replace(/\\s+/g, ' ').trim().slice(0, 120) : '',
+        };
+      })()
+    `);
+    delete out.updateBanner.text;
 
     out.errors = [];
   } catch (err) {

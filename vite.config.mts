@@ -12,6 +12,14 @@ import path from 'path';
  * React-refresh вставляют свои инлайн-скрипты. В сборке каждый инлайн-скрипт
  * заменяется своим sha256, и 'unsafe-inline' из script-src убирается — тогда
  * `javascript:`-ссылки и инъекция скрипта в документ не исполняются вовсе.
+ *
+ * `'unsafe-eval'` в script-src не нужен: Monaco берётся ESM-сборкой
+ * (src/monacoSetup.ts), worker'ы подключаются через worker-src 'self' blob:.
+ * Директиву убрали и проверили полным прогоном `npm run checks` (Monaco,
+ * Excel/Word/PPT/PDF, стриминг AI) — наборы проходят без неё.
+ *
+ * Плагин fail-closed: любая ситуация, когда после подстановки хешей
+ * 'unsafe-inline' в script-src всё ещё есть, роняет сборку.
  */
 function cspInlineHashes(): Plugin {
   return {
@@ -29,16 +37,24 @@ function cspInlineHashes(): Plugin {
         if (!body.trim()) continue;
         hashes.push(`'sha256-${crypto.createHash('sha256').update(body, 'utf8').digest('base64')}'`);
       }
-      if (hashes.length === 0) return html;
+      // Fail-closed: раньше при пустом списке HTML возвращался как есть и
+      // 'unsafe-inline' оставался в script-src, то есть защита исчезала молча
+      // при малейшей правке разметки.
+      if (hashes.length === 0) {
+        throw new Error('CSP: в index.html не найдено ни одного инлайн-скрипта — хешировать нечего');
+      }
 
       const replaced = html.replace(
         /(script-src[^;"]*)'unsafe-inline'/,
         (_all, prefix: string) => `${prefix}${hashes.join(' ')}`
       );
       if (replaced === html) {
-        // CSP изменился — значит directive не найден; тихо оставлять
-        // 'unsafe-inline' нельзя, иначе защита исчезает незаметно.
-        throw new Error('CSP: не удалось заменить unsafe-inline в script-src');
+        // Директива не найдена: подставлять хеши некуда, а inline-скрипты
+        // остались бы без разрешения — падаем, чтобы это не уехало в релиз.
+        throw new Error("CSP: в script-src не найден 'unsafe-inline' — разметка CSP изменилась");
+      }
+      if (/script-src[^;"]*'unsafe-inline'/.test(replaced)) {
+        throw new Error("CSP: 'unsafe-inline' остался в script-src — хеши инлайн-скриптов не подставлены");
       }
       return replaced;
     },

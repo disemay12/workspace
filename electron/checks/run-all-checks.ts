@@ -64,6 +64,37 @@ function readLock() {
 }
 
 /**
+ * Возраст файла блокировки в мс; null — mtime прочитать не удалось.
+ * Пустой или битый лок — это в том числе окно между захватом файла (wx) и
+ * записью pid, поэтому свежий лок нельзя считать мёртвым: иначе два прогона
+ * одновременно пересобирают dist/ и перезаписывают одни и те же *-check.json.
+ */
+function lockAgeMs() {
+  try {
+    return Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/** Лок, который моложе этого возраста, не трогаем: pid мог ещё не записаться. */
+const LOCK_GRACE_MS = 10_000;
+
+/** Запись pid через rename: читатель видит либо прошлое состояние, либо полный json. */
+function writeLockAtomic(lock) {
+  const tmp = `${LOCK_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(lock, null, 2), 'utf-8');
+  try {
+    fs.renameSync(tmp, LOCK_FILE);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
+}
+
+/**
  * Два одновременных прогона пересобирают dist/ и переписывают одни и те же
  * *-check.json — ленивый импорт чанка Vite падал у соседа. Поэтому запуск
  * сериализуется: файл создаётся эксклюзивно (wx), а блокировка мёртвого
@@ -73,10 +104,9 @@ function acquireLock() {
   const lock = { pid: process.pid, startedAt: new Date().toISOString(), root: ROOT };
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fd = fs.openSync(LOCK_FILE, 'wx');
-      fs.writeSync(fd, JSON.stringify(lock, null, 2));
-      fs.closeSync(fd);
-      return lock;
+      // Эксклюзивное создание — единственный неделимый «захват»: второй
+      // процесс получает EEXIST и до записи содержимого не доходит.
+      fs.closeSync(fs.openSync(LOCK_FILE, 'wx'));
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       const existing = readLock();
@@ -86,11 +116,30 @@ function acquireLock() {
             `дождитесь завершения или удалите ${LOCK_FILE}, если процесс уже убит`
         );
       }
+      const age = lockAgeMs();
+      if (age === null || age < LOCK_GRACE_MS) {
+        throw new Error(
+          `уже идёт прогон (${LOCK_FILE} создан ${age === null ? 'только что' : `${Math.round(age / 1000)} с назад`}, ` +
+            `pid не записан): дождитесь завершения или удалите файл вручную`
+        );
+      }
       // Блокировка осталась от упавшего прогона — снимаем и пробуем ещё раз.
       try {
         fs.unlinkSync(LOCK_FILE);
       } catch {}
+      continue;
     }
+    try {
+      writeLockAtomic(lock);
+    } catch (err) {
+      // Захватили, но записать не смогли: пустой лок иначе блокировал бы
+      // следующий прогон до истечения LOCK_GRACE_MS.
+      try {
+        fs.unlinkSync(LOCK_FILE);
+      } catch {}
+      throw err;
+    }
+    return lock;
   }
   throw new Error(`не удалось захватить ${LOCK_FILE}`);
 }
@@ -150,17 +199,19 @@ function suiteProfileDir(script: string): string {
 
 /** Electron порождает дочерние процессы: один kill(pid) оставлял их жить. */
 function killTree(pid) {
-  if (!pid) return;
+  if (!pid) return '';
   if (process.platform === 'win32') {
     try {
       execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
         stdio: 'ignore',
         windowsHide: true,
       });
-    } catch {
-      // Процесс уже завершился сам.
+    } catch (err) {
+      // Обычно процесс уже завершился сам, но причину не глушим: она попадает
+      // в сообщение о таймауте, иначе разбираться в зависании не с чем.
+      return String((err as Error).message || 'taskkill не смог завершить процесс');
     }
-    return;
+    return '';
   }
   try {
     process.kill(-pid, 'SIGKILL');
@@ -169,9 +220,21 @@ function killTree(pid) {
       process.kill(pid, 'SIGKILL');
     } catch {}
   }
+  return '';
 }
 
-/** Запуск с таймаутом и убийством дерева процессов: таймаут не должен оставлять Electron живым. */
+/**
+ * Запуск с таймаутом и убийством дерева процессов: таймаут не должен оставлять
+ * Electron живым.
+ *
+ * Ждать только 'close' нельзя: это событие приходит после закрытия stdio, а
+ * орфанные потомки держат pipe — промис не завершался никогда, и прогон висел
+ * до внешнего убийства. Код выхода известен уже на 'exit', поэтому результат
+ * отдаётся по нему, а на дочитывание stderr даётся короткая пауза.
+ */
+const EXEC_KILL_ESCALATION_MS = 5000;
+const EXEC_DRAIN_MS = 300;
+
 function exec(
   cmd: string,
   args: string[],
@@ -192,9 +255,48 @@ function exec(
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let killReason = '';
+    let settled = false;
+    let killTimer: NodeJS.Timeout | null = null;
+    let drainTimer: NodeJS.Timeout | null = null;
+
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (drainTimer) clearTimeout(drainTimer);
+      const tail = stderr.trim().split('\n').slice(-3).join(' | ').slice(0, 400);
+      if (timedOut) {
+        reject(
+          new Error(
+            `таймаут ${EXEC_TIMEOUT_MS} мс: ${cmd}${killReason ? ` (kill: ${killReason})` : ''}${
+              tail ? ` (${tail})` : ''
+            }`
+          )
+        );
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`${path.basename(cmd)}: код ${code}${tail ? `: ${tail}` : ''}`));
+        return;
+      }
+      resolve({ stdout, stderr, status: code });
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree(child.pid);
+      killReason = killTree(child.pid);
+      // taskkill мог не добрать потомков, которые держат pipe: второй шаг бьёт
+      // по процессу напрямую, и ошибка таймаута всё равно уходит наверх, а не
+      // теряется в незавершённом промисе.
+      killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Процесс уже завершился — 'exit' вот-вот придёт.
+        }
+      }, EXEC_KILL_ESCALATION_MS);
     }, EXEC_TIMEOUT_MS);
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
@@ -203,22 +305,17 @@ function exec(
       stderr += chunk;
     });
     child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       reject(err);
     });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const tail = stderr.trim().split('\n').slice(-3).join(' | ').slice(0, 400);
-      if (timedOut) {
-        reject(new Error(`таймаут ${EXEC_TIMEOUT_MS} мс: ${cmd}${tail ? ` (${tail})` : ''}`));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`${path.basename(cmd)}: код ${code}${tail ? `: ${tail}` : ''}`));
-        return;
-      }
-      resolve({ stdout, stderr, status: code });
+    // Код выхода известен здесь; 'close' ждёт закрытия stdio и может не прийти.
+    child.on('exit', (code) => {
+      drainTimer = setTimeout(() => finish(code), EXEC_DRAIN_MS);
     });
+    child.on('close', (code) => finish(code));
   });
 }
 
@@ -331,6 +428,8 @@ async function main() {
       // Запускается по вложенному пути: импортирует src/services и src/lib.
       'electron/checks/conversion-check.js',
       'v11-check.js',
+      // Боевые обработчики aiSettings и preload: поднимает окно в своём профиле.
+      'key-migration-check.js',
     ];
     for (const f of needed) {
       if (!fs.existsSync(path.join(ROOT, 'dist-electron', f))) {
@@ -397,6 +496,10 @@ async function main() {
     // процесс падал диалогом ошибки и набор «висел» до таймаута.
     ['Конвертация форматов и ширины Excel', 'electron/checks/conversion-check.js', 'conversion-check.json'],
     ['Фото-хостинги, зум видео, Google OAuth', 'v11-check.js', 'v11-check.json'],
+    // Один из двух CRITICAL прошлого ревью: перенос ключей API из localStorage
+    // в профиль. Набор поднимает окно в отдельном профиле и проверяет, что
+    // переживают ключи ВСЕХ провайдеров, а не только активного.
+    ['Перенос ключей API в профиль', 'key-migration-check.js', 'key-migration-check.json'],
   ];
 
   // Наборы, которые ходят в реальный AI-endpoint. Раньше они подключались самим

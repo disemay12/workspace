@@ -49,7 +49,7 @@ export interface AlbumResponse {
 
 const USER_AGENT = 'WorkSpace/1.0';
 
-/** ~100 МБ в base64: больше не имеет смысла гнать через IPC в память. */
+/** ~140 МБ в base64 (≈100 МБ файла): больше не имеет смысла гнать через IPC в память. */
 const MAX_UPLOAD_BASE64_CHARS = 140 * 1024 * 1024;
 
 function blobFrom(base64: string, mime: string): Blob {

@@ -7,14 +7,12 @@ name: CI
 
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
   push:
     branches: [master]
-    paths-ignore:
-      - "docs/**"
   workflow_dispatch:
 
+# Только чтение: CI ничего не публикует и не пишет в репозиторий, поэтому
+# токен не должен уметь больше.
 permissions:
   contents: read
 
@@ -27,18 +25,32 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
+      # Мажорные теги, а не 40-символьный SHA: пиновка по SHA — следующий шаг,
+      # здесь её не сделать без сети (сверить SHA коммитов нечем).
+      # TODO: заменить @v4 на @<sha> и добавить строку "# vX.Y.Z" в комментарий.
       - uses: actions/checkout@v4
+        with:
+          # Креденшелы в .git/config не нужны: дальше никто не пушит.
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
 
+      # Версия и ссылка на архив в docs/index.html не должны расходиться с
+      # package.json: --check — это dry-run без записи, расхождение = код 1.
+      # Релизного архива в CI нет, поэтому размер сверяется только при его
+      # наличии (см. предупреждение в выводе шага).
+      - name: Site release check (docs/index.html vs package.json)
+        run: node scripts/sync-site-release.js --check
+
       # npm ci вместо npm install: lock-файл обязателен, дерево зависимостей
       # должно совпадать с локальным.
       - name: Install dependencies
         run: npm ci
 
+      # Оба конфига: tsconfig.json (renderer) и tsconfig.electron.json (main).
       - name: Typecheck (renderer + main)
         run: npm run typecheck
 

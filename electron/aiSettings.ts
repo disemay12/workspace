@@ -151,6 +151,8 @@ export function registerAiSettings(): void {
       settings,
       keys,
       keyErrors,
+      // Имена провайдеров без значений: интерфейсу нужен индикатор «ключ есть».
+      keyProviders: Object.keys(data.keys ?? {}),
       encryptionUnavailable: !safeStorage.isEncryptionAvailable(),
     };
   });

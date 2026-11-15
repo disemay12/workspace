@@ -19,9 +19,18 @@ interface Props {
   onNotify?: (message: string) => void;
   /** Сохраняет несохранённые файлы перед перезапуском. false — отменить. */
   onBeforeUpdate?: () => Promise<boolean>;
+  /** Результат автопроверки при запуске: панель не просит проверять заново. */
+  initialUpdate?: UpdateCheckResult | null;
+  /** Проверка через общий хук: найденная версия сразу попадает в баннер. */
+  onCheckUpdates?: () => Promise<UpdateCheckResult | null>;
 }
 
-export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) => {
+export const SystemSettings: React.FC<Props> = ({
+  onNotify,
+  onBeforeUpdate,
+  initialUpdate,
+  onCheckUpdates,
+}) => {
   const [installed, setInstalled] = useState(false);
   const [exePath, setExePath] = useState('');
   const [loading, setLoading] = useState(true);
@@ -35,7 +44,7 @@ export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) =>
   const [shortcutPath, setShortcutPath] = useState('');
   const [shortcutBusy, setShortcutBusy] = useState(false);
   const [appVersion, setAppVersion] = useState('');
-  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(initialUpdate ?? null);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
@@ -96,15 +105,27 @@ export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) =>
     });
   }, []);
 
+  // Автопроверка может завершиться уже после открытия настроек: показываем
+  // найденное обновление, не дожидаясь нажатия «Проверить обновление».
+  useEffect(() => {
+    if (!initialUpdate?.available) return;
+    setUpdateInfo((current) => (current?.available ? current : initialUpdate));
+  }, [initialUpdate]);
+
   const checkUpdate = async () => {
-    if (!window.electronAPI?.checkForUpdates) {
+    const request = onCheckUpdates ?? window.electronAPI?.checkForUpdates;
+    if (!request) {
       setUpdateError('Проверка обновлений доступна только в настольной версии');
       return;
     }
     setUpdateChecking(true);
     setUpdateError('');
     try {
-      const info = await window.electronAPI.checkForUpdates();
+      const info = await request();
+      if (!info) {
+        setUpdateError('Не удалось проверить обновления');
+        return;
+      }
       setUpdateInfo(info);
       if (info.error && !info.available) setUpdateError(info.error);
     } catch (error) {
@@ -113,6 +134,17 @@ export const SystemSettings: React.FC<Props> = ({ onNotify, onBeforeUpdate }) =>
       setUpdateChecking(false);
     }
   };
+
+  /**
+   * Панель сама узнаёт состояние при открытии: если автопроверка ещё не
+   * ответила (старт без сети, повторы в очереди), запрос уходит отсюда.
+   */
+  useEffect(() => {
+    if (initialUpdate) return;
+    void checkUpdate();
+    // Ровно один раз при открытии панели: повторные запросы — по кнопке.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const installUpdate = async () => {
     if (!updateInfo?.latestVersion || !updateInfo.assetUrl || !updateInfo.assetName) {

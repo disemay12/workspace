@@ -26,11 +26,39 @@ function resolveProjectRoot() {
   return path.join(__dirname, '..');
 }
 const ROOT = resolveProjectRoot();
-const SANDBOX = path.join(ROOT, 'test-workspace');
+// Свой каталог на прогон: раньше общий ROOT/test-workspace делился с
+// feature-check, и наборы перезаписывали фикстуры друг друга.
+const { createCheckSandbox } = require('./sandbox');
+const SANDBOX = createCheckSandbox('render', ROOT);
 const errors = [];
 const results: any = {};
 
 app.disableHardwareAcceleration();
+
+/**
+ * Падение до try раньше оставляло процесс жить без render-check.json: набор
+ * висел до внешнего taskkill, и причины в отчёте не было.
+ */
+function failFast(reason) {
+  results.fatal = (reason as Error)?.stack || String(reason);
+  try {
+    fs.writeFileSync(path.join(ROOT, 'render-check.json'), JSON.stringify(results, null, 2), 'utf-8');
+  } catch {
+    // даже запись диагностики может не удаться
+  }
+  app.exit(1);
+}
+process.on('unhandledRejection', failFast);
+process.on('uncaughtException', failFast);
+
+/**
+ * Жёсткий предохранитель: без него подвисшее окно держало набор до внешнего
+ * taskkill от раннера (5 минут). Свой предел короче — с понятной причиной.
+ */
+const WATCHDOG_MS = 240_000;
+setTimeout(() => {
+  failFast(new Error(`watchdog: сценарий не уложился в ${WATCHDOG_MS / 1000} с`));
+}, WATCHDOG_MS);
 
 /* ---- Регистрируем те же IPC-обработчики, что и main.ts ---- */
 function registerIPC() {
@@ -243,7 +271,14 @@ function createFixtures() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-app.whenReady().then(async () => {
+/**
+ * Каналы IPC, фикстуры и окно.
+ *
+ * Вынесено в функцию, чтобы отказ на любом из этих шагов попадал в общий catch:
+ * раньше всё стояло до try, EPERM при создании каталога оставлял процесс жить
+ * без render-check.json, и набор снимался только внешним taskkill.
+ */
+function prepareWindow() {
   registerIPC();
   createFixtures();
 
@@ -298,7 +333,13 @@ app.whenReady().then(async () => {
     })()
   `;
 
+  return { win, probeLayout };
+}
+
+app.whenReady().then(async () => {
   try {
+    const { win, probeLayout } = prepareWindow();
+
     await win.loadFile(path.join(ROOT, 'dist', 'index.html'));
     await sleep(2500);
 
@@ -382,6 +423,24 @@ app.whenReady().then(async () => {
     `);
 
     /* ---- Открываем Markdown-файл кликом по дереву ---- */
+    /**
+     * Состояние панели вкладок: закрывающая кнопка есть у каждой вкладки, а
+     * активная отличается классом фона. Имя открытого файла уже есть в тексте
+     * дерева, поэтому `текст содержит «Заметки.md»` было истинным всегда.
+     */
+    const readTabs = `
+      (() => {
+        const tabs = [...document.querySelectorAll('button[title="Закрыть вкладку (Ctrl+W)"]')]
+          .map((btn) => btn.parentElement)
+          .filter(Boolean);
+        const active = tabs.find((el) => String(el.className || '').includes('bg-ws-editor'));
+        return {
+          count: tabs.length,
+          activePath: active ? active.getAttribute('title') || '' : '',
+        };
+      })()
+    `;
+    const tabsBefore = await win.webContents.executeJavaScript(readTabs);
     await win.webContents.executeJavaScript(`
       (() => {
         // Строка дерева содержит не только имя (размер и дата в той же
@@ -394,13 +453,19 @@ app.whenReady().then(async () => {
       })()
     `);
     await sleep(1800);
+    const tabsAfter = await win.webContents.executeJavaScript(readTabs);
+    results.tabsBefore = tabsBefore;
+    results.tabsAfter = tabsAfter;
+    // Вкладка именно появилась и стала активной: имя файла уже есть в тексте
+    // дерева, поэтому проверка по тексту страницы была истинной всегда.
+    const openedTabName = String(tabsAfter.activePath).split(/[\\/]/).pop() || '';
+    const tabOpened = tabsAfter.count > tabsBefore.count && openedTabName === 'Заметки.md';
 
     results.markdownOpened = await win.webContents.executeJavaScript(`
       (() => {
-        const t = document.body.innerText;
         const preview = document.querySelector('.ws-prose');
         return {
-          tabCreated: t.includes('Заметки.md'),
+          tabCreated: ${tabOpened},
           hasPreview: !!preview,
           // Утверждение — непустой HTML предпросмотра; длина остаётся диагностикой.
           previewHasContent: Boolean(preview && preview.innerHTML.length > 0),
@@ -415,7 +480,10 @@ app.whenReady().then(async () => {
           })(),
           hasCodeBlock: !!document.querySelector('.ws-prose pre'),
           hasCheckbox: !!document.querySelector('.ws-prose input[type=checkbox]'),
-          hasTextarea: !!document.querySelector('textarea'),
+          // Раньше здесь стояло наличие любого textarea на странице: оно
+          // выполнялось из-за поля чата и о предпросмотре ничего не говорило.
+          // Проверяем, что в статье оказался текст документа.
+          previewHasBodyText: /проверка рендеринга/.test(preview ? preview.innerText : ''),
         };
       })()
     `);
@@ -753,6 +821,11 @@ app.whenReady().then(async () => {
     `);
 
     // Фильтр: панель со значениями выбранного столбца
+    // Число строк до включения фильтра: сравнение «видимых строк < 60» было
+    // истинным на четырёх строках при любом фильтре и ничего не проверяло.
+    const rowsBeforeFilter = await win.webContents.executeJavaScript(
+      'document.querySelectorAll("tbody tr").length'
+    );
     await win.webContents.executeJavaScript(`
       (() => {
         const button = document.querySelector('button[title="Фильтр по значениям выбранного столбца"]');
@@ -770,22 +843,42 @@ app.whenReady().then(async () => {
         };
       })()
     `);
-    await win.webContents.executeJavaScript(`
+    // Снимаем флажок вместе с его подписью: без конкретного значения проверка
+    // «строк стало меньше» проходила и на пустом наборе значений.
+    const toggledFilterValue = await win.webContents.executeJavaScript(`
       (() => {
-        const input = [...document.querySelectorAll('input[type=checkbox]')];
-        if (input.length > 0) {
-          input[0].click();
-        }
-        return input.length > 0;
+        const label = [...document.querySelectorAll('label')]
+          .find((node) => node.querySelector('input[type=checkbox]'));
+        const input = label ? label.querySelector('input[type=checkbox]') : null;
+        if (!input) return '';
+        const value = (label.textContent || '').trim();
+        input.click();
+        return value;
       })()
     `);
     await sleep(500);
-    results.excelFilter.rowsHidden = await win.webContents.executeJavaScript(`
+    const filterState = await win.webContents.executeJavaScript(`
       (() => {
-        const visibleRows = document.querySelectorAll('tbody tr').length;
-        return visibleRows < 60;
+        const rows = [...document.querySelectorAll('tbody tr')];
+        // Фильтр включён по колонке «Кол-во» — последнее выделение перед ним
+        // было B1; значения берём из той же колонки (вторая ячейка строки).
+        const values = rows.map((tr) => (tr.querySelectorAll('td')[1]?.textContent || '').trim());
+        return {
+          rowsAfter: rows.length,
+          rowCountDecreased: rows.length < ${rowsBeforeFilter},
+          valueHidden:
+            ${JSON.stringify(toggledFilterValue)} !== '' &&
+            !values.includes(${JSON.stringify(toggledFilterValue)}),
+          remainingValues: values,
+        };
       })()
     `);
+    results.excelFilter.rowsHidden = filterState.rowCountDecreased;
+    results.excelFilter.valueHidden = filterState.valueHidden;
+    results.excelFilter.diagRowsBefore = rowsBeforeFilter;
+    results.excelFilter.diagRowsAfter = filterState.rowsAfter;
+    results.excelFilter.diagToggledValue = toggledFilterValue;
+    results.excelFilter.diagRemainingValues = filterState.remainingValues;
     await win.webContents.executeJavaScript(`
       (() => {
         const button = [...document.querySelectorAll('button')]

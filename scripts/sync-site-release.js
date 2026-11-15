@@ -6,15 +6,14 @@
  * билд. Скрипт берёт версию из package.json и размер готового архива из release/
  *
  * Запуск: npm run site:sync (после pack:release).
- * Без собранного архива (локальный прогон): node scripts/sync-site-release.js --allow-missing-archive.
+ * Проверка без записи (CI): node scripts/sync-site-release.js --check —
+ * расхождение с package.json даёт код 1, файл не меняется.
  */
 const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
-// Локальный прогон без release/ не должен выглядеть как успешная синхронизация
-// в CI: код возврата 1 остаётся, флаг снимает только отсутствие архива.
-const allowMissingArchive = process.argv.includes('--allow-missing-archive');
+const checkOnly = process.argv.includes('--check');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const version = pkg.version;
 const siteFile = path.join(root, 'docs', 'index.html');
@@ -26,14 +25,23 @@ if (!fs.existsSync(siteFile)) {
 
 const zipName = `WorkSpace-${version}-win-x64.zip`;
 const zipPath = path.join(root, 'release', zipName);
-const sizeMb = fs.existsSync(zipPath)
-  ? Math.round(fs.statSync(zipPath).size / (1024 * 1024))
-  : null;
+// Наличие архива проверяется ДО любых замен: иначе ссылка и версия
+// переписывались на zip, которого нет, а размер оставался от прошлого выпуска.
+const hasArchive = fs.existsSync(zipPath);
+const sizeMb = hasArchive ? Math.round(fs.statSync(zipPath).size / (1024 * 1024)) : null;
+
+if (!hasArchive && !checkOnly) {
+  console.error(
+    `Архив ${zipName} не найден в release/: сайт не изменён — ссылка вела бы на несуществующий файл. ` +
+      'Сначала выполните npm run pack:release; сверка без записи — node scripts/sync-site-release.js --check.'
+  );
+  process.exit(1);
+}
 
 let html = fs.readFileSync(siteFile, 'utf8');
 const before = html;
-let replaced = 0;
 const notFound = [];
+const changed = [];
 
 /**
  * Замена с подсчётом: «html === before» одинаково верно и когда всё уже
@@ -46,8 +54,9 @@ function apply(re, build, label) {
     notFound.push(label);
     return;
   }
-  html = html.replace(re, (...args) => build(...args));
-  replaced += matches.length;
+  const next = html.replace(re, (...args) => build(...args));
+  if (next !== html) changed.push(label);
+  html = next;
 }
 
 // Версия в JSON-LD и подписях, ссылки на ассет и его размер.
@@ -65,39 +74,40 @@ if (sizeMb !== null) {
   apply(/(WorkSpace-[\d.]+-win-x64\.zip, )\d+ МБ/g, (_m, head) => `${head}${sizeMb} МБ`, 'размер рядом с архивом');
 }
 
-if (replaced === 0) {
+// Частичное обновление — незавершённая синхронизация: часть шаблонов в
+// разметке не найдена, поэтому не пишем вовсе (сайт остался бы с прежней
+// версией или размером от прошлого выпуска).
+if (notFound.length > 0) {
   console.error(
-    `Сайт НЕ обновлён: в docs/index.html не найдено ни одного шаблона (${notFound.join(', ')}). ` +
+    `Сайт не обновлён: в docs/index.html не найдены шаблоны (${notFound.join(', ')}). ` +
       'Проверьте разметку — возможно, изменились классы или формат ссылки.'
   );
   process.exit(1);
 }
 
-// Частичное обновление — незавершённая синхронизация: часть шаблонов в
-// разметке не найдена, и сайт остался бы с прежней версией или размером.
-if (notFound.length > 0) {
-  console.error(
-    `Сайт обновлён частично: не найдены шаблоны (${notFound.join(', ')}). ` +
-      'Проверьте разметку docs/index.html.'
-  );
-  process.exitCode = 1;
+if (checkOnly) {
+  if (changed.length > 0) {
+    console.error(
+      `docs/index.html расходится с package.json ${version}: не обновлено (${changed.join(', ')}). ` +
+        'Выполните npm run site:sync.'
+    );
+    process.exit(1);
+  }
+  if (sizeMb === null) {
+    // В CI релизного архива нет: release/ не коммитится, сверить нечем.
+    // Версия и ссылки уже сошлись — этого достаточно для проверки.
+    console.warn(`Размер архива не сверен: release/${zipName} отсутствует.`);
+  }
+  console.log(`Сайт соответствует package.json: версия ${version}${sizeMb !== null ? `, архив ${sizeMb} МБ` : ''}`);
+  process.exit(0);
 }
 
-if (html === before) {
+if (changed.length === 0) {
   console.log(`Сайт уже указывает на ${version}${sizeMb !== null ? ` (${sizeMb} МБ)` : ''}`);
-} else {
-  fs.writeFileSync(siteFile, html, 'utf8');
-  console.log(`Сайт обновлён: версия ${version}${sizeMb !== null ? `, архив ${sizeMb} МБ` : ', размер архива не найден — пропущен'}`);
+  process.exit(0);
 }
-if (sizeMb === null) {
-  if (allowMissingArchive) {
-    // Архив ещё не собран: размеры могли остаться от прошлой версии.
-    console.warn(`Архив ${zipName} не найден в release/ — размер на сайте не обновлён (--allow-missing-archive).`);
-  } else {
-    console.error(
-      `Архив ${zipName} не найден в release/: размер на сайте не обновлён. ` +
-        'Сначала выполните npm run pack:release или запустите с --allow-missing-archive.'
-    );
-    process.exitCode = 1;
-  }
-}
+
+// Запись только после полного успеха: версия, ссылка и размер обновляются
+// вместе, иначе сайт уезжает с версией на несуществующий zip.
+fs.writeFileSync(siteFile, html, 'utf8');
+console.log(`Сайт обновлён: версия ${version}, архив ${sizeMb} МБ`);

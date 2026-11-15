@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   AISettings,
   AIProvider,
@@ -157,8 +157,17 @@ const PRESET_URLS = new Set(
 export function normalizeSettings(input: AISettings): AISettings {
   // Неизвестный провайдер (старый или испорченный файл настроек) ронял
   // обращение к PROVIDER_PRESETS и оставлял приложение с белым экраном.
-  if (!PROVIDER_PRESETS[input.provider]) {
-    return { ...input, provider: DEFAULT_AI_SETTINGS.provider };
+  // Проверяется собственный ключ: `constructor` есть в любом объекте.
+  if (!Object.prototype.hasOwnProperty.call(PROVIDER_PRESETS, input.provider)) {
+    // Адрес и модель тоже заменяем: иначе провайдер «исправлен», а запросы
+    // продолжают уходить на endpoint сломанной конфигурации.
+    const fallback = PROVIDER_PRESETS[DEFAULT_AI_SETTINGS.provider];
+    return {
+      ...input,
+      provider: fallback.id,
+      baseUrl: fallback.baseUrl,
+      model: fallback.models[0] || input.model,
+    };
   }
   // Свой endpoint и локальная Ollama — адрес задаёт пользователь.
   if (input.provider === 'custom' || input.provider === 'ollama') return input;
@@ -254,17 +263,17 @@ async function getCryptoKey(): Promise<CryptoKey | null> {
   if (!cryptoKeyPromise) {
     cryptoKeyPromise = (async () => {
       try {
-        // Одноразовый перенос: старый ключ забираем в память и стираем с диска,
-        // иначе пара «ключ + шифротекст» остаётся в одном хранилище.
+        // Одноразовый перенос: старый ключ забираем в память. Удаляет его
+        // migrateLegacyKeys — только после того, как все записи, зашифрованные
+        // им, перенесены в постоянное хранилище: иначе ключи остальных
+        // провайдеров становились нерасшифровываемыми навсегда.
         const legacy = window.localStorage.getItem(LEGACY_CRYPTO_KEY_NAME);
         if (legacy) {
           const bytes = Uint8Array.from(atob(legacy), (c) => c.charCodeAt(0));
-          const imported = await window.crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, [
+          return await window.crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, [
             'encrypt',
             'decrypt',
           ]);
-          window.localStorage.removeItem(LEGACY_CRYPTO_KEY_NAME);
-          return imported;
         }
         return await window.crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, [
           'encrypt',
@@ -355,6 +364,18 @@ export const keyVault = {
 
   /** Провайдеры, ключ которых действительно читается прямо сейчас. */
   async listConfigured(): Promise<AIProvider[]> {
+    // В собранном приложении ключи живут только в профиле: localStorage-копия
+    // после перезапуска не расшифровывается и давала пустой список всегда.
+    const store = persistentStore();
+    if (store?.loadAiSettings) {
+      try {
+        const loaded = await store.loadAiSettings();
+        const providers = loaded?.keyProviders ?? [];
+        if (providers.length > 0) return providers as AIProvider[];
+      } catch {
+        // Индикатор не повод ломать диалог настроек — смотрим локальный кэш.
+      }
+    }
     try {
       const raw = window.localStorage.getItem(KEY_STORE);
       if (!raw) return [];
@@ -369,27 +390,213 @@ export const keyVault = {
       return [];
     }
   },
+
+  /**
+   * Удаление ключа провайдера. Чистить только localStorage нельзя: в собранном
+   * приложении ключ лежит в профиле, и следующий `changeProvider` вернул бы его
+   * обратно из файла.
+   */
+  async remove(
+    provider: AIProvider,
+    current: AISettings
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const raw = window.localStorage.getItem(KEY_STORE);
+      if (raw) {
+        const map = JSON.parse(raw) as Record<string, string>;
+        if (map[provider]) {
+          delete map[provider];
+          window.localStorage.setItem(KEY_STORE, JSON.stringify(map));
+        }
+      }
+    } catch {
+      // Локальный кэш не критичен: источник истины — файл профиля.
+    }
+    const store = persistentStore();
+    if (!store?.saveAiSettings) return { ok: true };
+    try {
+      const { apiKey: _omit, ...safe } = current;
+      await store.saveAiSettings({ ...safe, provider, apiKey: '' });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: `Ключ не удалён из профиля: ${(err as Error).message}` };
+    }
+  },
 };
+
+/** Флаг завершённого переноса ключей старого хранилища. */
+const LEGACY_MIGRATION_KEY = 'workspace_api_keys_migrated_v2';
+
+/**
+ * Переносит ключи из localStorage в постоянное хранилище ОДИН раз и только
+ * после этого стирает legacy-ключ шифрования.
+ *
+ * Прежняя версия удаляла ключ шифрования при первом же чтении и переносила
+ * ключ только активного провайдера: остальные `enc:`-записи после перезапуска
+ * расшифровать было нечем, ключи терялись молча.
+ */
+async function migrateLegacyKeys(): Promise<void> {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  if (window.localStorage.getItem(LEGACY_MIGRATION_KEY)) return;
+  const store = persistentStore();
+  if (!store?.saveAiSettings) return;
+
+  let map: Record<string, string> = {};
+  try {
+    const raw = window.localStorage.getItem(KEY_STORE);
+    if (raw) map = JSON.parse(raw) as Record<string, string>;
+  } catch {
+    // Битый JSON — не трогаем ни ключи, ни legacy-ключ шифрования.
+    return;
+  }
+
+  const pending = Object.entries(map).filter(([, stored]) => Boolean(stored));
+  if (pending.length === 0) {
+    finishLegacyMigration(map);
+    return;
+  }
+
+  // Активного провайдера в файле нельзя потерять: сохранение ключа пишет
+  // `provider` в те же настройки, поэтому исходное значение запоминаем.
+  let base: AISettings | null = null;
+  try {
+    const loaded = store.loadAiSettings ? await store.loadAiSettings() : null;
+    base = { ...DEFAULT_AI_SETTINGS, ...((loaded?.settings ?? {}) as Partial<AISettings>) };
+  } catch {
+    base = null;
+  }
+
+  const migrated: Record<string, string> = {};
+  for (const [provider, stored] of pending) {
+    const plain = await decryptString(stored);
+    if (!plain) continue; // нечитаемый ключ оставляем как есть — пользователь увидит предупреждение
+    try {
+      await store.saveAiSettings({
+        ...(base ?? DEFAULT_AI_SETTINGS),
+        provider: provider as AIProvider,
+        apiKey: plain,
+      });
+      migrated[provider] = stored;
+    } catch {
+      // Файл недоступен: перенос не засчитываем, попробуем в следующий запуск.
+    }
+  }
+
+  if (Object.keys(migrated).length !== pending.length) return;
+
+  if (base) {
+    const { apiKey: _omit, ...safe } = base;
+    try {
+      await store.saveAiSettings(safe);
+    } catch {
+      // Не удалось вернуть активного провайдера — не критично: ключи уже на диске.
+    }
+  }
+  finishLegacyMigration(migrated);
+}
+
+/** Стирает перенесённые записи и legacy-ключ шифрования. */
+function finishLegacyMigration(migrated: Record<string, string>): void {
+  try {
+    const raw = window.localStorage.getItem(KEY_STORE);
+    if (raw) {
+      const map = JSON.parse(raw) as Record<string, string>;
+      for (const provider of Object.keys(migrated)) delete map[provider];
+      if (Object.keys(map).length === 0) window.localStorage.removeItem(KEY_STORE);
+      else window.localStorage.setItem(KEY_STORE, JSON.stringify(map));
+    }
+    // Ключ шифрования стирается последним шагом: пока он нужен для чтения
+    // оставшихся записей, он должен быть на месте.
+    if (Object.keys(migrated).length > 0 || !raw) {
+      window.localStorage.removeItem(LEGACY_CRYPTO_KEY_NAME);
+    }
+    window.localStorage.setItem(LEGACY_MIGRATION_KEY, '1');
+  } catch {
+    // Хранилище недоступно: повторим в следующий запуск.
+  }
+}
 
 /* ============================================================
    Хук настроек
    ============================================================ */
 
-function loadSettings(): AISettings {
+/**
+ * Отбирает из сохранённого JSON поля, тип которых совпадает с дефолтным.
+ *
+ * Раньше значение подставлялось как `Partial<AISettings>` без проверки: строка
+ * вместо массива профилей роняла `mergeProfiles`, исключение глоталось, и весь
+ * набор настроек молча сбрасывался в дефолты.
+ */
+function validateStoredSettings(parsed: unknown): Partial<AISettings> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const defaults = DEFAULT_AI_SETTINGS as unknown as Record<string, unknown>;
+  const source = parsed as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    const reference = defaults[key];
+    if (reference === undefined) continue;
+    if (Array.isArray(reference)) {
+      if (Array.isArray(value)) result[key] = value;
+      continue;
+    }
+    if (typeof value === typeof reference) result[key] = value;
+  }
+  return result as Partial<AISettings>;
+}
+
+/** Сохраняет повреждённое значение рядом, чтобы его не затёрли дефолты молча. */
+function backupBrokenSettings(raw: string, reason: string): void {
   try {
-    const raw = window.localStorage.getItem(SETTINGS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<AISettings>;
+    window.localStorage.setItem(`${SETTINGS_KEY}.__broken`, raw);
+  } catch {
+    // Переполнение хранилища — не повод ломать запуск.
+  }
+  void window.electronAPI?.diagnosticsLog?.(
+    'warn',
+    `Настройки AI повреждены и сброшены (${reason}); копия: ${SETTINGS_KEY}.__broken`
+  );
+}
+
+function loadSettings(): AISettings {
+  const raw = (() => {
+    try {
+      return window.localStorage.getItem(SETTINGS_KEY);
+    } catch {
+      return null;
+    }
+  })();
+  if (raw) {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      // Копию сохраняем ДО возврата дефолтов: эффект записи сразу перепишет
+      // исходный ключ, и без копии битые настройки исчезали навсегда.
+      backupBrokenSettings(raw, (err as Error).message);
+      return DEFAULT_AI_SETTINGS;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      backupBrokenSettings(raw, 'ожидался объект');
+      return DEFAULT_AI_SETTINGS;
+    }
+    try {
+      const valid = validateStoredSettings(parsed);
+      const profiles = Array.isArray(valid.promptProfiles)
+        ? valid.promptProfiles.filter(
+            (item) => Boolean(item) && typeof item === 'object' && typeof item.id === 'string'
+          )
+        : undefined;
       return normalizeSettings({
         ...DEFAULT_AI_SETTINGS,
-        ...parsed,
+        ...valid,
         // Системные профили не должны пропадать из сохранённых настроек.
-        promptProfiles: mergeProfiles(parsed.promptProfiles),
-        activeProfileId: parsed.activeProfileId || DEFAULT_PROFILES[0].id,
+        promptProfiles: mergeProfiles(profiles),
+        activeProfileId: valid.activeProfileId || DEFAULT_PROFILES[0].id,
       });
+    } catch (err) {
+      backupBrokenSettings(raw, (err as Error).message);
+      return DEFAULT_AI_SETTINGS;
     }
-  } catch {
-    // повреждённые настройки — используем значения по умолчанию
   }
   return DEFAULT_AI_SETTINGS;
 }
@@ -532,16 +739,28 @@ export function useAISettings() {
       // Ключ конкретного провайдера: `aiSettings:load` отдаёт только активный.
       // Отказ канала не должен ломать смену провайдера.
       let persisted = '';
+      /** Ключ есть в файле, но не расшифровывается (другой компьютер/профиль). */
+      let unreadable = false;
       if (store?.aiSettingsKey) {
-        persisted = await store
+        await store
           .aiSettingsKey(provider)
-          .then((result) => result.key)
-          .catch(() => '');
+          .then((result) => {
+            persisted = result.key;
+            unreadable = result.unreadable;
+          })
+          .catch(() => undefined);
       }
       const key = persisted || (await keyVault.get(provider));
       // Пока читали ключ, его могли сохранить (импорт из файла секретов):
       // устаревший результат не должен затирать свежий.
       if (seq !== providerChangeSeq.current) return;
+      // Молча пустое поле ключа — худший вариант: пользователь не знает, что
+      // ключ существует, но не читается на этой машине.
+      setKeyProblem(
+        unreadable && !key
+          ? 'Ключ API сохранён на другом компьютере и не читается здесь. Откройте Настройки → AI и вставьте ключ заново.'
+          : ''
+      );
       setProviderKey(key);
       setSettingsState((prev) => {
         const cached = modelsCache[provider] || [];
@@ -600,8 +819,20 @@ export function useAISettings() {
       return;
     }
     let cancelled = false;
-    void store.loadAiSettings().then(async (stored) => {
-      if (cancelled) return;
+    /** Метод вынесен в константу: в замыкании опциональность уже не сужается. */
+    const loadAiSettings = store.loadAiSettings;
+    /**
+     * Пока шла загрузка, пользователь мог сохранить ключ (`saveApiKey`
+     * увеличивает счётчик): устаревший результат не должен затирать свежий,
+     * иначе поле ключа пустеет до перезапуска.
+     */
+    const seq = ++providerChangeSeq.current;
+    const stillFresh = () => !cancelled && seq === providerChangeSeq.current;
+    void migrateLegacyKeys()
+      .catch(() => undefined)
+      .then(() => loadAiSettings())
+      .then(async (stored) => {
+        if (!stillFresh()) return;
       const saved = stored.settings ?? {};
       if (saved.modelsCache) {
         setModelsCache((prev) => ({ ...prev, ...saved.modelsCache }));
@@ -634,11 +865,10 @@ export function useAISettings() {
             apiKey: key,
           });
           await persistPersistent(restored, key);
-          if (!cancelled) {
-            setProviderKey(key);
-            setSettingsState((prev) => ({ ...prev, ...restored }));
-            setKeyLoaded(true);
-          }
+          if (!stillFresh()) return;
+          setProviderKey(key);
+          setSettingsState((prev) => ({ ...prev, ...restored }));
+          setKeyLoaded(true);
           return;
         }
         problem = [
@@ -657,7 +887,7 @@ export function useAISettings() {
           void persistPersistent({ ...DEFAULT_AI_SETTINGS, ...saved, provider, apiKey: key }, key);
         }
       }
-      if (cancelled) return;
+      if (!stillFresh()) return;
       if (problem) setKeyProblem(problem);
       setProviderKey(key);
       setSettingsState((prev) => normalizeSettings({ ...prev, ...saved, provider, apiKey: key }));
@@ -728,7 +958,11 @@ export function useChatSessions() {
   const [activeId, setActiveId] = useState<string>('');
   /** Список для синхронной записи при закрытии окна. */
   const sessionsRef = useRef<ChatSession[]>(sessions);
-  sessionsRef.current = sessions;
+  // Присваивание во время рендера — побочный эффект в фазе отрисовки;
+  // для синхронного flush достаточно обновить ref после коммита.
+  useLayoutEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   // Стрим переписывает последнее сообщение десятки раз в секунду. Писать весь
   // JSON на каждый апдейт слишком дорого, поэтому запись откладывается на
@@ -744,6 +978,11 @@ export function useChatSessions() {
     window.addEventListener('beforeunload', flush);
     return () => window.removeEventListener('beforeunload', flush);
   }, []);
+
+  /** Запись при размонтировании: отложенный таймер к этому моменту уже снят. */
+  const flushOnUnmount = useRef(() => undefined as void);
+  flushOnUnmount.current = () => writeSessions(sessionsRef.current);
+  useEffect(() => () => flushOnUnmount.current(), []);
 
   const createSession = useCallback(
     (title = 'Новый диалог'): string => {

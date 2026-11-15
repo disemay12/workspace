@@ -4,7 +4,7 @@
  * Координаты задаются нормализованно (0..1 от ширины/высоты страницы), чтобы
  * не зависеть от масштаба превью; при записи пересчитываются в точки страницы.
  */
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
 import type { PDFFont, PDFPage } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import { bytesToBase64, loadPdfDocument } from './pdfOps';
@@ -143,6 +143,7 @@ function drawHighlight(page: PDFPage, options: HighlightOptions): void {
 function drawNote(page: PDFPage, options: NoteOptions, text: string, font: PDFFont): void {
   const size = page.getSize();
   const rotation = page.getRotation().angle;
+  const angle = normalizeRotation(rotation);
   const visible = displaySize(size, rotation);
   const fontSize = Math.max(6, Math.min(24, options.size ?? 10));
   const color = options.color ?? NOTE_COLOR;
@@ -175,13 +176,34 @@ function drawNote(page: PDFPage, options: NoteOptions, text: string, font: PDFFo
     borderColor: rgb(color.r, color.g, color.b),
     borderWidth: 0.7,
   });
+  // Подложка считается по осям отображения (annotationBox), поэтому при
+  // /Rotate 90|270 строки рисуем в осях страницы с тем же поворотом: иначе
+  // текст шёл поперёк рамки и вылезал за неё.
+  const paint = { size: fontSize, font, color: rgb(color.r, color.g, color.b) };
   lines.forEach((line, index) => {
+    if (angle === 90) {
+      // Слева-вправо по отображению — это ось Y страницы, строки вниз — ось X.
+      page.drawText(line, {
+        ...paint,
+        x: box.x + (index + 1) * lineHeight,
+        y: box.y + 4,
+        rotate: degrees(90),
+      });
+      return;
+    }
+    if (angle === 270) {
+      page.drawText(line, {
+        ...paint,
+        x: box.x + box.width - (index + 1) * lineHeight,
+        y: box.y + box.height - 4,
+        rotate: degrees(270),
+      });
+      return;
+    }
     page.drawText(line, {
+      ...paint,
       x: box.x + 4,
       y: box.y + box.height - (index + 1) * lineHeight,
-      size: fontSize,
-      font,
-      color: rgb(color.r, color.g, color.b),
     });
   });
 }

@@ -42,6 +42,9 @@ function isHttpUrl(value: string): boolean {
 /** Простой дольше этого означает, что провайдер замолчал: генерация прерывается. */
 const IDLE_TIMEOUT_MS = 120_000;
 
+/** Сколько текста ошибки провайдера показывать в интерфейсе (и держать в памяти). */
+const MAX_ERROR_BODY_CHARS = 8 * 1024;
+
 export function registerAiProxy() {
   /**
    * Запуск стримингового запроса к провайдеру.
@@ -72,7 +75,10 @@ export function registerAiProxy() {
     }
 
     try {
-      const request = net.request({ method: method || 'POST', url, redirect: 'follow' });
+      // redirect: 'manual' — адрес провайдера задаёт рендерер (кастомные
+      // шлюзы), поэтому автоматический переход на другой хост превращал бы
+      // прокси в SSRF-ретранслятор: ответ и так уходит в окно.
+      const request = net.request({ method: method || 'POST', url, redirect: 'manual' });
 
       for (const [key, value] of Object.entries(headers || {})) {
         try {
@@ -121,12 +127,28 @@ export function registerAiProxy() {
 
         reply('ai:response', { requestId, status, headers: responseHeaders });
 
+        // Переход по редиректу выполнял бы запрос к произвольному хосту от
+        // имени главного процесса — такой ответ сразу считаем ошибкой.
+        if (status >= 300 && status < 400) {
+          finish();
+          reply('ai:error', {
+            requestId,
+            status,
+            message: 'Провайдер ответил перенаправлением — укажите конечный адрес API',
+          });
+          return;
+        }
+
         // Не-200 ответы читаем целиком, чтобы показать текст ошибки
         if (status < 200 || status >= 300) {
           let errBody = '';
           response.on('data', (chunk: Buffer) => {
             touchIdle();
-            errBody += chunk.toString('utf-8');
+            // Текст ошибки нужен для интерфейса, а не для перекачки тела:
+            // без предела ответ на 500 МБ уносил память главного процесса.
+            if (errBody.length < MAX_ERROR_BODY_CHARS) {
+              errBody += chunk.toString('utf-8');
+            }
           });
           response.on('end', () => {
             finish();
@@ -238,7 +260,7 @@ export function registerAiProxy() {
       function requestJson(url: string, headers: Record<string, string>): Promise<any> {
         return new Promise((resolve, reject) => {
           try {
-            const request = net.request({ method: 'GET', url, redirect: 'follow' });
+            const request = net.request({ method: 'GET', url, redirect: 'manual' });
             for (const [k, v] of Object.entries(headers)) {
               try {
                 request.setHeader(k, v);

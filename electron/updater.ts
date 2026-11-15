@@ -10,6 +10,7 @@ import { execFile } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { unsupportedUpdateInfo } from './updateInfo';
 
 const REPO = 'disemay12/workspace';
 const USER_AGENT = 'WorkSpace-Updater';
@@ -76,10 +77,12 @@ function isAllowedUrl(value: string): boolean {
 
 /**
  * Обновления, скачанные и проверенные в этом сеансе: версия → каталог
- * распаковки. installUpdate принимает только их — иначе рендерер мог бы
- * указать на произвольный локальный каталог с подменённым загрузчиком.
+ * распаковки и контрольная сумма архива. installUpdate принимает только их —
+ * иначе рендерер мог бы указать на произвольный локальный каталог с
+ * подменённым загрузчиком. Сумма нужна ещё и загрузчику: он сверяет её с
+ * записанным в маркере значением.
  */
-const preparedUpdates = new Map<string, string>();
+const preparedUpdates = new Map<string, { dir: string; digest: string }>();
 
 /**
  * Что именно предложила проверка обновлений. Рендерер не может подменить ни
@@ -183,12 +186,10 @@ async function checkViaReleasePage(): Promise<UpdateInfo> {
 async function checkForUpdates(): Promise<UpdateInfo> {
   const currentVersion = app.getVersion();
   if (!app.isPackaged) {
-    return {
-      success: true,
-      supported: false,
-      currentVersion,
-      error: 'Проверка обновлений доступна только в собранной portable-версии WorkSpace',
-    };
+    // Определение ответа одно на приложение и на проверочный стенд
+    // (electron/updateInfo.ts): раньше стенд сверял заглушку с собственной
+    // копией литералов и расхождение с боевой веткой проходило молча.
+    return unsupportedUpdateInfo(currentVersion);
   }
   let info: UpdateInfo;
   try {
@@ -329,7 +330,7 @@ async function downloadUpdate(payload: {
     await extractZip(zipPath, extracted);
     const sourceRoot = await findSourceRoot(extracted);
     sendProgress('extract', 1, 1);
-    preparedUpdates.set(version, path.resolve(sourceRoot));
+    preparedUpdates.set(version, { dir: path.resolve(sourceRoot), digest: actual.toLowerCase() });
     return { success: true, zipPath, extractDir: sourceRoot, version };
   } catch (error) {
     return { success: false, error: (error as Error).message };
@@ -390,7 +391,7 @@ function installUpdate(payload: {
 
   const expected = preparedUpdates.get(String(payload?.version));
   const resolvedExtract = path.resolve(String(payload?.extractDir ?? ''));
-  if (!expected || resolvedExtract !== expected || !isInsideTemp(resolvedExtract)) {
+  if (!expected || resolvedExtract !== expected.dir || !isInsideTemp(resolvedExtract)) {
     return {
       success: false,
       error: 'Обновление не подготовлено этим сеансом — скачайте его заново.',
@@ -467,7 +468,14 @@ function installUpdate(payload: {
   const marker = pendingUpdatePath();
   try {
     fs.mkdirSync(path.dirname(marker), { recursive: true });
-    fs.writeFileSync(marker, `source=${payload.extractDir}\nversion=${payload.version}\n`, 'utf8');
+    // Сумма в маркере нужна загрузчику: он больше не верит только каталогу
+    // источника и сверяет хеш архива, который скачало приложение.
+    const digest = expected.digest.replace(/^sha256:/i, '');
+    fs.writeFileSync(
+      marker,
+      `source=${payload.extractDir}\nversion=${payload.version}\nsha256=${digest}\n`,
+      'utf8'
+    );
   } catch (error) {
     return { success: false, error: `Не удалось записать маркер обновления: ${(error as Error).message}` };
   }

@@ -22,6 +22,7 @@ import {
   assertReadablePath,
   getWorkspaceRoot,
   setProtectedDirectories,
+  setProtectedFiles,
   setWorkspaceRoot,
 } from './fsGuard';
 
@@ -168,7 +169,23 @@ function hardenWebContents(win: BrowserWindow): void {
 function configureFsGuard(): void {
   // В разработке каталог приложения — это каталог проекта: его файлы
   // редактируют, поэтому запрет действует только в собранной версии.
-  setProtectedDirectories(app.isPackaged ? [app.getAppPath()] : []);
+  // Профиль (userData) закрыт всегда: в нём маркер обновления, ключи и сессия,
+  // а загрузчик применяет маркер без дополнительных проверок.
+  setProtectedDirectories(
+    app.isPackaged ? [app.getAppPath(), app.getPath('userData')] : [app.getPath('userData')]
+  );
+
+  // Загрузчик portable-сборки при следующем старте подменяет сам себя файлом
+  // WorkSpace.exe.new и применяет app.asar — их запись из интерфейса равна
+  // запуску произвольного кода, поэтому закрываем поимённо в обоих каталогах.
+  const runtimeDir = path.dirname(process.execPath);
+  const installDir = path.dirname(runtimeDir);
+  const updatable = ['WorkSpace.exe', 'WorkSpace.exe.new', 'WorkSpace.exe.old'];
+  const protectedPaths = [
+    ...updatable.flatMap((name) => [path.join(runtimeDir, name), path.join(installDir, name)]),
+    path.join(runtimeDir, 'resources', 'app.asar'),
+  ];
+  setProtectedFiles(protectedPaths);
 }
 
 /**
@@ -531,6 +548,8 @@ ipcMain.handle('excel:runMacro', async (_event, filePath: string, macroName: str
     "$excel = New-Object -ComObject Excel.Application",
     '$excel.Visible = $false',
     '$excel.DisplayAlerts = $false',
+    // Макрос запускает пользователь — макросы должны быть разрешены (Low).
+    '$excel.AutomationSecurity = 1',
     'try {',
     `  $workbook = $excel.Workbooks.Open('${safePath}')`,
     `  $excel.Run('${safeMacro}')`,
@@ -580,6 +599,9 @@ ipcMain.handle('excel:exportCharts', async (_event, filePath: string, charts: Ex
     '$excel = New-Object -ComObject Excel.Application',
     '$excel.Visible = $false',
     '$excel.DisplayAlerts = $false',
+    // Макросы книги не нужны для диаграмм: Workbook_Open чужого .xlsm
+    // иначе исполнился бы при обычном экспорте.
+    '$excel.AutomationSecurity = 3',
     'try {',
     `  $workbook = $excel.Workbooks.Open('${safePath}')`,
     '  foreach ($chartSpec in $charts) {',
@@ -642,6 +664,8 @@ ipcMain.handle('excel:createPivot', async (_event, filePath: string, spec: Excel
     '$excel = New-Object -ComObject Excel.Application',
     '$excel.Visible = $false',
     '$excel.DisplayAlerts = $false',
+    // Сводная не требует макросов книги: Auto_Open чужого .xlsm блокируем.
+    '$excel.AutomationSecurity = 3',
     'try {',
     `  $workbook = $excel.Workbooks.Open('${safePath}')`,
     '  $source = $workbook.Worksheets.Item($spec.sourceSheet)',
@@ -1249,6 +1273,9 @@ function toArrayBuffer(buffer: Buffer | Uint8Array): ArrayBuffer {
 
 ipcMain.handle('fs:statFile', async (_event, filePath: string) => {
   try {
+    // Существование, размер и время изменения — тоже сведения о файле:
+    // без проверки рендерер узнавал о наличии secrets.local.ps1 и ключей.
+    assertReadablePath(filePath);
     const stat = await fs.promises.stat(filePath);
     return {
       success: true,
@@ -1670,7 +1697,9 @@ ipcMain.handle('diagnostics:report', async () => {
             chrome: process.versions.chrome,
             node: process.versions.node,
           },
-          paths: { userData: app.getPath('userData'), home: app.getPath('home'), appData: app.getPath('appData') },
+          // Путь профиля не отдаём: в нём ключи и маркер обновления, а строка
+          // отчёта уходит в текст, который пользователь копирует наружу.
+          paths: { home: app.getPath('home'), appData: app.getPath('appData') },
           memoryMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
         },
         autosave: { dir: autosaveDirPath, snapshots },
@@ -1766,6 +1795,9 @@ ipcMain.handle('autosave:remove', async (_event, name: string) => {
 });
 ipcMain.handle('fs:copyPath', async (_event, source: string, target: string) => {
   try {
+    // Копия переживает денлист чтения: без проверки источника достаточно
+    // скопировать каталог ключей рядом с рабочей папкой и прочитать его оттуда.
+    assertReadablePath(source);
     assertMutablePath(target, 'write');
     if (fs.existsSync(target)) {
       return { success: false, error: 'Объект с таким именем уже существует' };

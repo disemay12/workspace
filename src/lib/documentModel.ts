@@ -2470,18 +2470,69 @@ function replaceAcrossNodes(
   const maxIterations =
     nodes.reduce((sum, node) => sum + (node.textContent ?? '').length, 0) + 1000;
 
-  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-    const combined = nodes.map((node) => node.textContent ?? '').join('');
-    if (!combined || searchFrom >= combined.length) break;
+  // Вхождения копятся в координатах исходной склейки, а узлы правятся пачкой:
+  // пересборка склейки и смещений на каждое вхождение делала replace-all
+  // частого слова квадратичным (10⁴ находок × 200 КБ — фриз интерфейса).
+  // Склейка без правок остаётся валидной, потому что правки идут слева
+  // направо и вставка целиком ложится до курсора поиска: следующее вхождение
+  // начинается в исходной строке ровно там же, где в текущем тексте.
+  const edits: Array<{ at: number; length: number }> = [];
+  let source = nodes.map((node) => node.textContent ?? '').join('');
+  const needle = matchCase ? find : find.toLowerCase();
+  let haystack = matchCase ? source : source.toLowerCase();
+  /** Сдвиг текущего текста относительно склейки: сумма вставок до курсора. */
+  let shift = 0;
+  let pending = false;
 
-    const haystack = matchCase ? combined : combined.toLowerCase();
-    const needle = matchCase ? find : find.toLowerCase();
+  /** Применяет накопленные правки к узлам и перестраивает склейку. */
+  const flush = () => {
+    if (!pending) return;
+    let editIndex = 0;
+    let emitted = false;
+    let base = 0;
+    for (const node of nodes) {
+      const text = node.textContent ?? '';
+      const end = base + text.length;
+      let out = '';
+      let cursor = base;
+      while (editIndex < edits.length && edits[editIndex].at < end) {
+        const edit = edits[editIndex];
+        const editEnd = edit.at + edit.length;
+        out += text.slice(cursor - base, Math.max(edit.at, base) - base);
+        if (!emitted) {
+          out += replacement;
+          emitted = true;
+        }
+        cursor = Math.min(editEnd, end);
+        // Правка продолжается в следующем узле: вставка уже сделана.
+        if (editEnd > end) break;
+        editIndex += 1;
+        emitted = false;
+      }
+      out += text.slice(cursor - base);
+      if (out !== text) node.textContent = out;
+      base = end;
+    }
+    source = nodes.map((node) => node.textContent ?? '').join('');
+    haystack = matchCase ? source : source.toLowerCase();
+    searchFrom += shift;
+    shift = 0;
+    edits.length = 0;
+    pending = false;
+  };
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    if (!source || searchFrom >= source.length) break;
+
     let at = haystack.indexOf(needle, searchFrom);
     let length = find.length;
 
     // Модель может прислать ту же фразу с другим числом пробелов.
     if (at === -1) {
-      const normalized = collapseWhitespace(combined);
+      // Нечёткий поиск идёт по текущему тексту — сначала переносим правки.
+      flush();
+      if (!source || searchFrom >= source.length) break;
+      const normalized = collapseWhitespace(source);
       const normalizedFind = collapseWhitespace(find).text;
       if (normalizedFind) {
         const normalizedHaystack = matchCase ? normalized.text : normalized.text.toLowerCase();
@@ -2493,61 +2544,23 @@ function replaceAcrossNodes(
         }
         if (normalizedAt !== -1) {
           at = normalized.map[normalizedAt];
-          length =
-            normalized.map[normalizedAt + normalizedNeedle.length - 1] + 1 - at;
+          length = normalized.map[normalizedAt + normalizedNeedle.length - 1] + 1 - at;
         }
       }
     }
 
     if (at === -1) break;
 
-    const starts: number[] = [];
-    let cursor = 0;
-    for (const node of nodes) {
-      starts.push(cursor);
-      cursor += (node.textContent ?? '').length;
-    }
-
-    let startIndex = 0;
-    while (
-      startIndex < nodes.length - 1 &&
-      starts[startIndex] + (nodes[startIndex].textContent ?? '').length <= at
-    ) {
-      startIndex += 1;
-    }
-
-    let endIndex = startIndex;
-    while (
-      endIndex < nodes.length &&
-      starts[endIndex] + (nodes[endIndex].textContent ?? '').length < at + length
-    ) {
-      endIndex += 1;
-    }
-    if (endIndex >= nodes.length) break;
-
-    const startOffset = at - starts[startIndex];
-    const endOffset = at + length - starts[endIndex];
-    const startNode = nodes[startIndex];
-    const endNode = nodes[endIndex];
-    const startText = startNode.textContent ?? '';
-
-    if (startNode === endNode) {
-      startNode.textContent =
-        startText.slice(0, startOffset) + replacement + startText.slice(endOffset);
-    } else {
-      startNode.textContent = startText.slice(0, startOffset) + replacement;
-      for (let index = startIndex + 1; index < endIndex; index += 1) {
-        nodes[index].textContent = '';
-      }
-      endNode.textContent = (endNode.textContent ?? '').slice(endOffset);
-    }
-
+    edits.push({ at, length });
+    pending = true;
     replaced += 1;
+    // Следующая находка не пересекается с вставкой: курсор за совпадением.
+    searchFrom = at + length;
+    shift += replacement.length - length;
     if (!all) break;
-    // Продолжаем искать сразу за вставленным фрагментом.
-    searchFrom = at + replacement.length;
   }
 
+  flush();
   return replaced;
 }
 

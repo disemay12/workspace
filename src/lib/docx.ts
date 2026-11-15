@@ -7,6 +7,7 @@ import {
   registerCustomStyle,
   type CustomStyleDefinition,
 } from './customStyles';
+import { isSafeLinkHref } from './sanitizeMarkdownHtml';
 
 /**
  * Преобразование между HTML-полотном редактора Word и пакетом .docx.
@@ -162,6 +163,24 @@ const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationship
 // без отношения открывается как «битая ссылка».
 const HYPERLINK_REL = `${R_NS}/hyperlink`;
 
+/**
+ * Схемы, исполняющиеся в окне с мостом electronAPI: такая цель не должна ни
+ * попадать в href, ни записываться в пакет.
+ */
+const UNSAFE_LINK_SCHEME = /^(?:javascript|data|vbscript):/i;
+
+/**
+ * Единая проверка цели ссылки для чтения и записи, чтобы списки схем не
+ * разъезжались: при записи Word-ссылки на связанные файлы (относительные,
+ * file:/ftp:) штатны и терять их нельзя. `forHref` дополнительно требует
+ * isSafeLinkHref: href в редакторе — кликабельный переход, а не запись в rels.
+ */
+function isSafeLinkTarget(target: string, forHref = false): boolean {
+  const text = String(target ?? '').trim();
+  if (!text || UNSAFE_LINK_SCHEME.test(text)) return false;
+  return !forHref || isSafeLinkHref(text);
+}
+
 const HIGHLIGHTS: Record<string, string> = {
   yellow: '#fef08a',
   green: '#bbf7d0',
@@ -207,15 +226,13 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
     zip.file('word/footnotes.xml')?.async('string') ?? '',
   ]);
 
-  const doc = parseXml(docXml);
-  // Без этой проверки битый XML давал {html:'<p></p>'} и редактор сохранял
-  // поверх файла пустой документ.
-  if (doc.getElementsByTagName('parsererror').length > 0) {
-    throw new DocxCorruptError('word/document.xml повреждён: файл не разбирается как XML');
-  }
-  const rels = relsXml ? parseXml(relsXml) : null;
-  const numbering = numberingXml ? parseXml(numberingXml) : null;
-  const styles = stylesDoc ? parseXml(stylesDoc) : null;
+  const doc = parsePart(docXml, 'word/document.xml');
+  if (!doc) throw new DocxCorruptError('В пакете нет word/document.xml');
+  // Битая часть молча давала пустые карты стилей/связей, и сохранение
+  // затирало оформление и ссылки: валидируем каждую разбираемую часть.
+  const rels = parsePart(relsXml, 'word/_rels/document.xml.rels');
+  const numbering = parsePart(numberingXml, 'word/numbering.xml');
+  const styles = parsePart(stylesDoc, 'word/styles.xml');
   currentComments = parseComments(commentsDoc);
   currentFootnotes = parseFootnotes(footnotesDoc);
   currentRunId = 0;
@@ -1048,7 +1065,11 @@ async function patchDocxPackage(
   let nextDocumentXml =
     docXml.slice(0, innerStart) + bodyParts.join('') + sectPrXml + docXml.slice(closeIndex);
 
-  if (pendingLinks.length > 0) nextDocumentXml = ensureRelationshipsNamespace(nextDocumentXml);
+  // Объявление xmlns:r нужно ровно тогда, когда в готовом XML есть r:id:
+  // ссылка может переиспользовать отношение из rels и не попасть в pendingLinks.
+  if (/\br:id\s*=/.test(nextDocumentXml)) {
+    nextDocumentXml = ensureRelationshipsNamespace(nextDocumentXml);
+  }
 
   if (options.headerFooterEdits?.length) {
     nextDocumentXml = await editHeaderFooterParts(
@@ -1593,8 +1614,8 @@ function listItemStyle(p: Element): string {
 
 function parseComments(xml: string): Map<number, AnnotationComment> {
   const result = new Map<number, AnnotationComment>();
-  if (!xml) return result;
-  const doc = parseXml(xml);
+  const doc = parsePart(xml, 'word/comments.xml');
+  if (!doc) return result;
   for (const comment of elementsByLocal(doc, 'comment')) {
     const id = Number(attr(comment, 'id'));
     if (!Number.isFinite(id)) continue;
@@ -1611,8 +1632,8 @@ function parseComments(xml: string): Map<number, AnnotationComment> {
 
 function parseFootnotes(xml: string): Map<number, string> {
   const result = new Map<number, string>();
-  if (!xml) return result;
-  const doc = parseXml(xml);
+  const doc = parsePart(xml, 'word/footnotes.xml');
+  if (!doc) return result;
   for (const footnote of elementsByLocal(doc, 'footnote')) {
     const type = attr(footnote, 'type');
     if (type === 'separator' || type === 'continuationSeparator') continue;
@@ -1736,7 +1757,10 @@ async function paragraphInner(
       const relId = child.getAttribute('r:id') ?? child.getAttributeNS(R_NS, 'id') ?? '';
       const anchor = attr(child, 'anchor');
       // Цель берём из rels: без этого ссылка превращалась в href="#".
-      const href = links.get(relId) || (anchor ? `#${anchor}` : '');
+      // В href попадает только безопасная схема (проверка общая с записью):
+      // javascript: в окне с мостом electronAPI — это исполнение кода.
+      const target = links.get(relId) ?? '';
+      const href = isSafeLinkTarget(target, true) ? target : anchor ? `#${anchor}` : '';
       const inner = hyperlinkInner(child, images);
       html += href ? `<a href="${escapeAttr(href)}">${inner}</a>` : inner;
     } else if (name === 'commentRangeStart') {
@@ -2370,7 +2394,9 @@ function runsFromInline(
       const anchor = href.slice(1);
       return anchor ? `<w:hyperlink w:anchor="${escapeXml(anchor)}">${inner}</w:hyperlink>` : inner;
     }
-    if (!/^(https?:\/\/|mailto:|tel:)/i.test(href)) return inner;
+    // Схема проверяется той же функцией, что и при чтении: relative и
+    // file:/ftp: — штатные Word-ссылки на связанные файлы, терять их нельзя.
+    if (!isSafeLinkTarget(href)) return inner;
     // Раньше ссылка уходила в поле HYPERLINK: при правке абзаца Word
     // пересобирал поле и <w:hyperlink> исходника терялся вместе с r:id.
     return `<w:hyperlink r:id="${hyperlinkId(href)}">${inner}</w:hyperlink>`;
@@ -2914,6 +2940,19 @@ function twipsToMm(twips: number): number {
 
 function parseXml(xml: string): Document {
   return new DOMParser().parseFromString(xml, 'application/xml');
+}
+
+/**
+ * Разобранная часть пакета: битый XML не должен молча давать пустую карту,
+ * иначе правка абзаца сохраняла документ без стилей, нумерации и ссылок.
+ */
+function parsePart(xml: string, partName: string): Document | null {
+  if (!xml) return null;
+  const doc = parseXml(xml);
+  if (doc.getElementsByTagName('parsererror').length > 0) {
+    throw new DocxCorruptError(`${partName} повреждён: файл не разбирается как XML`);
+  }
+  return doc;
 }
 
 function localName(node: Element): string {

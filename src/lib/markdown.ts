@@ -35,13 +35,8 @@ export {
   isSafeLinkHref,
   sanitizeFenceLanguage,
 } from './sanitizeMarkdownHtml';
-import {
-  escapeHtml,
-  escapeRawHtml,
-  isSafeImageSrc,
-  isSafeLinkHref,
-  sanitizeFenceLanguage,
-} from './sanitizeMarkdownHtml';
+import { escapeHtml, isSafeLinkHref } from './sanitizeMarkdownHtml';
+import { createMarkedRenderers } from './markedRenderers';
 
 // Инициализируем mermaid один раз
 let mermaidInitialized = false;
@@ -105,78 +100,25 @@ const markedInstance = new Marked({
   breaks: true,
 });
 
+// Единственное определение боевых рендереров живёт в markedRenderers.ts:
+// этот же файл импортирует проверочный набор, иначе он проверял копию.
 markedInstance.use({
   renderer: {
-    /** Единственная точка, где в вывод попадает пользовательский HTML. */
-    html({ text }) {
-      return escapeRawHtml(text);
-    },
-    /**
-     * Ссылка тоже приходит из документа, а переход по `javascript:` исполняет
-     * код в окне с мостом electronAPI. Разрешены только явные схемы.
-     */
-    link({ href, title, tokens }) {
-      const text = this.parser.parseInline(tokens);
-      if (!isSafeLinkHref(href)) return text;
-      const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-      return `<a href="${escapeHtml(href)}"${titleAttr} class="ws-link text-ws-accent underline decoration-dotted">${text}</a>`;
-    },
-    image({ href, title, text }) {
-      if (!isSafeImageSrc(href)) return escapeHtml(text || '');
-      const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-      return `<img src="${escapeHtml(href)}" alt="${escapeHtml(text || '')}"${titleAttr} class="max-w-full rounded my-1" />`;
-    },
-    code({ text, lang }) {
-      // info-string фенса приходит из документа: вставлять его в разметку
-      // без экранирования — тот же XSS, что и сырой HTML.
-      const language = sanitizeFenceLanguage(lang || '');
-
-      // Mermaid диаграмма
-      if (language === 'mermaid') {
-        const id = 'mermaid_' + Math.random().toString(36).substring(2, 9);
-        return `<div class="mermaid-diagram my-3 overflow-x-auto rounded border border-ws bg-ws-elevated p-3 text-center" data-id="${id}" data-mermaid="${encodeURIComponent(text)}"><pre class="mermaid text-xs font-mono">${escapeHtml(text)}</pre></div>`;
-      }
-
-      // Подсветка Prism
-      let highlighted = '';
-      if (language && Prism.languages[language]) {
+    ...createMarkedRenderers({
+      // Prism подключается адаптером: модуль рендереров общий с проверочным
+      // набором, который запускается вне браузера и подсветку не тянет.
+      highlight(text, language) {
+        if (!language || !Prism.languages[language]) return escapeHtml(text);
         try {
-          highlighted = Prism.highlight(text, Prism.languages[language], language);
+          return Prism.highlight(text, Prism.languages[language], language);
         } catch {
-          highlighted = escapeHtml(text);
+          return escapeHtml(text);
         }
-      } else {
-        highlighted = escapeHtml(text);
-      }
-
-      return `<div class="relative group my-2 overflow-hidden rounded border border-ws bg-ws-elevated text-xs font-mono">
-        <div class="flex items-center justify-between border-b border-ws bg-ws-panel px-3 py-1 text-[10px] text-ws-muted uppercase tracking-wider">
-          <span>${language || 'text'}</span>
-          <button class="copy-code-btn rounded px-1.5 py-0.5 text-[10px] text-ws-faint hover:text-ws hover:bg-ws-hover transition-colors" data-code="${encodeURIComponent(text)}">Копировать</button>
-        </div>
-        <pre class="p-3 overflow-x-auto language-${language || 'text'}"><code>${highlighted}</code></pre>
-      </div>`;
-    },
-    table({ header, rows }) {
-      // marked v18 передаёт ячейки объектами { text, align, tokens }.
-      // Прямая вставка массива в шаблон давала «[object Object]» в каждой ячейке.
-      const renderCell = (cell: { text: string; align?: string | null }, tag: 'th' | 'td') => {
-        const align =
-          cell.align === 'center'
-            ? 'text-center'
-            : cell.align === 'right'
-              ? 'text-right'
-              : 'text-left';
-        return `<${tag} class="border border-ws px-2 py-1 ${align}">${markedInstance.parseInline(
-          cell.text ?? ''
-        )}</${tag}>`;
-      };
-      const head = header.map((cell) => renderCell(cell, 'th')).join('');
-      const body = rows
-        .map((row) => `<tr>${row.map((cell) => renderCell(cell, 'td')).join('')}</tr>`)
-        .join('');
-      return `<div class="my-3 overflow-x-auto"><table class="w-full border-collapse border border-ws text-xs"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
-    },
+      },
+      parseInline(text) {
+        return String(markedInstance.parseInline(text));
+      },
+    }),
     blockquote({ text }) {
       return `<blockquote class="border-l-4 border-ws-accent bg-ws-accent-soft/30 px-3 py-1.5 my-2 text-xs italic text-ws-muted rounded-r">${text}</blockquote>`;
     },

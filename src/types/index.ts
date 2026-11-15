@@ -413,6 +413,8 @@ declare global {
         keys: Record<string, string>;
         /** Провайдеры, чьи ключи не расшифровались на этом компьютере. */
         keyErrors?: string[];
+        /** Провайдеры, для которых в профиле есть ключ (без самих значений). */
+        keyProviders?: string[];
         /** Шифрование ОС недоступно: ключ лежит в файле без защиты. */
         encryptionUnavailable?: boolean;
       }>;

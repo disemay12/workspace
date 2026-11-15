@@ -16,6 +16,8 @@ import * as path from 'path';
 let workspaceRoot = '';
 /** Системные каталоги, которые добавляет главный процесс (каталог приложения). */
 let extraProtected: string[] = [];
+/** Точные файлы программы: их загрузчик применяет при обновлении. */
+let protectedFiles: string[] = [];
 
 export function setWorkspaceRoot(value: string): void {
   workspaceRoot = value ? canonicalPath(value) : '';
@@ -27,6 +29,15 @@ export function getWorkspaceRoot(): string {
 
 export function setProtectedDirectories(dirs: string[]): void {
   extraProtected = dirs.filter(Boolean).map(canonicalPath);
+}
+
+/**
+ * Файлы, которые загрузчик и Electron загружают при следующем старте.
+ * Рендерер мог записать `WorkSpace.exe.new` рядом с программой, и загрузчик
+ * подменял им сам себя — это запуск произвольного кода без обновления.
+ */
+export function setProtectedFiles(files: string[]): void {
+  protectedFiles = files.filter(Boolean).map((file) => canonicalPath(file).toLowerCase());
 }
 
 /** Убирает завершающие точки и пробелы: Windows их в именах отбрасывает. */
@@ -106,6 +117,9 @@ export function assertMutablePath(target: string, operation: 'write' | 'delete')
   if (operation === 'delete' && workspaceRoot && isInsidePath(workspaceRoot, resolved)) {
     throw new Error('Нельзя удалить или переименовать корень рабочей папки');
   }
+  if (protectedFiles.includes(resolved.toLowerCase())) {
+    throw new Error('Файл программы защищён от изменения из интерфейса');
+  }
   for (const protectedDir of protectedDirectories()) {
     if (isInsidePath(resolved, protectedDir)) {
       throw new Error(`Каталог защищён: ${protectedDir}`);
@@ -118,17 +132,32 @@ export function assertMutablePath(target: string, operation: 'write' | 'delete')
  * это ключи и настройки самого приложения. Путь к ним уже известен рендереру
  * (диагностика показывает userData), поэтому запрет нужен именно на чтении.
  */
-const SECRET_FILE_RE =
-  /(^|[\\/])(secrets\.local\.[^\\/]*|ai-settings\.json|gdrive\.json|workspace-session\.json|pending-update\.txt|\.env[^\\/]*|id_(rsa|dsa|ecdsa|ed25519)[^\\/]*|[^\\/]+\.(pem|ppk|pfx|p12|kdbx))$/i;
+const APP_SECRET_RE =
+  /(^|[\\/])(secrets\.local\.[^\\/]*|ai-settings\.json|gdrive\.json|workspace-session\.json|pending-update\.txt|launcher\.json|update\.log)$/i;
+/**
+ * Секреты пользователя. Вне открытой рабочей папки они закрыты, внутри —
+ * открываются: редактор кода обязан показывать `.env` и `.pem` проекта,
+ * иначе работа с ним невозможна.
+ */
+const USER_SECRET_RE =
+  /(^|[\\/])(\.env[^\\/]*|id_(rsa|dsa|ecdsa|ed25519)[^\\/]*|[^\\/]+\.(pem|ppk|pfx|p12|kdbx))$/i;
 const SENSITIVE_DIRS = ['.ssh', '.aws', '.gnupg', '.password-store', 'gcloud'];
+
+function matchesSensitiveDir(canonical: string): boolean {
+  return SENSITIVE_DIRS.some(
+    (dir) => canonical.includes(`${path.sep}${dir}${path.sep}`) || canonical.endsWith(`${path.sep}${dir}`)
+  );
+}
 
 export function isSecretPath(target: string): boolean {
   const canonical = canonicalPath(target).toLowerCase();
   if (!canonical) return false;
-  if (SECRET_FILE_RE.test(canonical)) return true;
-  return SENSITIVE_DIRS.some(
-    (dir) => canonical.includes(`${path.sep}${dir}${path.sep}`) || canonical.endsWith(`${path.sep}${dir}`)
-  );
+  // Настройки самого приложения закрыты везде: рабочей папкой может оказаться
+  // профиль пользователя, и тогда запрет «снаружи» ничего бы не значил.
+  if (APP_SECRET_RE.test(canonical)) return true;
+  if (matchesSensitiveDir(canonical) && !isInsidePath(canonical, workspaceRoot)) return true;
+  if (!USER_SECRET_RE.test(canonical)) return false;
+  return !workspaceRoot || !isInsidePath(canonical, workspaceRoot);
 }
 
 /** Бросает, если рендерер пытается прочитать секреты приложения. */
