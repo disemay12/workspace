@@ -427,6 +427,9 @@ async function main() {
       'doc-agent-check.js',
       // Запускается по вложенному пути: импортирует src/services и src/lib.
       'electron/checks/conversion-check.js',
+      // Тоже вложенный путь: набор открывает окно и печатает через живой
+      // редактор (провайдер печати Word сам лежит в бандле рендерера).
+      'electron/checks/word-pages-check.js',
       'v11-check.js',
       // Боевые обработчики aiSettings и preload: поднимает окно в своём профиле.
       'key-migration-check.js',
@@ -492,6 +495,10 @@ async function main() {
     ['AI: стриминг и Ctrl+K', 'ai-check.js', 'ai-check.json'],
     ['AI: вставка кода в редактор', 'insert-check.js', 'insert-check.json'],
     ['AI: агентные правки .docx', 'doc-agent-check.js', 'doc-agent-check.json'],
+    // Листы Word и печать: поднимает окно, открывает .docx на 20+ листов и
+    // проверяет геометрию, колонтитулы, сохранение без маркеров и PDF
+    // предпросмотра. Чистой логики здесь нет — только живой редактор.
+    ['Листы Word и печать', 'electron/checks/word-pages-check.js', 'word-pages-check.json'],
     // Импортирует src/** — из плоского dist-electron/ require не разрешается,
     // процесс падал диалогом ошибки и набор «висел» до таймаута.
     ['Конвертация форматов и ширины Excel', 'electron/checks/conversion-check.js', 'conversion-check.json'],
