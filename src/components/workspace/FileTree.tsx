@@ -29,6 +29,7 @@ import {
   FolderInput,
   FileSearch,
   SlidersHorizontal,
+  Printer,
 } from 'lucide-react';
 import { FileItem, FileType } from '../../types';
 import { cn, formatBytes } from '../../lib/utils';
@@ -857,6 +858,7 @@ export const FileTree: React.FC<Props> = ({
             { id: 'open-new', label: 'Открыть в новой вкладке', icon: <Files size={13} /> },
             { id: 'open-secondary', label: 'Открыть во второй области', icon: <ExternalLink size={13} /> },
             { id: 'open-external', label: 'Открыть в системе', icon: <ExternalLink size={13} /> },
+            { id: 'print', label: 'Печать…', icon: <Printer size={13} /> },
           ] : [
             { id: 'new-file', label: 'Новый файл', icon: <FilePlus2 size={13} /> },
             { id: 'new-folder', label: 'Новая папка', icon: <FolderPlus size={13} /> },

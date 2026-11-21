@@ -59,10 +59,21 @@ export interface PageSetup {
   marginRightMm?: number;
   marginBottomMm?: number;
   marginLeftMm?: number;
+  /** Расстояние верхнего колонтитула от края листа (w:pgMar/@w:header). */
+  headerMm?: number;
+  /** Расстояние нижнего колонтитула от края листа (w:pgMar/@w:footer). */
+  footerMm?: number;
+  /** Переплётный отступ слева (w:pgMar/@w:gutter). */
+  gutterMm?: number;
   fontFamily?: string;
   fontSizePt?: number;
   /** Множитель межстрочного интервала: 1 — одинарный, 1.5 — полуторный. */
   lineSpacing?: number;
+  /**
+   * Как понимать lineSpacing: auto — множитель (w:lineRule="auto"),
+   * exact — ровно столько пунктов, atLeast — не меньше пунктов.
+   */
+  lineSpacingRule?: 'auto' | 'exact' | 'atLeast';
 }
 
 /* ============================================================
@@ -299,6 +310,15 @@ declare global {
       /** Существует ли путь — для предупреждения о перезаписи в «Сохранить как». */
       pathExists?: (targetPath: string) => Promise<boolean>;
       exportPdf: (html: string, suggestedName?: string, targetPath?: string, pageSize?: { width: number; height: number }) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
+      /** Печать документа или PDF для предпросмотра (mode='preview'). */
+      printDocument?: (request: {
+        html: string;
+        title?: string;
+        mode: 'print' | 'preview';
+        pageSizeMicrons?: { width: number; height: number };
+        landscape?: boolean;
+        scaleFactor?: number;
+      }) => Promise<{ success: boolean; canceled?: boolean; error?: string; pdfBase64?: string }>;
   exportSlideImages?: (
     htmlPages: string[],
     outDir: string,

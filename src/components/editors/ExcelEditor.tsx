@@ -40,8 +40,10 @@ import {
   RefreshCw,
   Play,
 } from 'lucide-react';
-import { cn } from '../../lib/utils';
+import { baseName, cn } from '../../lib/utils';
 import { registerSheetController } from '../../services/sheetBridge';
+import { registerPrintProvider } from '../../services/printBridge';
+import { buildExcelDocument } from '../../services/printService';
 import type { SheetReadResult } from '../../services/sheetBridge';
 import { ClipboardPaste, Undo2, Redo2 } from 'lucide-react';
 import { parseClipboardTable } from '../../lib/clipboardTable';
@@ -151,9 +153,84 @@ function whyUnfixable(formula: string, shown: string): string {
   return ` (не поддерживается: ${[...unknown].join(', ')})`;
 }
 
+/** Стиль React (camelCase) → значение атрибута style. */
+function cssPropsToText(css: Record<string, string | number>): string {
+  return Object.entries(css)
+    .map(([key, value]) => `${key.replace(/[A-Z]/g, (ch) => `-${ch.toLowerCase()}`)}:${value}`)
+    .join(';');
+}
+
+function escapeCellHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * Лист как печатная таблица: ширины колонок, объединения, заливка, границы и
+ * числовые форматы — как в сетке редактора.
+ */
+function buildSheetPrintTable(
+  name: string,
+  grid: Array<Array<string | number | boolean | null | undefined>>,
+  meta: SheetFmt.SheetMeta,
+  display: (row: number, col: number) => string
+): { html: string; widthPx: number } {
+  let lastRow = 0;
+  let lastCol = 0;
+  const note = (row: number, col: number) => {
+    lastRow = Math.max(lastRow, row);
+    lastCol = Math.max(lastCol, col);
+  };
+  for (let row = 0; row < grid.length; row += 1) {
+    const cells = grid[row] ?? [];
+    for (let col = 0; col < cells.length; col += 1) {
+      const value = cells[col];
+      if (value !== undefined && value !== null && String(value).trim() !== '') note(row, col);
+    }
+  }
+  for (const address of Object.keys(meta.cells)) {
+    const parsed = SheetFmt.parseAddress(address);
+    if (parsed) note(parsed.row, parsed.col);
+  }
+  if (lastRow === 0 && lastCol === 0 && grid.length === 0) {
+    return { html: '<p>Лист пуст</p>', widthPx: 0 };
+  }
+
+  const merges = SheetFmt.buildMergeInfo(meta.merges);
+  const widths: number[] = [];
+  for (let col = 0; col <= lastCol; col += 1) {
+    widths.push(meta.colWidths[col] ?? SheetFmt.DEFAULT_COL_WIDTH);
+  }
+  const rows: string[] = [];
+  for (let row = 0; row <= lastRow; row += 1) {
+    const cells: string[] = [];
+    for (let col = 0; col <= lastCol; col += 1) {
+      const address = SheetFmt.cellAddress(row, col);
+      if (merges.covered.has(address)) continue;
+      const merge = merges.anchors.get(address);
+      const style = meta.cells[address];
+      const css = SheetFmt.styleToCss(style);
+      const shown = SheetFmt.formatCellValue(display(row, col), style?.numberFormat);
+      const span =
+        (merge && merge.colSpan > 1 ? ` colspan="${merge.colSpan}"` : '') +
+        (merge && merge.rowSpan > 1 ? ` rowspan="${merge.rowSpan}"` : '');
+      const styleAttr = Object.keys(css).length ? ` style="${cssPropsToText(css)}"` : '';
+      cells.push(`<td${span}${styleAttr}>${escapeCellHtml(shown)}</td>`);
+    }
+    const height = meta.rowHeights[row];
+    rows.push(`<tr${height ? ` style="height:${height}px"` : ''}>${cells.join('')}</tr>`);
+  }
+  const widthPx = widths.reduce((sum, value) => sum + value, 0);
+  const table =
+    `<table style="border-collapse:collapse;table-layout:fixed;width:${widthPx}px" data-sheet="${escapeCellHtml(
+      name
+    )}">` +
+    `<colgroup>${widths.map((width) => `<col style="width:${width}px">`).join('')}</colgroup>` +
+    `<tbody>${rows.join('')}</tbody></table>`;
+  return { html: table, widthPx };
+}
+
 /** Извлекает табличные данные из ответа AI: Markdown, JSON values/rows или TSV. */
-function extractTableRows(text: string): string[][] {
-  const table = detectMarkdownTables(text)[0];
+function extractTableRows(text: string): string[][] {  const table = detectMarkdownTables(text)[0];
   if (table?.columns?.length) {
     return [table.columns, ...table.rows];
   }
@@ -2957,6 +3034,30 @@ export const ExcelEditor: React.FC<Props> = ({
       },
     });
   }, [tab.id, activeSheet, addSheet, renameSheet, removeSheet, parseTarget, applyBatch, commitMeta, selectionRange, syncWorkbook]);
+
+  /**
+   * Печать: все листы книги, оформление берётся из живых ячеек и метаданных,
+   * поэтому на бумаге видно то же, что в сетке.
+   */
+  useEffect(() => {
+    return registerPrintProvider({
+      tabId: tab.id,
+      build: async () => {
+        const sheets = sheetNamesRef.current.map((name) => {
+          const grid = sheetsRef.current[name] ?? [];
+          const meta = SheetFmt.ensureSheetMeta(metaRef.current, name);
+          const table = buildSheetPrintTable(name, grid, meta, (row, col) =>
+            computeCellDisplay(sheetsRef.current, name, row, col)
+          );
+          return { name, html: table.html, widthPx: table.widthPx };
+        });
+        return buildExcelDocument({
+          title: baseName(tab.name).replace(/\.[^.]+$/, ''),
+          sheets,
+        });
+      },
+    });
+  }, [tab.id, tab.name]);
 
   /* ---------------- Запрос формулы у AI ---------------- */
 

@@ -268,6 +268,168 @@
   text-decoration: underline;
 }
 
+/* ---------- Лист Word: типографика как в Word ---------- */
+/*
+ * Оформление .docx приходит inline-стилями из sectPr/styles.xml (размер,
+ * поля, интервалы). Здесь только значения по умолчанию, чтобы неоформленный
+ * абзац выглядел как в Word, а не как текст в браузере.
+ *
+ * display:flex — принципиально: CSS схлопывает margin между соседними
+ * абзацами, Word складывает «интервал после» + «интервал до».
+ */
+.word-sheet {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: #ffffff;
+  color: #000000;
+  font-family: Calibri, 'Segoe UI', Arial, sans-serif;
+  font-size: 11pt;
+  line-height: normal;
+  text-align: left;
+  /* 1,25 см — табстоп Word по умолчанию. */
+  tab-size: 35.43px;
+  overflow-wrap: break-word;
+}
+.word-sheet > * {
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+.word-sheet p {
+  margin: 0 0 8pt;
+}
+.word-sheet h1 {
+  font-size: 16pt;
+  font-weight: 700;
+  color: #1f3864;
+  margin: 12pt 0 3pt;
+  line-height: normal;
+}
+.word-sheet h2 {
+  font-size: 13pt;
+  font-weight: 700;
+  color: #1f3864;
+  margin: 12pt 0 3pt;
+  line-height: normal;
+}
+.word-sheet h3 {
+  font-size: 12pt;
+  font-weight: 700;
+  color: #1f3864;
+  margin: 12pt 0 3pt;
+  line-height: normal;
+}
+.word-sheet h4,
+.word-sheet h5,
+.word-sheet h6 {
+  font-size: 11pt;
+  font-weight: 700;
+  font-style: italic;
+  color: #1f3864;
+  margin: 10pt 0 3pt;
+  line-height: normal;
+}
+.word-sheet ul,
+.word-sheet ol {
+  margin: 0;
+  padding-left: 0;
+  list-style-position: outside;
+}
+.word-sheet li {
+  margin: 0;
+}
+/* Абзац без отступов из numbering.xml (например, вставленный из Markdown). */
+.word-sheet li:not([style]) {
+  margin-left: 18pt;
+}
+.word-sheet li > ul,
+.word-sheet li > ol {
+  margin-left: 18pt;
+}
+.word-sheet table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+  margin: 0;
+}
+.word-sheet td,
+.word-sheet th {
+  border: none;
+  padding: 0;
+  vertical-align: top;
+  text-align: left;
+}
+.word-sheet th {
+  background: transparent;
+  font-weight: 700;
+}
+.word-sheet img {
+  max-width: 100%;
+  height: auto;
+  margin: 0;
+}
+.word-sheet a {
+  color: #0563c1;
+  text-decoration: underline;
+}
+.word-sheet blockquote {
+  margin: 0 0 8pt 1.27cm;
+  padding: 0;
+  border: none;
+  color: inherit;
+  font-style: italic;
+}
+.word-sheet code,
+.word-sheet pre {
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 10pt;
+}
+.word-sheet pre {
+  white-space: pre-wrap;
+  margin: 0 0 8pt;
+}
+
+/* Разрыв листа, вставленный разметкой: на экране — промежуток между листами. */
+.ws-page-gap {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Фон листов рисуется под полотном и в поток не попадает. */
+.ws-page-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.ws-page-sheet {
+  position: absolute;
+  background: #ffffff;
+  box-shadow:
+    0 0 0 1px rgb(0 0 0 / 0.12),
+    0 2px 8px rgb(0 0 0 / 0.16);
+}
+.ws-page-header,
+.ws-page-footer {
+  position: absolute;
+  color: #000000;
+  font-family: Calibri, 'Segoe UI', Arial, sans-serif;
+  font-size: 10pt;
+  line-height: 1.2;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ws-page-number {
+  position: absolute;
+  color: #6b7280;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------- Markdown-предпросмотр ---------- */
 .ws-prose {
   color: var(--ws-text);

@@ -118,6 +118,20 @@ const electronAPI = {
     pageSize?: { width: number; height: number }
   ): Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }> =>
     ipcRenderer.invoke('pdf:export', html, suggestedName, targetPath, pageSize),
+  /** Печать или предпросмотр: mode='preview' возвращает PDF в base64. */
+  printDocument: (request: {
+    html: string;
+    title?: string;
+    mode: 'print' | 'preview';
+    pageSizeMicrons?: { width: number; height: number };
+    landscape?: boolean;
+    scaleFactor?: number;
+  }): Promise<{
+    success: boolean;
+    canceled?: boolean;
+    error?: string;
+    pdfBase64?: string;
+  }> => ipcRenderer.invoke('print:document', request),
   exportSlideImages: (
     htmlPages: string[],
     outDir: string,

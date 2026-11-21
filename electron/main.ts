@@ -17,6 +17,7 @@ import { registerTerminal } from './terminal';
 import { registerContextMenuIpc } from './contextMenu';
 import { registerUpdater, UPDATE_EXIT_CODE } from './updater';
 import { openExternalSafe } from './safeOpen';
+import { runPrint, type PrintRequest } from './printWindow';
 import {
   assertMutablePath,
   assertReadablePath,
@@ -1493,48 +1494,54 @@ ipcMain.handle(
     targetPath?: string,
     pageSize?: { width: number; height: number }
   ) => {
-    let win: BrowserWindow | null = null;
     try {
-      win = new BrowserWindow({
-        show: false,
-        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
-      });
-      hardenWebContents(win);
-      await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-      await waitForPaint(win);
-      // Размер страницы в микронах: презентация печатается своим форматом,
+      // Размер страницы в микронах: презентация сохраняется своим форматом,
       // иначе слайд 16:9 попадёт на A4 с полями.
-      const hasCustomSize = Boolean(pageSize && pageSize.width > 0 && pageSize.height > 0);
-      const pdf = await win.webContents.printToPDF({
-        printBackground: true,
-        ...(hasCustomSize && pageSize
-          ? {
-              pageSize: { width: Math.round(pageSize.width), height: Math.round(pageSize.height) },
-              margins: { top: 0, bottom: 0, left: 0, right: 0 },
-              preferCSSPageSize: true,
-            }
-          : { pageSize: 'A4' as const }),
-      });
+      const result = await runPrint(
+        {
+          html,
+          mode: 'preview',
+          ...(pageSize && pageSize.width > 0 && pageSize.height > 0
+            ? { pageSizeMicrons: { width: pageSize.width, height: pageSize.height } }
+            : {}),
+        },
+        { harden: hardenWebContents, waitForPaint }
+      );
+      if (!result.success || !result.pdfBase64) {
+        return { success: false, error: result.error ?? 'Не удалось собрать PDF' };
+      }
       let output = targetPath || '';
       if (!output) {
-        const result = await dialog.showSaveDialog({
+        const dialogResult = await dialog.showSaveDialog({
           title: 'Экспорт в PDF',
           defaultPath: suggestedName,
           filters: [{ name: 'PDF', extensions: ['pdf'] }],
         });
-        if (result.canceled || !result.filePath) return { success: false, canceled: true };
-        output = result.filePath;
+        if (dialogResult.canceled || !dialogResult.filePath) {
+          return { success: false, canceled: true };
+        }
+        output = dialogResult.filePath;
       }
       assertMutablePath(output, 'write');
-      await fs.promises.writeFile(output, pdf);
+      await fs.promises.writeFile(output, Buffer.from(result.pdfBase64, 'base64'));
       return { success: true, path: output };
     } catch (err) {
       return { success: false, error: (err as Error).message };
-    } finally {
-      win?.destroy();
     }
   }
 );
+
+/**
+ * Печать документа любого формата и предпросмотр.
+ * Режим preview возвращает PDF, который покажет интерфейс.
+ */
+ipcMain.handle('print:document', async (_event, request: PrintRequest) => {
+  try {
+    return await runPrint(request, { harden: hardenWebContents, waitForPaint });
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+});
 
 ipcMain.handle(
   'fs:createFile',

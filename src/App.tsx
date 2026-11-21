@@ -58,6 +58,9 @@ import {
   type DocumentToolResult,
 } from './lib/documentModel';
 import { getDocumentController } from './services/docBridge';
+import { printBuiltDocument, printTarget, type PrintTarget } from './services/printService';
+import type { PrintDocument } from './services/printBridge';
+import { PrintPreviewModal } from './components/print/PrintPreviewModal';
 import { buildDocumentTools } from './services/aiTools';
 import { DOCUMENT_TEMPLATES } from './lib/templates';
 import {
@@ -282,6 +285,57 @@ const App: React.FC = () => {
     [ws]
   );
 
+  /* ---------------- Печать любого документа ---------------- */
+
+  /** Предпросмотр: собираем документ и показываем тот PDF, что уйдёт на принтер. */
+  const openPrintPreview = useCallback(
+    async (target: PrintTarget) => {
+      setPrintBusy(true);
+      try {
+        const result = await printTarget(target, { preview: true });
+        if (!result.success || !result.pdfBase64 || !result.document) {
+          if (!result.canceled) {
+            notify(result.error || 'Не удалось подготовить печать', 'error');
+          }
+          return;
+        }
+        setPrintPreview({ document: result.document, pdfBase64: result.pdfBase64 });
+      } finally {
+        setPrintBusy(false);
+      }
+    },
+    [notify]
+  );
+
+  /** Печать без предпросмотра — системный диалог. */
+  const printActiveTab = useCallback(async () => {
+    const tab = wsRef.current.activeTab;
+    if (!tab) {
+      notify('Нет открытого документа для печати', 'error');
+      return;
+    }
+    setPrintBusy(true);
+    try {
+      const result = await printTarget({ kind: 'tab', tab });
+      if (!result.success && !result.canceled) {
+        notify(result.error || 'Печать не выполнена', 'error');
+      }
+    } finally {
+      setPrintBusy(false);
+    }
+  }, [notify]);
+
+  /** Кнопка «Печать» в ленте редактора: событие, как у остальных команд Word. */
+  useEffect(() => {
+    const onPrint = () => {
+      const tab = wsRef.current.activeTab;
+      if (tab) void openPrintPreview({ kind: 'tab', tab });
+      else notify('Нет открытого документа для печати', 'error');
+    };
+    window.addEventListener('workspace:print-preview', onPrint);
+    return () => window.removeEventListener('workspace:print-preview', onPrint);
+  }, [openPrintPreview, notify]);
+
   // Нечитаемый ключ (перенос профиля/portable на другой компьютер) — сказать
   // об этом прямо, иначе приложение выглядит «сломанным».
   useEffect(() => {
@@ -328,6 +382,12 @@ const App: React.FC = () => {
   const [commandQuery, setCommandQuery] = useState('');
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const [searchPanelOpen, setSearchPanelOpen] = useState(false);
+  /** Предпросмотр печати: собранный документ и его PDF. */
+  const [printPreview, setPrintPreview] = useState<{
+    document: PrintDocument;
+    pdfBase64: string;
+  } | null>(null);
+  const [printBusy, setPrintBusy] = useState(false);
 
   // Раскладка: панели и открытые вкладки общие для окон, живут в workspace-session.json.
   const layoutApplyingRef = useRef(false);
@@ -597,6 +657,17 @@ const App: React.FC = () => {
       // в таблице фокус часто стоит в строке формул или в ячейке, и
       // сохранение там должно срабатывать.
       const saveCombo = (e.key === 's' || e.key === 'S') && !e.repeat;
+
+      // Ctrl+Alt+P — печать документа с предпросмотром. Работает и при
+      // фокусе в тексте: печать нужна из редактора, а не только из дерева.
+      if ((e.key === 'p' || e.key === 'P') && e.altKey) {
+        e.preventDefault();
+        const activeTab = wsRef.current.activeTab;
+        if (activeTab) void openPrintPreview({ kind: 'tab', tab: activeTab });
+        else notify('Нет открытого документа для печати', 'error');
+        return;
+      }
+
       if (isTextFieldTarget(e.target) && !saveCombo) return;
 
       // Ctrl+Shift+P — командная палитра
@@ -717,6 +788,8 @@ const App: React.FC = () => {
     newFileDialog.open,
     renameDialog.open,
     inlineTarget,
+    openPrintPreview,
+    notify,
   ]);
 
   /* ============================================================
@@ -3443,6 +3516,9 @@ const App: React.FC = () => {
         kind: 'folder',
         name: '',
       });
+    } else if (action === 'print') {
+      // Печать файла без открытия вкладки: HTML собирается по содержимому.
+      await openPrintPreview({ kind: 'file', path: item.path });
     } else if (action === 'favorite') {
       await ws.toggleFavorite(item.path);
     } else if (action === 'open-secondary') {
@@ -4182,6 +4258,20 @@ const App: React.FC = () => {
                   run: () => setTerminalOpen((value) => !value),
                 },
                 {
+                  label: printBusy ? 'Готовим печать…' : 'Печать документа…',
+                  hint: 'Ctrl+Alt+P',
+                  run: () => {
+                    const tab = wsRef.current.activeTab;
+                    if (tab) void openPrintPreview({ kind: 'tab', tab });
+                    else notify('Нет открытого документа для печати', 'error');
+                  },
+                },
+                {
+                  label: 'Печать сразу (системный диалог)',
+                  hint: '',
+                  run: () => void printActiveTab(),
+                },
+                {
                   label: 'Создать из шаблона',
                   hint: '',
                   run: () => setTemplatesOpen(true),
@@ -4252,6 +4342,23 @@ const App: React.FC = () => {
           </div>
         </div>
       )}
+
+      <PrintPreviewModal
+        open={printPreview !== null}
+        document={printPreview?.document ?? null}
+        pdfBase64={printPreview?.pdfBase64 ?? null}
+        onClose={() => setPrintPreview(null)}        onPrint={async () => {
+          if (!printPreview) return;
+          const result = await printBuiltDocument(printPreview.document);
+          if (!result.success && !result.canceled) {
+            notify(result.error || 'Печать не выполнена', 'error');
+          } else if (result.success) {
+            setPrintPreview(null);
+            notify('Документ отправлен на печать', 'save');
+          }
+        }}
+        onError={(message) => notify(message, 'error')}
+      />
 
       <QuickOpenModal
         isOpen={quickOpenOpen}

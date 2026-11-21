@@ -8,6 +8,8 @@ import {
   type CustomStyleDefinition,
 } from './customStyles';
 import { isSafeLinkHref } from './sanitizeMarkdownHtml';
+import { lineHeightCss } from './fontMetrics';
+import { WORD_DEFAULT_PAGE, mmToTwips, twipsToMm } from './units';
 
 /**
  * Преобразование между HTML-полотном редактора Word и пакетом .docx.
@@ -137,6 +139,17 @@ export interface DocxHtml {
   page?: PageSetup;
   /** Исходные XML-блоки в том же порядке, что и HTML-блоки. */
   blocks?: DocxBlockSource[];
+  /** Верхние колонтитулы по видам: обычный, первый, чётный. */
+  headers?: DocxHeaderFooterHtml;
+  /** Нижние колонтитулы по видам: обычный, первый, чётный. */
+  footers?: DocxHeaderFooterHtml;
+}
+
+/** HTML колонтитулов листа: ключ — w:type ссылки в sectPr. */
+export interface DocxHeaderFooterHtml {
+  default?: string;
+  first?: string;
+  even?: string;
 }
 
 /** Сохранение поверх исходного пакета: части, которых нет в HTML, не теряются. */
@@ -240,12 +253,15 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
 
   const images = await readImages(zip, rels);
   const links = readHyperlinks(rels);
-  const listKinds = readListKinds(numbering);
-  const listLevelKinds = readListLevelKinds(numbering);
+  const listLevels = readListLevels(numbering);
+  /** Счётчики нумерации: numId:ilvl → последний номер в документе. */
+  const listCounters = new Map<string, number>();
 
   const body = firstByLocal(doc, 'body');
   // Без body сохранение падало на отсутствии раздела и уходило в тихий fallback.
   if (!body) throw new DocxCorruptError('В word/document.xml нет w:body');
+  const pageSetup = readPageSetup(body, styles);
+  registerParagraphStyles(styles, pageSetup?.fontFamily ?? WORD_DEFAULT_PAGE.fontFamily ?? 'Calibri');
 
   interface PendingList {
     items: PendingListItem[];
@@ -275,16 +291,19 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
     if (name === 'p') {
       const info = paragraphListInfo(child);
       if (info) {
-        const kind =
-          listLevelKinds.get(info.numId)?.get(info.level) ??
-          listKinds.get(info.numId) ??
-          'ol';
+        const levelInfo = listLevels.get(info.numId)?.get(info.level) ?? null;
+        const kind = levelInfo?.kind ?? 'ol';
+        const key = `${info.numId}:${info.level}`;
+        const ordinal = (listCounters.get(key) ?? 0) + 1;
+        listCounters.set(key, ordinal);
         if (!pendingList) pendingList = { items: [] };
         pendingList.items.push({
           level: info.level,
           kind,
+          marker: levelInfo?.marker ?? (kind === 'ul' ? 'disc' : 'decimal'),
+          ordinal,
           inner: await paragraphInner(child, images, links),
-          style: listItemStyle(child),
+          style: listItemStyle(child, levelInfo ?? undefined),
           xml: serializeXml(child),
         });
         continue;
@@ -326,12 +345,28 @@ export async function docxBase64ToHtml(base64: string): Promise<DocxHtml> {
   }
 
   const html = rendered.map((block) => block.html).join('') || '<p></p>';
-  return { html, warnings: [], page: readPageSetup(body, styles), blocks: rendered };
+  const page = pageSetup;
+  const [headersHtml, footersHtml] = await Promise.all([
+    readHeaderFooterParts(zip, rels, body, 'header', images, links),
+    readHeaderFooterParts(zip, rels, body, 'footer', images, links),
+  ]);
+  return {
+    html,
+    warnings: [],
+    page,
+    blocks: rendered,
+    headers: headersHtml,
+    footers: footersHtml,
+  };
 }
 
 interface PendingListItem {
   level: number;
   kind: 'ul' | 'ol';
+  /** CSS list-style-type уровня (disc, lower-alpha, decimal…). */
+  marker: string;
+  /** Порядковый номер в своей нумерации: <ol start> для продолжения списка. */
+  ordinal: number;
   inner: string;
   style: string;
   xml: string;
@@ -344,6 +379,14 @@ function renderPendingList(items: PendingListItem[]): { html: string; xml: strin
   let html = '';
   const stack: Array<{ level: number; kind: 'ul' | 'ol'; open: boolean }> = [];
 
+  const openList = (item: PendingListItem) => {
+    const marker = item.marker && item.marker !== 'decimal' ? ` style="list-style-type:${item.marker}"` : '';
+    // start нужен, когда нумерованный список продолжается после другого блока.
+    const start =
+      item.kind === 'ol' && item.ordinal > 1 ? ` start="${item.ordinal}"` : '';
+    html += `<${item.kind}${start}${marker}>`;
+  };
+
   for (const item of items) {
     while (stack.length > 0 && item.level < stack[stack.length - 1].level) {
       const top = stack.pop()!;
@@ -353,12 +396,12 @@ function renderPendingList(items: PendingListItem[]): { html: string; xml: strin
 
     if (stack.length === 0) {
       stack.push({ level: item.level, kind: item.kind, open: false });
-      html += `<${item.kind}>`;
+      openList(item);
     } else {
       const top = stack[stack.length - 1];
       if (item.level > top.level) {
         stack.push({ level: item.level, kind: item.kind, open: false });
-        html += `<${item.kind}>`;
+        openList(item);
       } else {
         if (top.open) {
           html += '</li>';
@@ -368,7 +411,7 @@ function renderPendingList(items: PendingListItem[]): { html: string; xml: strin
           html += `</${top.kind}>`;
           stack.pop();
           stack.push({ level: item.level, kind: item.kind, open: false });
-          html += `<${item.kind}>`;
+          openList(item);
         }
       }
     }
@@ -447,6 +490,13 @@ function readPageSetup(body: Element, styles: Document | null): PageSetup | unde
       if (right > 0) page.marginRightMm = twipsToMm(right);
       if (bottom > 0) page.marginBottomMm = twipsToMm(bottom);
       if (left > 0) page.marginLeftMm = twipsToMm(left);
+      // Расстояния колонтитулов: без них лист рисовал бы их по своим правилам.
+      const header = Number(attr(margins, 'header'));
+      const footer = Number(attr(margins, 'footer'));
+      const gutter = Number(attr(margins, 'gutter'));
+      if (header > 0) page.headerMm = twipsToMm(header);
+      if (footer > 0) page.footerMm = twipsToMm(footer);
+      if (gutter > 0) page.gutterMm = twipsToMm(gutter);
     }
   }
 
@@ -478,10 +528,21 @@ function readPageSetup(body: Element, styles: Document | null): PageSetup | unde
       Number(attr(firstByLocal(defaultRun, 'sz'), 'val'));
     if (halfPoints > 0) page.fontSizePt = halfPoints / 2;
 
-    const line =
-      Number(attr(firstByLocal(normalParagraph, 'spacing'), 'line')) ||
-      Number(attr(firstByLocal(defaultParagraph, 'spacing'), 'line'));
-    if (line > 0) page.lineSpacing = Math.round((line / 240) * 100) / 100;
+    const normalSpacing = firstByLocal(normalParagraph, 'spacing');
+    const defaultSpacing = firstByLocal(defaultParagraph, 'spacing');
+    const line = Number(attr(normalSpacing, 'line')) || Number(attr(defaultSpacing, 'line'));
+    const lineRule =
+      attr(normalSpacing, 'lineRule') || attr(defaultSpacing, 'lineRule') || 'auto';
+    if (line > 0) {
+      if (lineRule === 'exact' || lineRule === 'atLeast') {
+        // Точный интервал Word задаёт в twips: 280 twips = 14 pt.
+        page.lineSpacing = Math.round((line / 20) * 100) / 100;
+        page.lineSpacingRule = lineRule;
+      } else {
+        page.lineSpacing = Math.round((line / 240) * 100) / 100;
+        page.lineSpacingRule = 'auto';
+      }
+    }
   }
 
   return Object.keys(page).length > 0 ? page : undefined;
@@ -1239,9 +1300,13 @@ function samePage(a: PageSetup | undefined, b: PageSetup | undefined): boolean {
     'marginRightMm',
     'marginBottomMm',
     'marginLeftMm',
+    'headerMm',
+    'footerMm',
+    'gutterMm',
     'fontFamily',
     'fontSizePt',
     'lineSpacing',
+    'lineSpacingRule',
   ];
   return keys.every((key) => {
     const left = a[key];
@@ -1252,16 +1317,31 @@ function samePage(a: PageSetup | undefined, b: PageSetup | undefined): boolean {
 }
 
 function sectPrBodyXml(page?: PageSetup): string {
-  const width = page?.widthMm ? mmToTwips(page.widthMm) : 11906;
-  const height = page?.heightMm ? mmToTwips(page.heightMm) : 16838;
-  const top = page?.marginTopMm ? mmToTwips(page.marginTopMm) : 1134;
-  const right = page?.marginRightMm ? mmToTwips(page.marginRightMm) : 1134;
-  const bottom = page?.marginBottomMm ? mmToTwips(page.marginBottomMm) : 1134;
-  const left = page?.marginLeftMm ? mmToTwips(page.marginLeftMm) : 1134;
+  const source = { ...WORD_DEFAULT_PAGE, ...stripUndefined(page) };
+  const width = mmToTwips(source.widthMm ?? 210);
+  const height = mmToTwips(source.heightMm ?? 297);
+  const top = mmToTwips(source.marginTopMm ?? 20);
+  const right = mmToTwips(source.marginRightMm ?? 15);
+  const bottom = mmToTwips(source.marginBottomMm ?? 20);
+  const left = mmToTwips(source.marginLeftMm ?? 30);
+  const header = mmToTwips(source.headerMm ?? 12.5);
+  const footer = mmToTwips(source.footerMm ?? 12.5);
+  const gutter = mmToTwips(source.gutterMm ?? 0);
   return (
     `<w:pgSz w:w="${width}" w:h="${height}"/>` +
-    `<w:pgMar w:top="${top}" w:right="${right}" w:bottom="${bottom}" w:left="${left}"/>`
+    `<w:pgMar w:top="${top}" w:right="${right}" w:bottom="${bottom}" w:left="${left}" ` +
+    `w:header="${header}" w:footer="${footer}" w:gutter="${gutter}"/>`
   );
+}
+
+/** Копия без undefined: `{...defaults, ...page}` иначе затирает дефолты. */
+function stripUndefined(page?: PageSetup): Partial<PageSetup> {
+  if (!page) return {};
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(page)) {
+    if (value !== undefined && value !== null && value !== '') result[key] = value;
+  }
+  return result as Partial<PageSetup>;
 }
 
 /** Меняет только заданные поля, не пересобирая sectPr целиком. */
@@ -1280,8 +1360,16 @@ function applyPageToSectPr(sectPr: string, page: PageSetup): string {
   if (page.marginRightMm) margins.push(`w:right="${mmToTwips(page.marginRightMm)}"`);
   if (page.marginBottomMm) margins.push(`w:bottom="${mmToTwips(page.marginBottomMm)}"`);
   if (page.marginLeftMm) margins.push(`w:left="${mmToTwips(page.marginLeftMm)}"`);
+  if (page.headerMm) margins.push(`w:header="${mmToTwips(page.headerMm)}"`);
+  if (page.footerMm) margins.push(`w:footer="${mmToTwips(page.footerMm)}"`);
+  if (typeof page.gutterMm === 'number') margins.push(`w:gutter="${mmToTwips(page.gutterMm)}"`);
   if (margins.length) {
-    next = upsertTag(next, 'w:pgMar', margins, '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/>');
+    next = upsertTag(
+      next,
+      'w:pgMar',
+      margins,
+      '<w:pgMar w:top="1134" w:right="850" w:bottom="1134" w:left="1701" w:header="709" w:footer="709" w:gutter="0"/>'
+    );
   }
 
   return next;
@@ -1544,38 +1632,69 @@ function readHyperlinks(rels: Document | null): Map<string, string> {
   return links;
 }
 
-function readListKinds(numbering: Document | null): Map<string, 'ul' | 'ol'> {
-  const kinds = new Map<string, 'ul' | 'ol'>();
-  if (!numbering) return kinds;
-
-  const abstract = new Map<string, 'ul' | 'ol'>();
-  for (const abs of elementsByLocal(numbering, 'abstractNum')) {
-    const id = abs.getAttribute('w:abstractNumId');
-    const level = firstByLocal(abs, 'lvl');
-    const fmt = level ? attr(firstByLocal(level, 'numFmt'), 'val') : '';
-    if (id) abstract.set(id, fmt === 'bullet' ? 'ul' : 'ol');
-  }
-  for (const num of elementsByLocal(numbering, 'num')) {
-    const id = num.getAttribute('w:numId');
-    const absId = attr(firstByLocal(num, 'abstractNumId'), 'val');
-    if (id) kinds.set(id, abstract.get(absId ?? '') ?? 'ol');
-  }
-  return kinds;
+/** Уровень нумерации: вид списка, маркер и отступы из numbering.xml. */
+export interface ListLevelInfo {
+  kind: 'ul' | 'ol';
+  /** Значение для CSS list-style-type: disc / lower-alpha / decimal … */
+  marker: string;
+  /** Отступ текста уровня (twips) и выступ маркера (twips). */
+  leftTwips: number;
+  hangingTwips: number;
 }
 
-function readListLevelKinds(numbering: Document | null): Map<string, Map<number, 'ul' | 'ol'>> {
-  const result = new Map<string, Map<number, 'ul' | 'ol'>>();
+/** numFmt + lvlText → CSS list-style-type. */
+function listMarkerCss(format: string, text: string): string {
+  switch (format) {
+    case 'bullet': {
+      const glyph = (text || '').trim();
+      if (glyph === 'o' || glyph === '◦' || glyph === '○') return 'circle';
+      if (glyph === '▪' || glyph === '■' || glyph === '∎') return 'square';
+      return 'disc';
+    }
+    case 'lowerLetter':
+      return 'lower-alpha';
+    case 'upperLetter':
+      return 'upper-alpha';
+    case 'lowerRoman':
+      return 'lower-roman';
+    case 'upperRoman':
+      return 'upper-roman';
+    case 'decimalZero':
+      return 'decimal-leading-zero';
+    case 'none':
+      return 'none';
+    default:
+      return 'decimal';
+  }
+}
+
+function readLevelInfo(level: Element): ListLevelInfo {
+  const format = attr(firstByLocal(level, 'numFmt'), 'val') || 'decimal';
+  const text = attr(firstByLocal(level, 'lvlText'), 'val') || '';
+  const ind = firstByLocal(firstByLocal(level, 'pPr'), 'ind');
+  const left = Number(attr(ind, 'left') || attr(ind, 'start') || 0);
+  const hanging = Number(attr(ind, 'hanging') || 0);
+  return {
+    kind: format === 'bullet' ? 'ul' : 'ol',
+    marker: listMarkerCss(format, text),
+    leftTwips: left,
+    hangingTwips: hanging,
+  };
+}
+
+/** numId → ilvl → оформление. Один уровень нумерации может быть маркированным. */
+function readListLevels(numbering: Document | null): Map<string, Map<number, ListLevelInfo>> {
+  const result = new Map<string, Map<number, ListLevelInfo>>();
   if (!numbering) return result;
 
-  const abstracts = new Map<string, Map<number, 'ul' | 'ol'>>();
+  const abstracts = new Map<string, Map<number, ListLevelInfo>>();
   for (const abs of elementsByLocal(numbering, 'abstractNum')) {
     const id = abs.getAttribute('w:abstractNumId');
     if (!id) continue;
-    const levels = new Map<number, 'ul' | 'ol'>();
+    const levels = new Map<number, ListLevelInfo>();
     for (const level of elementsByLocal(abs, 'lvl')) {
       const ilvl = Number(level.getAttribute('w:ilvl') ?? 0);
-      const format = attr(firstByLocal(level, 'numFmt'), 'val');
-      levels.set(ilvl, format === 'bullet' ? 'ul' : 'ol');
+      levels.set(ilvl, readLevelInfo(level));
     }
     abstracts.set(id, levels);
   }
@@ -1588,8 +1707,78 @@ function readListLevelKinds(numbering: Document | null): Map<string, Map<number,
   return result;
 }
 
-function paragraphListInfo(p: Element): { numId: string; level: number } | null {
-  const pPr = firstByLocal(p, 'pPr');
+/** Блоки части колонтитула (w:hdr/w:ftr): абзацы и таблицы. */
+async function renderPartBlocks(
+  root: Element,
+  images: Map<string, string>,
+  links: Map<string, string>
+): Promise<string> {
+  let html = '';
+  for (const child of childElements(root)) {
+    const name = localName(child);
+    if (name === 'p') html += renderParagraph(child, await paragraphInner(child, images, links));
+    else if (name === 'tbl') html += await renderTable(child, images, links);
+    else if (name === 'sdt') {
+      for (const inner of childElements(child)) {
+        if (localName(inner) === 'sdtContent') {
+          html += await renderPartBlocks(inner, images, links);
+        }
+      }
+    }
+  }
+  return html;
+}
+
+/**
+ * Колонтитулы из пакета: без них лист выглядел как чистый лист, хотя в Word
+ * на нём есть шапка, подпись и номер страницы.
+ */
+async function readHeaderFooterParts(
+  zip: JSZip,
+  rels: Document | null,
+  body: Element,
+  kind: 'header' | 'footer',
+  images: Map<string, string>,
+  links: Map<string, string>
+): Promise<DocxHeaderFooterHtml> {
+  const result: DocxHeaderFooterHtml = {};
+  const sections = elementsByLocal(body, 'sectPr');
+  const sectPr = sections[sections.length - 1] ?? null;
+  if (!sectPr) return result;
+
+  const targets = new Map<string, string>();
+  if (rels) {
+    for (const rel of elementsByLocal(rels, 'Relationship')) {
+      const id = rel.getAttribute('Id');
+      const target = rel.getAttribute('Target') ?? '';
+      const type = rel.getAttribute('Type') ?? '';
+      if (id && target && type.endsWith(`/${kind}`)) targets.set(id, target);
+    }
+  }
+
+  for (const reference of childElements(sectPr)) {
+    if (localName(reference) !== `${kind}Reference`) continue;
+    const referenceType = attr(reference, 'type') || 'default';
+    const id = reference.getAttribute('r:id') ?? reference.getAttributeNS(R_NS, 'id') ?? '';
+    const target = targets.get(id);
+    if (!target) continue;
+    const path = target.startsWith('/') ? target.slice(1) : `word/${target.replace(/^\.\.\//, '')}`;
+    const file = zip.file(path);
+    if (!file) continue;
+    const xml = await file.async('string');
+    const part = parsePart(xml, path);
+    const root = part?.documentElement;
+    if (!root) continue;
+    const html = await renderPartBlocks(root, images, links);
+    if (!html.trim()) continue;
+    const key: keyof DocxHeaderFooterHtml =
+      referenceType === 'first' ? 'first' : referenceType === 'even' ? 'even' : 'default';
+    result[key] = html;
+  }
+  return result;
+}
+
+function paragraphListInfo(p: Element): { numId: string; level: number } | null {  const pPr = firstByLocal(p, 'pPr');
   const numPr = pPr ? firstByLocal(pPr, 'numPr') : null;
   if (!numPr) return null;
   const numId = attr(firstByLocal(numPr, 'numId'), 'val');
@@ -1598,17 +1787,29 @@ function paragraphListInfo(p: Element): { numId: string; level: number } | null 
   return { numId, level };
 }
 
-/** Оформление элемента списка: выравнивание и отступы. */
-function listItemStyle(p: Element): string {
+/**
+ * Оформление элемента списка: выравнивание, интервалы и отступы.
+ *
+ * Отступ Word хранит обычно в уровне нумерации, а не в абзаце. Без него все
+ * уровни списка вставали в один столбец.
+ */
+function listItemStyle(p: Element, level?: ListLevelInfo): string {
   const pPr = firstByLocal(p, 'pPr');
+  const style = pPr ? attr(firstByLocal(pPr, 'pStyle'), 'val') : '';
   const align = pPr ? attr(firstByLocal(pPr, 'jc'), 'val') : '';
-  const css = [
+  const directIndent = paragraphIndent(pPr);
+  const parts = [
+    style ? paragraphStyleCssFor(style) : '',
     align ? `text-align:${cssAlign(align)}` : '',
-    paragraphIndent(pPr),
-    paragraphFormatCss(pPr),
-  ]
-    .filter(Boolean)
-    .join(';');
+    directIndent,
+  ];
+  if (!directIndent && level && level.leftTwips > 0) {
+    const hanging = level.hangingTwips > 0 ? level.hangingTwips : Math.min(level.leftTwips, 425);
+    parts.push(`margin-left:${round((level.leftTwips - hanging) / 20)}pt`);
+    parts.push(`text-indent:-${round(hanging / 20)}pt`);
+  }
+  parts.push(paragraphFormatCss(pPr));
+  const css = parts.filter(Boolean).join(';');
   return css ? ` style="${css}"` : '';
 }
 
@@ -1654,7 +1855,11 @@ function renderParagraph(p: Element, inner: string): string {
   const style = pPr ? attr(firstByLocal(pPr, 'pStyle'), 'val') : '';
   const align = pPr ? attr(firstByLocal(pPr, 'jc'), 'val') : '';
   const custom = style ? getCustomStyle(style) : undefined;
+  // Сначала именованный стиль (Normal или Heading N), потом прямое оформление:
+  // прямой pPr перекрывает стиль, как в Word.
+  const namedCss = paragraphStyleCssFor(style || 'Normal');
   const css = [
+    namedCss,
     align ? `text-align:${cssAlign(align)}` : '',
     paragraphIndent(pPr),
     paragraphFormatCss(pPr),
@@ -1678,43 +1883,97 @@ function renderParagraph(p: Element, inner: string): string {
   const namedStyleAttr = style ? ` data-style="${escapeAttr(style)}"` : '';
   const widow = pPr ? firstByLocal(pPr, 'widowControl') : null;
   const widowAttr = widow ? ` data-widow="${isOn(widow) ? 'on' : 'off'}"` : '';
-  return `<${tag}${fieldAttr}${tabsAttr}${namedStyleAttr}${widowAttr}${styleAttr}>${inner || '<br>'}</${tag}>`;
+  // Флаги разрыва нужны разметке листов: computed style читается медленно и
+  // не переживает клонирование узлов при печати.
+  const keepNext = pPr && firstByLocal(pPr, 'keepNext') ? ' data-keep-next="1"' : '';
+  const keepLines = pPr && firstByLocal(pPr, 'keepLines') ? ' data-keep-lines="1"' : '';
+  const breakBefore =
+    pPr && firstByLocal(pPr, 'pageBreakBefore') ? ' data-page-break="start"' : '';
+  return `<${tag}${fieldAttr}${tabsAttr}${namedStyleAttr}${widowAttr}${keepNext}${keepLines}${breakBefore}${styleAttr}>${inner || '<br>'}</${tag}>`;
 }
 
-/** Интервалы, отступы до/после и запреты разрыва из pPr. */
+/** Штрихи рамки OOXML → CSS. Незнакомое значение рисуем сплошным. */
+const BORDER_STYLE: Record<string, string> = {
+  single: 'solid',
+  thick: 'solid',
+  double: 'double',
+  dashed: 'dashed',
+  dotted: 'dotted',
+  dashSmallGap: 'dashed',
+  dotDash: 'dashed',
+  dotDotDash: 'dotted',
+  wave: 'solid',
+  doubleWave: 'double',
+  nil: 'none',
+  none: 'none',
+};
+
+/** Табстоп по умолчанию задан в CSS листа: 1,25 см — значение Word. */
+
+/**
+ * Интервалы, отступы до/после, табы и рамки из pPr.
+ *
+ * Word пишет `line="259" lineRule="auto"` (множитель) либо `line="280"
+ * lineRule="exact"` (ровно 14 pt) — второе без правила превращалось в 14-кратный
+ * межстрочный интервал. Нули тоже пишутся явно: `after="0"` должен снять
+ * отступ, а не оставить тему браузера.
+ */
 function paragraphFormatCss(pPr: Element | null): string {
   if (!pPr) return '';
   const parts: string[] = [];
   const spacing = firstByLocal(pPr, 'spacing');
-  const line = Number(attr(spacing, 'line'));
-  if (line > 0) parts.push(`line-height:${Math.round((line / 240) * 100) / 100}`);
-  const before = Number(attr(spacing, 'before'));
-  if (before > 0) parts.push(`margin-top:${Math.round((before / 20) * 10) / 10}pt`);
-  const after = Number(attr(spacing, 'after'));
-  if (after > 0) parts.push(`margin-bottom:${Math.round((after / 20) * 10) / 10}pt`);
+  if (spacing) {
+    const line = Number(attr(spacing, 'line'));
+    const rule = attr(spacing, 'lineRule') || 'auto';
+    const height = lineHeightCss(line, rule, currentBaseFontFamily);
+    if (height) parts.push(height);
+    const before = Number(attr(spacing, 'before'));
+    const after = Number(attr(spacing, 'after'));
+    if (Number.isFinite(before) && attr(spacing, 'before') !== '')
+      parts.push(`margin-top:${round(before / 20)}pt`);
+    if (Number.isFinite(after) && attr(spacing, 'after') !== '')
+      parts.push(`margin-bottom:${round(after / 20)}pt`);
+  }
 
   if (firstByLocal(pPr, 'keepNext')) parts.push('break-after:avoid');
   if (firstByLocal(pPr, 'keepLines')) parts.push('break-inside:avoid');
   if (firstByLocal(pPr, 'pageBreakBefore')) parts.push('break-before:page');
+
+  const tab = pPr ? firstByLocal(pPr, 'tabs') : null;
+  const firstTab = tab ? childElements(tab).find((node) => localName(node) === 'tab') : null;
+  const firstStop = firstTab ? Number(attr(firstTab, 'pos')) : 0;
+  if (firstStop > 0) parts.push(`tab-size:${round(firstStop / 20)}pt`);
 
   const shading = firstByLocal(pPr, 'shd');
   const fill = attr(shading, 'fill');
   if (fill && fill.toLowerCase() !== 'auto') parts.push(`background-color:#${fill}`);
 
   const borders = firstByLocal(pPr, 'pBdr');
-  const top = borders ? firstByLocal(borders, 'top') : null;
-  if (top) {
-    const size = Number(attr(top, 'sz'));
-    const color = attr(top, 'color') || 'auto';
-    const val = attr(top, 'val') || 'single';
-    const style = val === 'dashed' || val === 'dotted' || val === 'double' ? val : 'solid';
-    if (size > 0) {
-      parts.push(
-        `border:${Math.max(0.25, size / 8)}pt ${style} #${color === 'auto' ? '000000' : color}`
-      );
+  if (borders) {
+    for (const side of ['top', 'right', 'bottom', 'left'] as const) {
+      const border = firstByLocal(borders, side);
+      const css = borderCss(border);
+      if (css) parts.push(`border-${side}:${css}`);
     }
   }
   return parts.join(';');
+}
+
+/** Рамка одной стороны: `w:sz` — восьмые доли пункта, `w:val` — штрих. */
+function borderCss(border: Element | null): string {
+  if (!border) return '';
+  const value = attr(border, 'val') || 'single';
+  const style = BORDER_STYLE[value] ?? 'solid';
+  if (style === 'none') return '';
+  const size = Number(attr(border, 'sz'));
+  const color = attr(border, 'color') || 'auto';
+  const width = size > 0 ? size / 8 : 0.5;
+  return `${round(Math.max(0.25, width))}pt ${style} #${color === 'auto' ? '000000' : color}`;
+}
+
+/** Округление до сотых — чтобы в style не попадали 12 десятичных знаков. */
+function round(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 /** Отступы абзаца из OOXML: twips → pt для CSS. */
@@ -1725,12 +1984,14 @@ function paragraphIndent(pPr: Element | null): string {
 
   const parts: string[] = [];
   const left = Number(attr(ind, 'left') || attr(ind, 'start') || 0);
+  const right = Number(attr(ind, 'right') || attr(ind, 'end') || 0);
   const firstLine = Number(attr(ind, 'firstLine') || 0);
   const hanging = Number(attr(ind, 'hanging') || 0);
 
-  if (left > 0) parts.push(`margin-left:${left / 20}pt`);
-  if (firstLine > 0) parts.push(`text-indent:${firstLine / 20}pt`);
-  if (hanging > 0) parts.push(`text-indent:-${hanging / 20}pt`);
+  if (left > 0) parts.push(`margin-left:${round(left / 20)}pt`);
+  if (right > 0) parts.push(`margin-right:${round(right / 20)}pt`);
+  if (firstLine > 0) parts.push(`text-indent:${round(firstLine / 20)}pt`);
+  if (hanging > 0) parts.push(`text-indent:-${round(hanging / 20)}pt`);
   return parts.join(';');
 }
 
@@ -1750,10 +2011,50 @@ async function paragraphInner(
   links: Map<string, string>
 ): Promise<string> {
   let html = '';
+  // Сложное поле Word: fldChar begin → instrText → separate → кэш → end.
+  // Код поля и кэш PAGE/NUMPAGES не показываем: кэш устаревает, вместо него
+  // маркер, который лист заполняет реальным номером.
+  let inField = false;
+  let inResult = false;
+  let fieldInstruction = '';
+  let fieldReplaced = false;
   for (const child of childElements(p)) {
     const name = localName(child);
-    if (name === 'r') html += renderRun(child, images);
-    else if (name === 'hyperlink') {
+    if (name === 'r') {
+      const fldChar = firstByLocal(child, 'fldChar');
+      if (fldChar) {
+        const type = attr(fldChar, 'fldCharType');
+        if (type === 'begin') {
+          inField = true;
+          inResult = false;
+          fieldInstruction = '';
+          fieldReplaced = false;
+        } else if (type === 'separate') {
+          inResult = true;
+          const kind = /^\s*(PAGE|NUMPAGES)\s*$/i.exec(fieldInstruction)?.[1]?.toUpperCase() ?? '';
+          if (kind) {
+            fieldReplaced = true;
+            html += `<span data-field="${kind}">1</span>`;
+          }
+        } else if (type === 'end') {
+          inField = false;
+          inResult = false;
+          fieldInstruction = '';
+          fieldReplaced = false;
+        }
+        continue;
+      }
+      const instr = firstByLocal(child, 'instrText');
+      if (instr && inField && !inResult) {
+        fieldInstruction += `${instr.textContent ?? ''} `;
+        continue;
+      }
+      // Код поля не показывается, кэш PAGE/NUMPAGES уже заменён маркером.
+      if (inField && (!inResult || fieldReplaced)) continue;
+      html += renderRun(child, images);
+      continue;
+    }
+    if (name === 'hyperlink') {
       const relId = child.getAttribute('r:id') ?? child.getAttributeNS(R_NS, 'id') ?? '';
       const anchor = attr(child, 'anchor');
       // Цель берём из rels: без этого ссылка превращалась в href="#".
@@ -1876,6 +2177,8 @@ interface DocxTableCell {
   rowSpan: number;
   /** Ячейку закрывает rowspan предыдущей строки — не выводим. */
   covered: boolean;
+  /** Ширина, поля, заливка и вертикальное выравнивание из tcPr. */
+  style: string;
 }
 
 /** Строки таблицы: прямые w:tr плюс строки внутри w:sdt/w:sdtContent и w:customXml. */
@@ -1889,17 +2192,125 @@ function collectTableRows(node: Element, out: Element[]): void {
   }
 }
 
+interface CellMargins {
+  top: number;
+  left: number;
+  bottom: number;
+  right: number;
+}
+
+/** Поля ячеек по умолчанию — как в Word: 0 сверху/снизу, 0,19 см по бокам. */
+const DEFAULT_CELL_MARGINS: CellMargins = { top: 0, left: 108, bottom: 0, right: 108 };
+
+type BorderSide = 'top' | 'left' | 'bottom' | 'right' | 'insideH' | 'insideV';
+type TableBorders = Partial<Record<BorderSide, Element>>;
+
+function bordersOf(container: Element | null): TableBorders {
+  const result: TableBorders = {};
+  if (!container) return result;
+  for (const node of childElements(container)) {
+    const name = localName(node);
+    if (name === 'top' || name === 'left' || name === 'bottom' || name === 'right') {
+      result[name] = node;
+    } else if (name === 'insideH' || name === 'insideV') {
+      result[name] = node;
+    }
+  }
+  return result;
+}
+
+function marginsOf(source: Element | null, fallback: CellMargins): CellMargins {
+  if (!source) return fallback;
+  const read = (side: keyof CellMargins): number => {
+    const node = firstByLocal(source, side);
+    const value = Number(attr(node, 'w'));
+    return node ? (Number.isFinite(value) ? value : fallback[side]) : fallback[side];
+  };
+  return { top: read('top'), left: read('left'), bottom: read('bottom'), right: read('right') };
+}
+
+function tableGridTwips(tbl: Element): number[] {
+  const grid = childByLocal(tbl, 'tblGrid');
+  if (!grid) return [];
+  return childElements(grid)
+    .filter((node) => localName(node) === 'gridCol')
+    .map((node) => Number(attr(node, 'w')) || 0);
+}
+
+/** Ширина и выравнивание таблицы: Word рисует сетку фиксированных колонок. */
+function tableCss(tblPr: Element | null, gridTwips: number[]): string {
+  const parts: string[] = ['border-collapse:collapse', 'table-layout:fixed'];
+  const width = firstByLocal(tblPr, 'tblW');
+  const value = Number(attr(width, 'w'));
+  const type = attr(width, 'type');
+  if (value > 0 && type === 'pct') parts.push(`width:${round(value / 50)}%`);
+  else if (value > 0 && type === 'dxa') parts.push(`width:${round(value / 20)}pt`);
+  else if (gridTwips.length) {
+    parts.push(`width:${round(gridTwips.reduce((sum, item) => sum + item, 0) / 20)}pt`);
+  } else parts.push('width:100%');
+
+  const jc = attr(firstByLocal(tblPr, 'jc'), 'val');
+  const indent = Number(attr(firstByLocal(tblPr, 'tblInd'), 'w'));
+  if (jc === 'center') parts.push('margin-left:auto;margin-right:auto');
+  else if (jc === 'right' || jc === 'end') parts.push('margin-left:auto;margin-right:0');
+  else if (indent > 0) parts.push(`margin-left:${round(indent / 20)}pt`);
+  return parts.join(';');
+}
+
+/** Глубина «растяжки» рамки для обратной записи (data-table-border). */
+function tableBorderAttribute(borders: TableBorders): string {
+  const sample = borders.top ?? borders.insideH ?? borders.insideV ?? borders.left ?? borders.bottom;
+  const css = borderCss(sample ?? null);
+  if (!css) return 'none';
+  const [width, style, color] = css.split(' ');
+  return `${parseFloat(width)}|${style}|${color}`;
+}
+
 async function renderTable(
   tbl: Element,
   images: Map<string, string>,
   links: Map<string, string>
 ): Promise<string> {
+  const tblPr = childByLocal(tbl, 'tblPr');
+  const borders = bordersOf(firstByLocal(tblPr, 'tblBorders'));
+  const cellIndentPadding = marginsOf(firstByLocal(tblPr, 'tblCellMar'), DEFAULT_CELL_MARGINS);
+  const gridTwips = tableGridTwips(tbl);
+  const html = await renderTableRows(tbl, {
+    images,
+    links,
+    borders,
+    defaultMargins: cellIndentPadding,
+    gridTwips,
+  });
+  return html;
+}
+
+interface TableRenderContext {
+  images: Map<string, string>;
+  links: Map<string, string>;
+  borders: TableBorders;
+  defaultMargins: CellMargins;
+  gridTwips: number[];
+}
+
+async function renderTableRows(tbl: Element, context: TableRenderContext): Promise<string> {
   const rows: DocxTableCell[][] = [];
+  const rowInfo: Array<{ header: boolean; cantSplit: boolean; height: number }> = [];
   // Только свои строки: elementsByLocal затягивал строки вложенной таблицы,
   // а строки внутри w:sdt/w:customXml наоборот исчезали.
   const rowElements: Element[] = [];
   collectTableRows(tbl, rowElements);
+
+  let maxCols = context.gridTwips.length;
   for (const tr of rowElements) {
+    const trPr = childByLocal(tr, 'trPr');
+    const heightNode = firstByLocal(trPr, 'trHeight');
+    rowInfo.push({
+      header: !!firstByLocal(trPr, 'tblHeader'),
+      cantSplit: !!firstByLocal(trPr, 'cantSplit'),
+      height: Number(attr(heightNode, 'val')) || 0,
+    });
+
     const cells: DocxTableCell[] = [];
     // gridBefore: строка начинается не с первой колонки, объединения считаются от неё.
     let col =
@@ -1915,14 +2326,17 @@ async function renderTable(
       const parts: string[] = [];
       for (const child of childElements(tc)) {
         const name = localName(child);
-        if (name === 'p') parts.push(await paragraphInner(child, images, links));
-        else if (name === 'tbl') parts.push(await renderTable(child, images, links));
+        if (name === 'p') parts.push(await paragraphInner(child, context.images, context.links));
+        else if (name === 'tbl') parts.push(await renderTable(child, context.images, context.links));
         else if (name === 'sdt') {
           for (const inner of childElements(child)) {
             if (localName(inner) === 'sdtContent') {
               for (const node of childElements(inner)) {
-                if (localName(node) === 'p') parts.push(await paragraphInner(node, images, links));
-                else if (localName(node) === 'tbl') parts.push(await renderTable(node, images, links));
+                if (localName(node) === 'p') {
+                  parts.push(await paragraphInner(node, context.images, context.links));
+                } else if (localName(node) === 'tbl') {
+                  parts.push(await renderTable(node, context.images, context.links));
+                }
               }
             }
           }
@@ -1935,9 +2349,11 @@ async function renderTable(
         col,
         rowSpan: 1,
         covered: false,
+        style: cellStyle(tcPr, context, colSpan),
       });
       col += colSpan;
     }
+    maxCols = Math.max(maxCols, col);
     rows.push(cells);
   }
 
@@ -1954,20 +2370,110 @@ async function renderTable(
     }
   });
 
-  const html = rows
-    .map((cells) => {
-      const rendered = cells
-        .filter((cell) => !cell.covered)
-        .map((cell) => {
-          const colspan = cell.colSpan > 1 ? ` colspan="${cell.colSpan}"` : '';
-          const rowspan = cell.rowSpan > 1 ? ` rowspan="${cell.rowSpan}"` : '';
-          return `<td${colspan}${rowspan}>${cell.html}</td>`;
-        });
-      return `<tr>${rendered.join('')}</tr>`;
-    })
-    .join('');
-  return `<table>${html}</table>`;
+  const totalCols = Math.max(1, maxCols);
+  const rendered = rows.map((cells, r) => {
+    const attributes: string[] = [];
+    const height = rowInfo[r]?.height ?? 0;
+    if (height > 0) attributes.push(` style="height:${round(height / 20)}pt"`);
+    if (rowInfo[r]?.cantSplit) attributes.push(' data-cant-split="1"');
+    const body = cells
+      .filter((cell) => !cell.covered)
+      .map((cell) => {
+        const colspan = cell.colSpan > 1 ? ` colspan="${cell.colSpan}"` : '';
+        const rowspan = cell.rowSpan > 1 ? ` rowspan="${cell.rowSpan}"` : '';
+        const style = cellBorderStyle(cell, context, r, rows.length, totalCols, cell.style);
+        const styleAttr = style ? ` style="${style}"` : '';
+        return `<td${colspan}${rowspan}${styleAttr}>${cell.html}</td>`;
+      });
+    return { html: `<tr${attributes.join('')}>${body.join('')}</tr>`, header: !!rowInfo[r]?.header };
+  });
+
+  // Word повторяет шапку на новой странице: ведущие помеченные строки — <thead>.
+  let headerCount = 0;
+  while (headerCount < rendered.length && rendered[headerCount].header) headerCount += 1;
+  const thead =
+    headerCount > 0
+      ? `<thead>${rendered.slice(0, headerCount).map((row) => row.html).join('')}</thead>`
+      : '';
+  const tbody = `<tbody>${rendered
+    .slice(headerCount)
+    .map((row) => row.html)
+    .join('')}</tbody>`;
+
+  const colgroup = context.gridTwips.length
+    ? `<colgroup>${context.gridTwips
+        .map((width) => `<col${
+          width > 0 ? ` style="width:${round(width / 20)}pt"` : ''
+        }>`)
+        .join('')}</colgroup>`
+    : '';
+
+  const tableStyle = tableCss(childByLocal(tbl, 'tblPr'), context.gridTwips);
+  const borderAttr = ` data-table-border="${tableBorderAttribute(context.borders)}"`;
+  return `<table style="${tableStyle}"${borderAttr}>${colgroup}${thead}${tbody}</table>`;
 }
+
+/** Ширина, поля, заливка и вертикальное выравнивание ячейки. */
+function cellStyle(tcPr: Element | null, context: TableRenderContext, colSpan: number): string {
+  const parts: string[] = [];
+  const widthTwips = Number(attr(firstByLocal(tcPr, 'tcW'), 'w'));
+  if (widthTwips > 0 && colSpan > 1) parts.push(`width:${round(widthTwips / 20)}pt`);
+
+  const margins = marginsOf(firstByLocal(tcPr, 'tcMar'), context.defaultMargins);
+  if (margins.top || margins.bottom || margins.left || margins.right) {
+    parts.push(
+      `padding:${round(margins.top / 20)}pt ${round(margins.right / 20)}pt ` +
+        `${round(margins.bottom / 20)}pt ${round(margins.left / 20)}pt`
+    );
+  }
+
+  const fill = attr(firstByLocal(tcPr, 'shd'), 'fill');
+  if (fill && fill.toLowerCase() !== 'auto') parts.push(`background-color:#${fill}`);
+
+  const vertical = attr(firstByLocal(tcPr, 'vAlign'), 'val');
+  if (vertical === 'center') parts.push('vertical-align:middle');
+  else if (vertical === 'bottom') parts.push('vertical-align:bottom');
+  else if (vertical === 'top') parts.push('vertical-align:top');
+
+  return parts.join(';');
+}
+
+/**
+ * Рамки конкретной ячейки: внешние берутся с краёв таблицы, внутренние —
+ * из insideH/insideV. При border-collapse сетка выглядит как в Word.
+ */
+function cellBorderStyle(
+  cell: DocxTableCell,
+  context: TableRenderContext,
+  row: number,
+  rowCount: number,
+  totalCols: number,
+  base: string
+): string {
+  const parts: string[] = base ? base.split(';').filter(Boolean) : [];
+  const lastCol = cell.col + cell.colSpan - 1 >= totalCols - 1;
+  const sides: Array<{ css: 'top' | 'bottom' | 'left' | 'right'; source: BorderSide }> = [
+    { css: 'top', source: 'top' },
+    { css: 'bottom', source: 'bottom' },
+    { css: 'left', source: 'left' },
+    { css: 'right', source: 'right' },
+  ];
+  for (const { css: side, source } of sides) {
+    let node = context.borders[source];
+    if (!node) {
+      if (source === 'top' && row === 0) node = context.borders.top;
+      else if (source === 'bottom' && row === rowCount - 1) node = context.borders.bottom;
+      else if (source === 'left' && cell.col === 0) node = context.borders.left;
+      else if (source === 'right' && lastCol) node = context.borders.right;
+      else if (source === 'top' || source === 'bottom') node = context.borders.insideH;
+      else node = context.borders.insideV;
+    }
+    const css = borderCss(node ?? null);
+    if (css) parts.push(`border-${side}:${css}`);
+  }
+  return parts.join(';');
+}
+
 
 /* --------------------------------------------------------------- запись */
 
@@ -2660,17 +3166,10 @@ function readAlign(el: Element): string {
 /* ---------------------------------------------------------------- пакет */
 
 function documentXml(body: string, page?: PageSetup): string {
-  const width = page?.widthMm ? mmToTwips(page.widthMm) : 11906;
-  const height = page?.heightMm ? mmToTwips(page.heightMm) : 16838;
-  const top = page?.marginTopMm ? mmToTwips(page.marginTopMm) : 1134;
-  const right = page?.marginRightMm ? mmToTwips(page.marginRightMm) : 1134;
-  const bottom = page?.marginBottomMm ? mmToTwips(page.marginBottomMm) : 1134;
-  const left = page?.marginLeftMm ? mmToTwips(page.marginLeftMm) : 1134;
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     `<w:document xmlns:w="${W_NS}" xmlns:r="${R_NS}">` +
-    `<w:body>${body}<w:sectPr><w:pgSz w:w="${width}" w:h="${height}"/>` +
-    `<w:pgMar w:top="${top}" w:right="${right}" w:bottom="${bottom}" w:left="${left}"/></w:sectPr></w:body></w:document>`
+    `<w:body>${body}<w:sectPr>${sectPrBodyXml(page)}</w:sectPr></w:body></w:document>`
   );
 }
 
@@ -2773,8 +3272,7 @@ function appendCustomStyles(xml: string, container: HTMLElement): string {
   return result;
 }
 
-function registerStylesFromXml(styles: Document | null): void {
-  if (!styles) return;
+function registerStylesFromXml(styles: Document | null): void {  if (!styles) return;
   for (const node of elementsByLocal(styles, 'style')) {
     if (attr(node, 'customStyle') !== '1') continue;
     const id = attr(node, 'styleId');
@@ -2817,6 +3315,77 @@ function registerStylesFromXml(styles: Document | null): void {
         spacing && attr(spacing, 'after') ? Number(attr(spacing, 'after')) / 20 : undefined,
     });
   }
+}
+
+/* ---------------------------------------------- именованные стили абзацев */
+
+/** Базовый шрифт документа нужен для перевода множителя интервала в CSS. */
+let currentBaseFontFamily = 'Calibri';
+let currentStyleNodes = new Map<string, Element>();
+let currentStyleCssCache = new Map<string, string>();
+
+/**
+ * Стили абзацев из styles.xml (Normal, Heading 1–9, Title, Quote…).
+ *
+ * Пока читались только пользовательские (customStyle="1"), поэтому абзац со
+ * стилем «Заголовок 1» рисовался обычным текстом: размер, жирность и
+ * интервалы стиля терялись.
+ */
+function registerParagraphStyles(styles: Document | null, baseFont: string): void {
+  currentBaseFontFamily = baseFont || 'Calibri';
+  currentStyleNodes = new Map();
+  currentStyleCssCache = new Map();
+  if (!styles) return;
+  for (const node of elementsByLocal(styles, 'style')) {
+    if (attr(node, 'type') !== 'paragraph') continue;
+    const id = attr(node, 'styleId');
+    if (!id) continue;
+    currentStyleNodes.set(id.toLowerCase(), node);
+  }
+}
+
+/** CSS стиля с учётом basedOn: базовый стиль идёт первым и перекрывается своим. */
+function paragraphStyleCssFor(styleId: string, depth = 0): string {
+  const key = styleId.toLowerCase();
+  const cached = currentStyleCssCache.get(key);
+  if (cached !== undefined) return cached;
+  const node = currentStyleNodes.get(key);
+  if (!node || depth > 6) {
+    currentStyleCssCache.set(key, '');
+    return '';
+  }
+  const parent = attr(firstByLocal(node, 'basedOn'), 'val');
+  const inherited =
+    parent && parent.toLowerCase() !== key ? paragraphStyleCssFor(parent, depth + 1) : '';
+  const css = [inherited, paragraphStyleCss(node)].filter(Boolean).join(';');
+  currentStyleCssCache.set(key, css);
+  return css;
+}
+
+/** CSS одного стиля абзаца: свойства шрифта и абзаца. */
+function paragraphStyleCss(node: Element): string {
+  const parts: string[] = [];
+  const rPr = firstByLocal(node, 'rPr');
+  if (rPr) {
+    const fonts = firstByLocal(rPr, 'rFonts');
+    const font = fonts?.getAttribute('w:ascii') || fonts?.getAttribute('w:hAnsi');
+    if (font) parts.push(`font-family:${font}`);
+    const size = Number(attr(firstByLocal(rPr, 'sz'), 'val'));
+    if (size > 0) parts.push(`font-size:${round(size / 2)}pt`);
+    if (isOn(firstByLocal(rPr, 'b'))) parts.push('font-weight:700');
+    if (isOn(firstByLocal(rPr, 'i'))) parts.push('font-style:italic');
+    if (isOn(firstByLocal(rPr, 'u'))) parts.push('text-decoration:underline');
+    const color = attr(firstByLocal(rPr, 'color'), 'val');
+    if (color && color.toLowerCase() !== 'auto') parts.push(`color:#${color}`);
+  }
+  const pPr = firstByLocal(node, 'pPr');
+  if (pPr) {
+    const align = attr(firstByLocal(pPr, 'jc'), 'val');
+    if (align) parts.push(`text-align:${cssAlign(align)}`);
+    parts.push(paragraphIndent(pPr));
+    parts.push(paragraphFormatCss(pPr));
+  }
+  return parts.filter(Boolean).join(';');
 }
 
 /**
@@ -2926,17 +3495,6 @@ function documentRelsXml(
 }
 
 /* -------------------------------------------------------------- утилиты */
-
-/** 1 мм = 56.6929 twips (1/1440 дюйма). */
-const TWIPS_PER_MM = 56.692913;
-
-function mmToTwips(mm: number): number {
-  return Math.round(mm * TWIPS_PER_MM);
-}
-
-function twipsToMm(twips: number): number {
-  return Math.round((twips / TWIPS_PER_MM) * 10) / 10;
-}
 
 function parseXml(xml: string): Document {
   return new DOMParser().parseFromString(xml, 'application/xml');

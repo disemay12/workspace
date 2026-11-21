@@ -1,12 +1,21 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { OpenTab, PageSetup } from '../../types';
 import { bindDocxBlockSources, DocxCorruptError, docxBase64ToHtml, docxPackageInfo, htmlToDocxBase64 } from '../../lib/docx';
-import type { DocxBlockSource, HeaderFooterEdit } from '../../lib/docx';
+import type { DocxBlockSource, DocxHeaderFooterHtml, HeaderFooterEdit } from '../../lib/docx';
 import { offsetWithinBlock, applyDocumentTool, sanitizeSelectionHtml, selectionRangeHtml } from '../../lib/documentModel';
 import { DocumentHistory } from '../../lib/documentHistory';
 import type { DocumentTransaction } from '../../lib/documentHistory';
 import type { DocumentSelection } from '../../services/docBridge';
 import { markdownToDocumentHtml } from '../../lib/aiDocument';
+import { captureCaret, restoreCaret } from '../../lib/caretPath';
+import { resolvePageGeometry } from '../../lib/units';
+import { paginate, pageOfNode, splitPaginatedFlow, stripPagination, unpaginateDom, type PageBox } from '../../lib/pageLayout';
+import { PageSheets } from '../word/PageSheets';
+import { PageSetupPanel } from '../word/PageSetupPanel';
+import { headerFooterHtmlToText, headerFooterTextToHtml } from '../../lib/docxFields';
+import { registerPrintProvider } from '../../services/printBridge';
+import { buildFlowDocument, pagesToPrintDocument } from '../../services/printService';
+import { baseName } from '../../lib/utils';
 import {
   FileText,
   Bold,
@@ -39,6 +48,7 @@ import {
   Subscript,
   RemoveFormatting,
   ChevronDown,
+  Printer,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { IconButton, Spinner } from '../ui';
@@ -231,9 +241,28 @@ export const WordEditor: React.FC<Props> = ({
   const aiTxnRef = useRef('');
   /** Сколько изображений удалось сохранить при последней замене. */
   const [restoredImages, setRestoredImages] = useState(0);
+  /** Живой HTML полотна без служебных маркеров листов. */
+  const liveHtml = useCallback(() => stripPagination(editorRef.current?.innerHTML ?? ''), []);
+
   /** Поля, размер страницы и базовый шрифт: читаются из .docx и меняются AI. */
   const [pageSetup, setPageSetup] = useState<PageSetup>({});
   const pageSetupRef = useRef<PageSetup>({});
+  /** Геометрия листа: размер бумаги, поля, колонтитулы в пикселях. */
+  const geometry = useMemo(() => resolvePageGeometry(pageSetup), [pageSetup]);
+  /** Листы, вычисленные постраничной разметкой. */
+  const [pages, setPages] = useState<PageBox[]>([]);
+  /** Номер листа под кареткой — для строки состояния. */
+  const [currentPage, setCurrentPage] = useState(0);
+  const [paginationWarning, setPaginationWarning] = useState('');
+  /** Колонтитулы из пакета: показываются в поле листа. */
+  const [docHeaders, setDocHeaders] = useState<DocxHeaderFooterHtml>({});
+  const [docFooters, setDocFooters] = useState<DocxHeaderFooterHtml>({});
+  /** Отложенная разметка листов: ставится после загрузки и правок. */
+  const schedulePaginateRef = useRef<(delay?: number) => void>(() => {});
+  /** Панель параметров страницы и текст колонтитулов для правки. */
+  const [showPageSetup, setShowPageSetup] = useState(false);
+  const [headerText, setHeaderText] = useState('');
+  const [footerText, setFooterText] = useState('');
 
   const editorRef = useRef<HTMLDivElement>(null);
   /**
@@ -304,7 +333,7 @@ export const WordEditor: React.FC<Props> = ({
   /** Сериализация всегда идёт поверх исходного пакета вкладки. */
   const serializeDocx = useCallback(
     (html: string, page?: PageSetup) =>
-      htmlToDocxBase64(html, page, {
+      htmlToDocxBase64(stripPagination(html), page, {
         sourceBase64: sourceBase64Ref.current || undefined,
         blockXml: blockXmlRef.current,
         headerFooterEdits: [...headerFooterEditsRef.current.values()],
@@ -410,6 +439,8 @@ export const WordEditor: React.FC<Props> = ({
             setPendingHtml('<p></p>');
             pageSetupRef.current = {};
             setPageSetup({});
+            setDocHeaders({});
+            setDocFooters({});
             setLoading(false);
             setWordCount(0);
           }
@@ -426,6 +457,8 @@ export const WordEditor: React.FC<Props> = ({
         setPendingHtml(parsed.html || '<p></p>');
         pageSetupRef.current = parsed.page ?? {};
         setPageSetup(parsed.page ?? {});
+        setDocHeaders(parsed.headers ?? {});
+        setDocFooters(parsed.footers ?? {});
         sourceBase64Ref.current = tab.content;
         blockSourcesRef.current = parsed.blocks ?? [];
         setLoading(false);
@@ -485,6 +518,9 @@ export const WordEditor: React.FC<Props> = ({
     refreshOutline();
     queueMicrotask(() => {
       isSyncing.current = false;
+      // Переносы зависят от шрифта: до document.fonts.ready разметка листов
+      // считалась бы по запасному шрифту и разъехалась бы с Word.
+      void document.fonts.ready.then(() => schedulePaginateRef.current(0));
     });
   }, [pendingHtml, loading, refreshOutline]);
 
@@ -515,12 +551,202 @@ export const WordEditor: React.FC<Props> = ({
     }
   }, []);
 
+  /* ---------------- Постраничная разметка листов ---------------- */
+
+  const paginateTimer = useRef<NodeJS.Timeout | null>(null);
+  const pagesRef = useRef<PageBox[]>([]);
+
+  /**
+   * Пересобирает листы. Ошибка разметки не должна ломать редактирование:
+   * при сбое маркеры снимаются и документ остаётся одним полотном.
+   */
+  const paginateNow = useCallback(() => {
+    const root = editorRef.current;
+    if (!root || loading) return;
+    const caret = captureCaret(root);
+    try {
+      const result = paginate(root, { geometry });
+      pagesRef.current = result.pages;
+      setPages(result.pages);
+      setPaginationWarning(result.warnings[0] ?? '');
+    } catch (err) {
+      console.warn('Word: постраничная разметка не выполнена', err);
+      unpaginateDom(root);
+      const single: PageBox = {
+        index: 0,
+        topPx: 0,
+        heightPx: geometry.heightPx,
+        contentTopPx: geometry.bodyTopPx,
+        contentBottomPx: geometry.bodyTopPx + geometry.contentHeightPx,
+      };
+      pagesRef.current = [single];
+      setPages([single]);
+      setPaginationWarning('Разметка страниц недоступна — показано одно полотно');
+    } finally {
+      restoreCaret(root, caret);
+    }
+  }, [geometry, loading]);
+
+  /** Отложенная разметка: набор текста не должен пересобирать листы на каждый символ. */
+  const schedulePaginate = useCallback(
+    (delay = 160) => {
+      if (paginateTimer.current) clearTimeout(paginateTimer.current);
+      paginateTimer.current = setTimeout(() => {
+        paginateTimer.current = null;
+        paginateNow();
+      }, delay);
+    },
+    [paginateNow]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (paginateTimer.current) clearTimeout(paginateTimer.current);
+    };
+  }, []);
+
+  schedulePaginateRef.current = schedulePaginate;
+
+  /** Пересобирает листы при смене бумаги или полей. */
+  useEffect(() => {
+    if (loading) return;
+    schedulePaginateRef.current(0);
+  }, [geometry, loading]);
+
+  /**
+   * Масштаб из строки состояния: числа — проценты, «по ширине» и «страница
+   * целиком» считаются от видимой области.
+   */
+  const applyZoomPreset = useCallback(
+    (value: string) => {
+      const scroll = zoomScrollRef.current;
+      if (!scroll) return;
+      const clamp = (next: number) => Math.min(4, Math.max(0.25, next));
+      if (value === 'width') {
+        setZoom(clamp((scroll.clientWidth - 48) / geometry.widthPx));
+        return;
+      }
+      if (value === 'page') {
+        setZoom(clamp((scroll.clientHeight - 40) / geometry.heightPx));
+        return;
+      }
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric > 0) setZoom(clamp(numeric));
+    },
+    [geometry.heightPx, geometry.widthPx]
+  );
+
+  /** Текущий лист для строки состояния. */
+  const refreshCurrentPage = useCallback(() => {    const root = editorRef.current;
+    if (!root || pagesRef.current.length === 0) return;
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return;
+    const range = selection.getRangeAt(0);
+    if (!root.contains(range.startContainer)) return;
+    setCurrentPage(pageOfNode(range.startContainer, pagesRef.current, root));
+  }, []);
+
+  /** Номер листа в строке состояния обновляется вместе с выделением. */
+  useEffect(() => {
+    const onSelection = () => refreshCurrentPage();
+    document.addEventListener('selectionchange', onSelection);
+    return () => document.removeEventListener('selectionchange', onSelection);
+  }, [refreshCurrentPage]);
+
+  /**
+   * Печать идёт через живое полотно: берутся уже разложенные листы, поэтому
+   * число страниц в предпросмотре совпадает с экраном, а не пересчитывается
+   * вторым проходом.
+   */
+  useEffect(() => {
+    return registerPrintProvider({
+      tabId: tab.id,
+      build: async () => {
+        const root = editorRef.current;
+        if (!root) return null;
+        return pagesToPrintDocument({
+          title: baseName(tab.name).replace(/\.[^.]+$/, ''),
+          pages: splitPaginatedFlow(root),
+          geometry,
+          headers: docHeaders,
+          footers: docFooters,
+        });
+      },
+    });
+  }, [tab.id, tab.name, geometry, docHeaders, docFooters]);
+
+  /** Текст колонтитулов в поля панели: поля Word показываем плейсхолдерами. */
+  useEffect(() => {
+    setHeaderText(headerFooterHtmlToText(docHeaders.default));
+    setFooterText(headerFooterHtmlToText(docFooters.default));
+  }, [docHeaders, docFooters]);
+
+  /** Правка полей/бумаги: меняет sectPr и сразу пересобирает пакет. */
+  const applyPageChange = useCallback(
+    (patch: Partial<PageSetup>) => {
+      const merged = { ...pageSetupRef.current, ...patch };
+      pageSetupRef.current = merged;
+      setPageSetup(merged);
+      const root = editorRef.current;
+      if (!root || corruptRef.current) return;
+      const seq = ++serializeSeq.current;
+      void serializeDocx(root.innerHTML, merged)
+        .then((base64) => {
+          if (serializeSeq.current === seq) onChange(base64);
+        })
+        .catch(() => {
+          /* Ошибку покажет ближайшее сохранение. */
+        });
+    },
+    [onChange, serializeDocx]
+  );
+
+  /** Текст колонтитула: плейсхолдеры {{page}}/{{pages}} пишутся полями Word. */
+  const applyHeaderFooterText = useCallback(
+    (kind: 'header' | 'footer', text: string) => {
+      if (kind === 'header') setHeaderText(text);
+      else setFooterText(text);
+
+      const value = text.trim();
+      const edit: HeaderFooterEdit = {
+        kind,
+        referenceType: 'default',
+        text: value,
+        remove: value.length === 0,
+      };
+      const key = `${kind}:default`;
+      if (edit.remove) headerFooterEditsRef.current.delete(key);
+      else headerFooterEditsRef.current.set(key, edit);
+
+      const html = value ? headerFooterTextToHtml(value) : undefined;
+      if (kind === 'header') {
+        setDocHeaders((previous) => ({ ...previous, default: html }));
+      } else {
+        setDocFooters((previous) => ({ ...previous, default: html }));
+      }
+
+      const root = editorRef.current;
+      if (!root || corruptRef.current) return;
+      const seq = ++serializeSeq.current;
+      void serializeDocx(root.innerHTML, pageSetupRef.current)
+        .then((base64) => {
+          if (serializeSeq.current === seq) onChange(base64);
+        })
+        .catch(() => {
+          /* Ошибку покажет ближайшее сохранение. */
+        });
+    },
+    [onChange, serializeDocx]
+  );
+
   const handleInput = useCallback(() => {
     if (!editorRef.current || isSyncing.current) return;
-    const html = editorRef.current.innerHTML;
+    // Служебные маркеры листов не должны попадать ни в историю, ни в пакет.
+    const html = stripPagination(editorRef.current.innerHTML);
     setWordCount(countWords(editorRef.current.innerText));
     refreshOutline();
     refreshBreadcrumb();
+    schedulePaginate();
 
     // Debounce упаковки пакета .docx (устраняет фризы при быстром наборе текста)
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
@@ -535,7 +761,7 @@ export const WordEditor: React.FC<Props> = ({
           /* Ошибку сериализации не показываем на каждый символ: документ остаётся открытым. */
         });
     }, 400);
-  }, [onChange, refreshOutline, refreshBreadcrumb]);
+  }, [onChange, refreshOutline, refreshBreadcrumb, schedulePaginate, serializeDocx]);
 
   /* ---------------- Поиск и замена в документе ---------------- */
 
@@ -694,7 +920,7 @@ export const WordEditor: React.FC<Props> = ({
       setFindMessage('Введите текст для поиска');
       return;
     }
-    const result = applyDocumentTool(root.innerHTML, 'find_replace', {
+    const result = applyDocumentTool(liveHtml(), 'find_replace', {
       find: query,
       replace: replaceWith,
       all: true,
@@ -720,7 +946,7 @@ export const WordEditor: React.FC<Props> = ({
   const captureVersion = useCallback((label: string) => {
     const root = editorRef.current;
     if (!root) return;
-    const html = root.innerHTML;
+    const html = liveHtml();
     const list = versionsRef.current;
     if (list[0]?.html === html) return;
     list.unshift({ id: `v${Date.now()}`, timestamp: Date.now(), label, html });
@@ -772,14 +998,14 @@ export const WordEditor: React.FC<Props> = ({
     if (!open) return;
     if (open.timer) clearTimeout(open.timer);
     openTxnRef.current = null;
-    if (!root || open.before === root.innerHTML) return;
+    if (!root || open.before === liveHtml()) return;
 
     historyRef.current.commit({
       id: open.id,
       label: open.label,
       timestamp: open.timestamp,
       before: open.before,
-      after: root.innerHTML,
+      after: liveHtml(),
     });
 
     // Подсвечиваем изменённые блоки через CSS Highlight API: DOM не меняется,
@@ -826,7 +1052,7 @@ export const WordEditor: React.FC<Props> = ({
             id: `${transactionId}-${Date.now()}`,
             label: 'Правка ассистента',
             timestamp: Date.now(),
-            before: root.innerHTML,
+            before: liveHtml(),
           };
         }
         scheduleFinalize();
@@ -836,7 +1062,7 @@ export const WordEditor: React.FC<Props> = ({
       finalizeTransaction();
       captureVersion('До правки AI');
       aiTxnRef.current = transactionId;
-      setAiSnapshot(root.innerHTML);
+      setAiSnapshot(liveHtml());
       setRestoredImages(0);
       setAiError('');
       openTxnRef.current = {
@@ -881,7 +1107,7 @@ export const WordEditor: React.FC<Props> = ({
   useEffect(() => {
     return registerDocumentController({
       tabId: tab.id,
-      readHtml: () => editorRef.current?.innerHTML ?? '',
+      readHtml: () => liveHtml(),
       serialize: async () => {
         const root = editorRef.current;
         // Повреждённый пакет не пересобираем с нуля: отдаём исходное содержимое.
@@ -1337,24 +1563,28 @@ export const WordEditor: React.FC<Props> = ({
       setError('Экспорт в PDF доступен только в настольном приложении');
       return;
     }
-    const body = editorRef.current?.innerHTML ?? '';
-    const html = `<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><title>${tab.name}</title>
-<style>
-@page { size: A4; margin: ${pageSetup.marginTopMm ?? 20}mm ${pageSetup.marginRightMm ?? 15}mm ${pageSetup.marginBottomMm ?? 20}mm ${pageSetup.marginLeftMm ?? 30}mm; }
-body{font-family:${pageSetup.fontFamily ? `"${pageSetup.fontFamily}", serif` : "Calibri, 'Segoe UI', Georgia, serif"};font-size:${pageSetup.fontSizePt ?? 12}pt;line-height:${pageSetup.lineSpacing ?? 1.5};color:#1c2430;max-width:100%;}
-table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 8px}
-blockquote{border-left:3px solid #2563eb;margin:12px 0;padding-left:12px;color:#555}
-img{max-width:100%}
-</style></head><body>${body}</body></html>`;
-    const result = await api(html, `${tab.name.replace(/\.[^.]+$/, '')}.pdf`);
+    // PDF собирается тем же постраничным HTML, что печать: страницы, поля и
+    // колонтитулы совпадают с тем, что видно в редакторе.
+    const document = buildFlowDocument({
+      title: baseName(tab.name).replace(/\.[^.]+$/, ''),
+      bodyHtml: liveHtml() || '<p></p>',
+      geometry,
+      headers: docHeaders,
+      footers: docFooters,
+    });
+    const result = await api(
+      document.html,
+      `${tab.name.replace(/\.[^.]+$/, '')}.pdf`,
+      undefined,
+      document.pageSizeMicrons
+    );
     if (!result.success && !result.canceled) {
       setError(result.error ?? 'Не удалось экспортировать PDF');
     }
   };
 
   const exportHtml = () => {
-    const body = editorRef.current?.innerHTML ?? '';
+    const body = liveHtml();
     const html = `<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"><title>${tab.name}</title>
 <style>body{font-family:Calibri,'Segoe UI',Georgia,serif;font-size:15px;line-height:1.7;max-width:820px;margin:40px auto;padding:0 24px;color:#1c2430}
@@ -1410,19 +1640,25 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
     ? latestTransaction.diff.changed + latestTransaction.diff.added + latestTransaction.diff.removed
     : 0;
 
-  // Полотно повторяет поля и базовый шрифт .docx, чтобы редактор совпадал с Word.
+  // Полотно — лист точного размера: поля в пикселях 96 dpi, без округления
+  // до целых, иначе строка не помещалась в полосу набора как в Word.
   const canvasStyle: React.CSSProperties = {
     fontFamily: pageSetup.fontFamily
-      ? `"${pageSetup.fontFamily}", serif`
-      : 'Calibri, "Segoe UI", Georgia, serif',
-    fontSize: pageSetup.fontSizePt ? `${pageSetup.fontSizePt}pt` : '15px',
-    lineHeight: pageSetup.lineSpacing ? String(pageSetup.lineSpacing) : 1.7,
+      ? `"${pageSetup.fontFamily}", "Segoe UI", serif`
+      : 'Calibri, "Segoe UI", Arial, sans-serif',
+    fontSize: `${pageSetup.fontSizePt ?? 11}pt`,
+    lineHeight:
+      pageSetup.lineSpacingRule === 'exact' && pageSetup.lineSpacing
+        ? `${pageSetup.lineSpacing}pt`
+        : 'normal',
+    width: `${geometry.widthPx}px`,
+    paddingTop: `${geometry.bodyTopPx}px`,
+    paddingRight: `${geometry.marginRightPx}px`,
+    paddingBottom: `${geometry.bodyBottomPx}px`,
+    paddingLeft: `${geometry.marginLeftPx}px`,
+    minHeight: `${geometry.heightPx}px`,
+    boxSizing: 'border-box',
   };
-  const mmToCanvasPx = 820 / 210;
-  if (pageSetup.marginTopMm) canvasStyle.paddingTop = `${Math.round(pageSetup.marginTopMm * mmToCanvasPx)}px`;
-  if (pageSetup.marginRightMm) canvasStyle.paddingRight = `${Math.round(pageSetup.marginRightMm * mmToCanvasPx)}px`;
-  if (pageSetup.marginBottomMm) canvasStyle.paddingBottom = `${Math.round(pageSetup.marginBottomMm * mmToCanvasPx)}px`;
-  if (pageSetup.marginLeftMm) canvasStyle.paddingLeft = `${Math.round(pageSetup.marginLeftMm * mmToCanvasPx)}px`;
 
   return (
     <div className="flex h-full w-full flex-col bg-ws-editor text-ws">
@@ -1474,6 +1710,40 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
             onClick={() => setVersionsOpen((value) => !value)}
           >
             <Clock size={14} />
+          </IconButton>
+
+          <div className="mx-1 h-3.5 w-px border-l border-ws" />
+
+          <div className="relative">
+            <IconButton
+              title="Параметры страницы: бумага, поля, колонтитулы"
+              active={showPageSetup}
+              onClick={() => setShowPageSetup((value) => !value)}
+            >
+              <FileText size={14} />
+            </IconButton>
+            {showPageSetup && (
+              <MenuPanel onClose={() => setShowPageSetup(false)} width="w-[330px]">
+                <PageSetupPanel
+                  page={pageSetup}
+                  geometry={geometry}
+                  pages={pages.length}
+                  onChange={applyPageChange}
+                  onHeaderFooterText={applyHeaderFooterText}
+                  headerText={headerText}
+                  footerText={footerText}
+                />
+              </MenuPanel>
+            )}
+          </div>
+          <IconButton
+            title="Печать (Ctrl+Alt+P)"
+            onClick={() => window.dispatchEvent(new Event('workspace:print-preview'))}
+          >
+            <Printer size={14} />
+          </IconButton>
+          <IconButton title="Экспорт в PDF" onClick={() => void exportPdf()}>
+            <Download size={14} />
           </IconButton>
 
           <div className="mx-1 h-3.5 w-px border-l border-ws" />
@@ -2035,26 +2305,58 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
             )}
           </aside>
         )}
-        <div ref={zoomScrollRef} className="min-h-0 flex-1 overflow-y-auto bg-ws-editor-alt p-6">
+        <div
+          ref={zoomScrollRef}
+          className="min-h-0 flex-1 overflow-y-auto bg-ws-editor-alt px-6 py-5"
+          data-word-scroll="1"
+        >
           <div
-            ref={editorRef}
-            contentEditable
-            suppressContentEditableWarning
-            onInput={handleInput}
-            onMouseUp={() => {
-              rememberSelection();
-              refreshFormat();
-            }}
-            onKeyUp={() => {
-              rememberSelection();
-              refreshFormat();
-            }}
-            onBlur={handleInput}
-            className="doc-canvas mx-auto min-h-[1000px] w-full max-w-[820px] rounded-sm border border-ws bg-ws-surface p-14 text-ws shadow-ws focus:outline-none select-text"
-            style={{ ...canvasStyle, zoom }}
-          />
+            className="word-stage relative mx-auto"
+            style={{ width: `${geometry.widthPx}px`, zoom }}
+          >
+            <PageSheets
+              geometry={geometry}
+              pages={pages}
+              headers={docHeaders}
+              footers={docFooters}
+            />
+            <div
+              ref={editorRef}
+              contentEditable
+              suppressContentEditableWarning
+              onInput={handleInput}
+              onMouseUp={() => {
+                rememberSelection();
+                refreshFormat();
+                refreshCurrentPage();
+              }}
+              onKeyUp={() => {
+                rememberSelection();
+                refreshFormat();
+                refreshCurrentPage();
+              }}
+              onBlur={handleInput}
+              className="word-sheet relative z-[1] mx-auto text-black focus:outline-none select-text"
+              style={canvasStyle}
+              spellCheck={false}
+            />
+          </div>
         </div>
       </div>
+
+      {paginationWarning && (
+        <div className="flex shrink-0 items-center gap-2 border-t border-amber-500/40 bg-amber-500/10 px-3 py-1 text-[10px] text-amber-500">
+          <AlertTriangle size={11} />
+          <span className="flex-1">{paginationWarning}</span>
+          <button
+            type="button"
+            onClick={() => setPaginationWarning('')}
+            className="rounded px-1 text-[10px] text-ws-faint hover:bg-ws-hover"
+          >
+            Скрыть
+          </button>
+        </div>
+      )}
 
       {/* Строка состояния */}
       <div className="flex shrink-0 items-center justify-between border-t border-ws bg-ws-surface px-3 py-1 text-[10px] text-ws-faint">
@@ -2062,7 +2364,28 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
         <div className="flex items-center gap-3">
           {format.fontName && <span>{format.fontName}</span>}
           {format.fontSizePt && <span>{format.fontSizePt} пт</span>}
-          <span>Масштаб: {Math.round(zoom * 100)}%</span>
+          <span data-word-pages="1">
+            Стр. {pages.length === 0 ? 0 : Math.min(currentPage + 1, pages.length)} из {pages.length}
+          </span>
+          <label className="flex items-center gap-1">
+            <span>Масштаб</span>
+            <select
+              value=""
+              data-word-zoom="1"
+              onChange={(event) => applyZoomPreset(event.target.value)}
+              className="rounded border border-ws bg-ws-elevated px-1 py-0.5 text-[10px] text-ws"
+            >
+              <option value="">{Math.round(zoom * 100)}%</option>
+              <option value="0.5">50%</option>
+              <option value="0.75">75%</option>
+              <option value="1">100%</option>
+              <option value="1.25">125%</option>
+              <option value="1.5">150%</option>
+              <option value="2">200%</option>
+              <option value="width">По ширине</option>
+              <option value="page">Страница целиком</option>
+            </select>
+          </label>
           <span>Слов: {wordCount.toLocaleString('ru-RU')}</span>
           {tab.isDirty && <span className="text-ws-warning">● Изменено</span>}
         </div>
@@ -2357,9 +2680,9 @@ function insertHtmlAt(root: HTMLDivElement | null, range: Range | null, html: st
     }
   }
 
-  const before = root.innerHTML;
+  const before = stripPagination(root.innerHTML);
   const inserted = document.execCommand('insertHTML', false, html);
-  if (!inserted || root.innerHTML === before) {
+  if (!inserted || stripPagination(root.innerHTML) === before) {
     if (validRange) {
       const fragment = validRange.createContextualFragment(html);
       const lastInserted = fragment.lastChild;
