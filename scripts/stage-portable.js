@@ -55,6 +55,8 @@ const keep = new Set([
   'fsGuard.js',
   // Контракт ответа update:check: updater.ts (main) и проверочный стенд.
   'updateInfo.js',
+  // Печать и предпросмотр: отдельное окно с printToPDF/print (main.ts).
+  'printWindow.js',
 ]);
 
 for (const entry of fs.readdirSync(path.join(srcRoot, 'dist-electron'), { withFileTypes: true })) {
