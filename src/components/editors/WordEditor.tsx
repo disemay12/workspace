@@ -7,7 +7,7 @@ import { DocumentHistory } from '../../lib/documentHistory';
 import type { DocumentTransaction } from '../../lib/documentHistory';
 import type { DocumentSelection } from '../../services/docBridge';
 import { markdownToDocumentHtml } from '../../lib/aiDocument';
-import { captureCaret, restoreCaret } from '../../lib/caretPath';
+import { captureSelection, restoreSelection as restoreFlowSelection } from '../../lib/caretPath';
 import { resolvePageGeometry } from '../../lib/units';
 import { paginate, pageOfNode, splitPaginatedFlow, stripPagination, unpaginateDom, type PageBox } from '../../lib/pageLayout';
 import { PageSheets } from '../word/PageSheets';
@@ -259,6 +259,8 @@ export const WordEditor: React.FC<Props> = ({
   const [docFooters, setDocFooters] = useState<DocxHeaderFooterHtml>({});
   /** Отложенная разметка листов: ставится после загрузки и правок. */
   const schedulePaginateRef = useRef<(delay?: number) => void>(() => {});
+  /** Разметка отложена из-за выделения, которое она бы схлопнула. */
+  const paginatePending = useRef(false);
   /** Панель параметров страницы и текст колонтитулов для правки. */
   const [showPageSetup, setShowPageSetup] = useState(false);
   const [headerText, setHeaderText] = useState('');
@@ -412,6 +414,12 @@ export const WordEditor: React.FC<Props> = ({
         },
       };
       refreshBreadcrumb();
+
+      // Выделение схлопнулось — можно доразметить листы, отложенные ранее.
+      if (paginatePending.current && range.collapsed) {
+        paginatePending.current = false;
+        schedulePaginateRef.current(0);
+      }
     };
 
     document.addEventListener('selectionchange', onSelectionChange);
@@ -563,7 +571,22 @@ export const WordEditor: React.FC<Props> = ({
   const paginateNow = useCallback(() => {
     const root = editorRef.current;
     if (!root || loading) return;
-    const caret = captureCaret(root);
+    // Разметка разрезает текстовые узлы на границах строк, а это схлопывает
+    // живое выделение: пока в документе выделен текст, разметку откладываем до
+    // щелчка (см. обработчик selectionchange ниже).
+    const selection = window.getSelection();
+    if (
+      selection &&
+      selection.rangeCount > 0 &&
+      !selection.isCollapsed &&
+      selection.anchorNode &&
+      root.contains(selection.anchorNode)
+    ) {
+      paginatePending.current = true;
+      return;
+    }
+    paginatePending.current = false;
+    const caret = captureSelection(root);
     try {
       const result = paginate(root, { geometry });
       pagesRef.current = result.pages;
@@ -583,7 +606,7 @@ export const WordEditor: React.FC<Props> = ({
       setPages([single]);
       setPaginationWarning('Разметка страниц недоступна — показано одно полотно');
     } finally {
-      restoreCaret(root, caret);
+      restoreFlowSelection(root, caret);
     }
   }, [geometry, loading]);
 
@@ -2312,6 +2335,7 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
         >
           <div
             className="word-stage relative mx-auto"
+            data-word-stage="1"
             style={{ width: `${geometry.widthPx}px`, zoom }}
           >
             <PageSheets
@@ -2368,20 +2392,20 @@ img{max-width:100%}</style></head><body>${body}</body></html>`;
             Стр. {pages.length === 0 ? 0 : Math.min(currentPage + 1, pages.length)} из {pages.length}
           </span>
           <label className="flex items-center gap-1">
-            <span>Масштаб</span>
+            <span data-word-zoom="1">Масштаб: {Math.round(zoom * 100)}%</span>
             <select
               value=""
-              data-word-zoom="1"
+              aria-label="Масштаб: пресеты"
               onChange={(event) => applyZoomPreset(event.target.value)}
               className="rounded border border-ws bg-ws-elevated px-1 py-0.5 text-[10px] text-ws"
             >
-              <option value="">{Math.round(zoom * 100)}%</option>
-              <option value="0.5">50%</option>
-              <option value="0.75">75%</option>
-              <option value="1">100%</option>
-              <option value="1.25">125%</option>
-              <option value="1.5">150%</option>
-              <option value="2">200%</option>
+              <option value="">Пресет…</option>
+              <option value="0.5">50 %</option>
+              <option value="0.75">75 %</option>
+              <option value="1">100 %</option>
+              <option value="1.25">125 %</option>
+              <option value="1.5">150 %</option>
+              <option value="2">200 %</option>
               <option value="width">По ширине</option>
               <option value="page">Страница целиком</option>
             </select>

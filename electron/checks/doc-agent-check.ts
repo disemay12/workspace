@@ -1860,9 +1860,14 @@ async function main() {
       sent: pageSend.sent,
       idle: pageSend.idle,
       saved: Boolean(pageSave),
-      margins: /<w:pgMar w:top="1134" w:right="850" w:bottom="1134" w:left="1701"\/>/.test(
-        pageDoc.xml
-      ),
+      // Поля пишутся вместе с расстояниями колонтитулов: Word хранит их в том же
+      // w:pgMar (w:header/w:footer/w:gutter), поэтому проверяем пары атрибутов,
+      // а не побайтовое совпадение тега.
+      margins:
+        /<w:pgMar\b[^>]*w:top="1134"[^>]*w:right="850"[^>]*w:bottom="1134"[^>]*w:left="1701"/.test(
+          pageDoc.xml
+        ),
+      headerFooterDistances: /<w:pgMar\b[^>]*w:header="\d+"[^>]*w:footer="\d+"/.test(pageDoc.xml),
       serifFont: pageDoc.styles.includes('w:ascii="Times New Roman"'),
       font14: /<w:sz w:val="28"\/>/.test(pageDoc.styles),
       singleSpacing: /w:line="240"/.test(pageDoc.styles),
@@ -2575,9 +2580,10 @@ async function main() {
       metaGone: !statementDoc.text.includes('Рекомендуемые настройки'),
       fencesGone: !statementDoc.text.includes('```'),
       fileTitleGone: !statementDoc.text.includes('Резюме'),
-      marginsKept: /<w:pgMar w:top="1134" w:right="850" w:bottom="1134" w:left="1701"\/>/.test(
-        statementDoc.xml
-      ),
+      marginsKept:
+        /<w:pgMar\b[^>]*w:top="1134"[^>]*w:right="850"[^>]*w:bottom="1134"[^>]*w:left="1701"/.test(
+          statementDoc.xml
+        ),
     });
 
     /* ---------- 11. «Вставить в документ»: текст реально вставляется ---------- */
@@ -2951,23 +2957,25 @@ async function main() {
 
     const wordZoomState = await js(`
       const canvas = document.querySelector('[contenteditable=true]');
+      // Масштаб живёт на подложке листов: сам contenteditable — это лист,
+      // который должен остаться в масштабе 1.
+      const stage = canvas?.closest('[data-word-stage]') || canvas?.parentElement;
       const target = canvas?.parentElement;
-      if (!canvas || !target) return null;
+      if (!canvas || !target || !stage) return null;
       target.dispatchEvent(new WheelEvent('wheel', { deltaY: -200, ctrlKey: true, bubbles: true, cancelable: true }));
       await new Promise((resolve) => setTimeout(resolve, 120));
-      const status = [...document.querySelectorAll('span')]
-        .map((node) => node.textContent || '')
-        .find((text) => text.includes('Масштаб:'));
-      const zoom = canvas.style.zoom;
-      const styleAttr = canvas.getAttribute('style') || '';
-      const computed = getComputedStyle(canvas).zoom || '';
+      const statusNode = document.querySelector('[data-word-zoom]');
+      const status = statusNode ? statusNode.textContent || '' : '';
+      const stageZoom = Number.parseFloat(getComputedStyle(stage).zoom || '1');
+      const styleAttr = stage.getAttribute('style') || '';
       target.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, ctrlKey: true, bubbles: true, cancelable: true }));
-      return { zoom, styleAttr, computed, status };
+      return { status, stageZoom, styleAttr };
     `);
     step('wordZoom', {
-      zoomed: /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(wordZoomState?.styleAttr || '') ||
-        Number.parseFloat(wordZoomState?.computed || '1') > 1,
-      // Раньше поле называлось status и освобождалось во всех наборах сразу.
+      zoomed:
+        /(?:^|;)\s*zoom:\s*(?:1\.[1-9]|[2-9])/.test(wordZoomState?.styleAttr || '') ||
+        Number.parseFloat(String(wordZoomState?.stageZoom ?? 1)) > 1,
+      // Поле называлось status и освобождалось во всех наборах сразу.
       statusShown: /Масштаб: \d+%/.test(wordZoomState?.status || ''),
     });
 
